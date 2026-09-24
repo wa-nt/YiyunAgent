@@ -89,7 +89,7 @@ async def test_openai_stream_aggregates_tool_call():
                         SimpleNamespace(
                             index=0,
                             id="c1",
-                            function=SimpleNamespace(name="sea", arguments='{"q"'),
+                            function=SimpleNamespace(name="search", arguments='{"q"'),
                         )
                     ],
                 )
