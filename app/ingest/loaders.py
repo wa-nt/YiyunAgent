@@ -9,7 +9,8 @@ import pymupdf
 class _HtmlTextExtractor(HTMLParser):
     """把 HTML 拆成标题与正文纯文本，块级标签转成段落换行。"""
 
-    _SKIP = {"script", "style", "noscript", "template", "head"}
+    # 不含 head：缺 </head> 的页面会让跳过计数永不归零，正文全丢；title 已单独提取
+    _SKIP = {"script", "style", "noscript", "template"}
     _BLOCK = {
         "p",
         "div",
@@ -73,9 +74,10 @@ class _HtmlTextExtractor(HTMLParser):
 
 
 def _normalize(raw: str) -> str:
-    raw = re.sub(r"[ \t\r\f\v\xa0]+", " ", raw)
-    raw = re.sub(r" *\n *", "\n", raw)
-    return re.sub(r"\n{3,}", "\n\n", raw).strip()
+    """折叠行尾空白与连续空行，但保留行首缩进（代码笔记的缩进是内容）。"""
+    raw = raw.replace("\r\n", "\n").replace("\r", "\n").replace("\xa0", " ")
+    raw = re.sub(r"[ \t]+(?=\n)", "", raw)
+    return re.sub(r"\n{3,}", "\n\n", raw).strip("\n")
 
 
 def extract_html(html: str, fallback_title: str = "") -> tuple[str, str]:

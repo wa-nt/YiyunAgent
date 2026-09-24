@@ -19,7 +19,11 @@ async def ingest(source: str | Path, db_path: str | Path | None = None) -> int:
     if not chunks:
         return 0
 
+    # init_db 自开自关，不持有写锁；embedding 必须完成后再开写事务，
+    # 否则 SQLite 写锁会跨越整个网络 I/O
     await init_db(db_path)
+    vectors = await embed_texts(chunks)
+
     async with get_db(db_path) as conn:
         try:
             cursor = await conn.execute(
@@ -27,7 +31,6 @@ async def ingest(source: str | Path, db_path: str | Path | None = None) -> int:
                 (str(source), title, _now()),
             )
             doc_id = cursor.lastrowid
-            vectors = await embed_texts(chunks)
             for idx, (content, vector) in enumerate(zip(chunks, vectors, strict=True)):
                 cursor = await conn.execute(
                     "INSERT INTO chunks (doc_id, idx, content, token_count, embedding) "

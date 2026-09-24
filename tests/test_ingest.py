@@ -2,7 +2,7 @@ import pymupdf
 import pytest
 
 from app.config import settings
-from app.db import get_db
+from app.db import get_db, init_db
 from app.ingest import loaders, pipeline
 from app.ingest.chunker import chunk_text
 from app.ingest.loaders import load
@@ -66,6 +66,26 @@ def test_chunk_text_hard_splits_long_paragraph():
         assert _common_overlap(a, b) == OVERLAP
 
 
+def test_chunk_text_clamps_runaway_overlap():
+    # overlap ≥ size/2 的退化配置：不钳制时窗口每次只前进 1 字符，块数会逼近文本长度
+    text = "".join(f"s{i:04d}" for i in range(500))
+    size = 200
+    chunks = chunk_text(text, size, size)
+
+    assert len(chunks) < len(text) // 50
+    assert all(len(c) <= size for c in chunks)
+    for a, b in zip(chunks, chunks[1:]):
+        assert size // 2 - 1 >= _common_overlap(a, b) >= size // 2 - 1 - 2
+
+
+def test_chunk_text_keeps_indentation():
+    code = "    def f():\n        return 1"
+    chunks = chunk_text(f"# 笔记\n\n{code}\n\n结尾", SIZE, OVERLAP)
+
+    assert len(chunks) == 1
+    assert code in chunks[0]
+
+
 def test_load_markdown_and_dispatch(tmp_path):
     note = tmp_path / "note.md"
     note.write_text("# 标题\n\n第一段\n\n第二段\n", encoding="utf-8")
@@ -113,6 +133,24 @@ def test_load_url_strips_tags_without_network(monkeypatch):
     assert title == "网页标题"
     assert "第一段" in text and "第二段" in text
     assert "var x=1" not in text and "b{}" not in text and "<p>" not in text
+
+
+def test_extract_html_without_head_close_tag():
+    # 不少页面缺 </head>；head 一旦计入跳过，正文会被整体丢弃
+    html = "<html><head><title>标题</title><body><p>正文第一段</p><p>正文第二段</p>"
+    title, text = loaders.extract_html(html)
+
+    assert title == "标题"
+    assert "正文第一段" in text and "正文第二段" in text
+
+
+def test_extract_html_keeps_indentation():
+    html = "<p>说明</p><pre>    code line\n        nested\n\n\n\n尾部</pre>"
+
+    _, text = loaders.extract_html(html)
+
+    assert "    code line\n        nested" in text
+    assert "\n\n\n" not in text
 
 
 @pytest.mark.asyncio
@@ -207,3 +245,33 @@ async def test_ingest_empty_document_writes_nothing(tmp_path, monkeypatch):
     note.write_text("\n\n   \n\n", encoding="utf-8")
 
     assert await pipeline.ingest(str(note), tmp_path / "app.db") == 0
+
+
+@pytest.mark.asyncio
+async def test_ingest_embeds_before_opening_write_transaction(tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "embed_dim", DIM)
+    db_path = tmp_path / "app.db"
+    await init_db(db_path)  # 先建表，便于在 embedding 期间直接查库
+
+    seen: dict[str, int] = {}
+
+    async def fake_embed_texts(texts: list[str]) -> list[list[float]]:
+        async with get_db(db_path) as conn:
+            seen["documents"] = len(
+                await conn.execute_fetchall("SELECT id FROM documents")
+            )
+        return [[1.0] * DIM for _ in texts]
+
+    monkeypatch.setattr(pipeline, "embed_texts", fake_embed_texts)
+
+    note = tmp_path / "note.md"
+    note.write_text("# 标题\n\n" + "正文 " * 100, encoding="utf-8")
+
+    count = await pipeline.ingest(str(note), db_path)
+
+    # embedding 期间还没有任何写入，写事务不跨网络 I/O（也无需读连接阻塞）
+    assert seen["documents"] == 0
+    assert count > 0
+    async with get_db(db_path) as conn:
+        assert len(await conn.execute_fetchall("SELECT id FROM documents")) == 1
+        assert len(await conn.execute_fetchall("SELECT id FROM chunks")) == count
