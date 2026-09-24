@@ -1,0 +1,36 @@
+[project]
+name = "second-brain-agent"
+version = "0.1.0"
+description = "第二大脑 Agent：个人知识管理 Agent（分层记忆 × 上下文治理 × Skill 化 × 评测）"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi",
+    "uvicorn",
+    "openai",
+    "anthropic",
+    "langgraph",
+    "pydantic>=2",
+    "pydantic-settings",
+    "aiosqlite",
+    "sqlite-vec",
+    "rank-bm25",
+    "httpx",
+    "python-frontmatter",
+    "pytest",
+    "pytest-asyncio",
+]
+
+[project.optional-dependencies]
+pg = ["asyncpg", "pgvector"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["app*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
