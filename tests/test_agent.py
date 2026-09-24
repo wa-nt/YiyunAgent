@@ -1,3 +1,4 @@
+import asyncio
 import json
 
 import httpx
@@ -43,7 +44,10 @@ class BoomLLM:
 
 @pytest.fixture
 async def db(tmp_path, monkeypatch):
-    """tmp 数据库 + 隔离的 BM25 索引缓存 + 默认 db_path 指向 tmp。"""
+    """tmp 数据库 + 隔离的 BM25 索引缓存 + 默认 db_path 指向 tmp。
+
+    run_agent 不建表（生产由 main.py 的 lifespan 负责），所以这里显式 init_db。
+    """
     monkeypatch.setattr(runtime.settings, "db_path", str(tmp_path / "app.db"))
     invalidate()
     await init_db(tmp_path / "app.db", DIM)
@@ -266,6 +270,95 @@ async def test_assemble_messages_is_the_assembly_hook(db, monkeypatch):
     assert llm.calls[0][0].content == "被治理过的 system"
 
 
+class HangingLLM:
+    """按脚本返回：第一轮请求工具，第二轮吐一个 text_delta 后挂住不返回。
+
+    `hang_on_round` 指定挂住发生在第几轮（1 起算），迟到调用不再挂。
+    """
+
+    def __init__(self, hang_on_round: int = 2) -> None:
+        self.hang_on_round = hang_on_round
+        self.released = asyncio.Event()
+        self.round = 0
+
+    async def chat_stream(self, messages, tools=None):
+        self.round += 1
+        if self.round < self.hang_on_round:
+            yield final(
+                [ToolCall(id="c1", name="search_knowledge", arguments={"query": "RAG"})]
+            )
+            return
+        if self.round == self.hang_on_round:
+            yield chunk("前半段回答")
+            await self.released.wait()
+            return
+        yield chunk("根据笔记……")
+        yield final()
+
+
+async def test_client_disconnect_persists_user_message(db, monkeypatch):
+    use_llm(monkeypatch, HangingLLM())
+    fake_chunks(monkeypatch, [])
+
+    stream = runtime.run_agent(SESSION, "什么是 RAG？")
+    seen = [await anext(stream)]  # tool_start
+    while seen[-1].type != "text_delta":  # 走到第二轮生成的第一个增量
+        seen.append(await anext(stream))
+    assert [e.type for e in seen] == ["tool_start", "tool_end", "text_delta"]
+
+    # 客户端关页面 = 生成器被 aclose()，内部抛 GeneratorExit
+    await stream.aclose()
+
+    saved = await messages_of(SESSION, db)
+    assert [m["role"] for m in saved] == ["user", "assistant"]
+    assert saved[0]["content"] == "什么是 RAG？"
+    # 已生成的部分回答保留，并标记未完成
+    assert saved[1]["content"].startswith("前半段回答")
+    assert "未完成" in saved[1]["content"]
+
+
+async def test_cancelled_task_still_persists_user_message(db, monkeypatch):
+    """真实 HTTP 断开走的是取消任务（CancelledError），不是 aclose：
+    清理阶段的 await 会被打断，但用户提问必须已经落库。"""
+    use_llm(monkeypatch, HangingLLM())
+    fake_chunks(monkeypatch, [])
+
+    async def consume():
+        async for _ in runtime.run_agent(SESSION, "被取消的提问"):
+            pass  # 流会挂住，直到任务被取消
+
+    task = asyncio.create_task(consume())
+    await asyncio.sleep(0.2)  # 跑到 stub 的挂起点
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    saved = await messages_of(SESSION, db)
+    assert saved[0]["role"] == "user"
+    assert saved[0]["content"] == "被取消的提问"
+
+
+async def test_disconnect_keeps_partial_answer_in_next_history(db, monkeypatch):
+    """断开的半截回答进历史（带未完成标记），且只落一次、不影响下一轮提问。"""
+    use_llm(monkeypatch, HangingLLM())
+    fake_chunks(monkeypatch, [])
+
+    stream = runtime.run_agent(SESSION, "第一问")
+    while (await anext(stream)).type != "text_delta":
+        pass
+    await stream.aclose()
+
+    # 同一 session 再问一轮：断开那轮只留 2 行，历史里带着未完成标记
+    use_llm(monkeypatch, FakeLLM([[chunk("第二次回答"), final()]]))
+    await collect(SESSION)
+
+    saved = await messages_of(SESSION, db)
+    assert [m["role"] for m in saved] == ["user", "assistant", "user", "assistant"]
+    assert saved[0]["content"] == "第一问"
+    assert "前半段回答" in saved[1]["content"] and "未完成" in saved[1]["content"]
+    assert saved[3]["content"] == "第二次回答"
+
+
 # ---------- API 层 ----------
 
 
@@ -332,6 +425,56 @@ async def test_chat_reports_llm_error_as_event(client, monkeypatch):
 
     assert [e["type"] for e in events] == ["error"]
     assert resp.status_code == 200
+
+
+async def test_chat_survives_run_agent_exception(client, monkeypatch):
+    """run_agent 自己抛（比如装配阶段就崩、写库失败），HTTP 码已经发出去了，
+    必须补一个 error 事件，否则前端拿到 200 之后就永远等不到 done。"""
+
+    async def boom(session_id, message, db_path=None):
+        yield runtime.AgentEvent("text_delta", {"text": "开头"})
+        raise RuntimeError("装配阶段崩了")
+
+    monkeypatch.setattr("app.main.run_agent", boom)
+
+    resp = await client.post("/api/chat", json={"session_id": "s1", "message": "hi"})
+    events = parse_sse(resp.text)
+
+    assert resp.status_code == 200
+    assert [e["type"] for e in events] == ["text_delta", "error"]
+    assert "装配阶段崩了" in events[-1]["data"]["message"]
+
+
+async def test_chat_session_event_survives_ensure_session_failure(client, monkeypatch):
+    """发 session 事件时就失败：仍然要给一个 error 事件，而不是空响应体。"""
+
+    async def boom(session_id, db_path=None):
+        raise RuntimeError("建会话失败")
+
+    monkeypatch.setattr("app.main.ensure_session", boom)
+
+    resp = await client.post("/api/chat", json={"session_id": None, "message": "hi"})
+    events = parse_sse(resp.text)
+
+    assert resp.status_code == 200
+    assert [e["type"] for e in events] == ["error"]
+    assert "建会话失败" in events[-1]["data"]["message"]
+
+
+async def test_chat_error_event_is_json_serializable(client, monkeypatch):
+    """兜底事件里的 data 可能带着无法 json 化的对象，不能让 SSE 再炸一次。"""
+    leaky = object()
+
+    async def boom(session_id, message, db_path=None):
+        yield runtime.AgentEvent("text_delta", {"text": "开头"})
+        raise RuntimeError(leaky)  # 异常消息本身带不可序列化内容
+
+    monkeypatch.setattr("app.main.run_agent", boom)
+
+    resp = await client.post("/api/chat", json={"session_id": "s1", "message": "hi"})
+    events = parse_sse(resp.text)
+
+    assert events[-1]["type"] == "error"
 
 
 async def test_ingest_and_documents_endpoints(client, monkeypatch):

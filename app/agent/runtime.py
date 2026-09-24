@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from typing import Any, AsyncIterator
 
 from app.config import settings
-from app.db import get_db, init_db
+from app.db import get_db
 from app.llm import get_llm
 from app.llm.types import Message, ToolCall, ToolDef
 from app.retrieval.hybrid import hybrid_search
@@ -141,78 +141,96 @@ async def run_agent(
 ) -> AsyncIterator[AgentEvent]:
     """ReAct 主循环：加载历史 → 流式生成 → 有工具调用则执行并回到生成。
 
+    不建表：HTTP 层由 main.py 的 lifespan 调 init_db，CLI 与测试自行初始化。
     db_path 仅测试与 CLI 用；HTTP 层走默认路径（app.config.settings.db_path）。
     """
     path = db_path or settings.db_path
-    await init_db(path)
     await ensure_session(session_id, path)
 
     history = await load_history(session_id, HISTORY_LIMIT, path)
     messages = assemble_messages(history, user_message)
 
+    # 用户提问立刻落库，不等本轮结束：客户端中途关页面时任务会被取消
+    # （CancelledError），清理阶段的 await 会被打断，只有提前写才能保证提问不丢。
+    await _save_message(session_id, "user", user_message, path)
+
     answer = ""
     calls: list[ToolCall] = []
-    recorded = False
+    answer_saved = False
+    completed = False
 
-    async def record() -> None:
-        """把本轮 user 消息与助手输出落库，只落一次（异常路径也会调用）。"""
-        nonlocal recorded
-        if recorded:
+    async def save_answer(interrupted: bool = False) -> None:
+        """落库助手输出，只落一次。正常结束、异常、断开都走这里。"""
+        nonlocal answer_saved
+        if answer_saved:
             return
-        recorded = True
-        await _save_message(session_id, "user", user_message, path)
-        await _save_message(session_id, "assistant", _assistant_message(answer, calls).content, path)
+        answer_saved = True
+        content = _assistant_message(answer, calls).content
+        if interrupted:
+            mark = "（回答未完成：客户端断开）"
+            content = f"{content}\n{mark}" if content else mark
+        await _save_message(session_id, "assistant", content, path)
 
     try:
         llm = get_llm()
-        for _ in range(MAX_TOOL_ROUNDS):
-            text = ""
-            final_calls: list[ToolCall] = []
-            async for chunk in llm.chat_stream(messages, tools=[SEARCH_TOOL]):
-                if chunk.text_delta:
-                    text += chunk.text_delta
-                    yield AgentEvent("text_delta", {"text": chunk.text_delta})
-                if chunk.finish:
-                    final_calls = chunk.tool_calls
+        try:
+            for _ in range(MAX_TOOL_ROUNDS):
+                text = ""
+                final_calls: list[ToolCall] = []
+                async for chunk in llm.chat_stream(messages, tools=[SEARCH_TOOL]):
+                    if chunk.text_delta:
+                        text += chunk.text_delta
+                        # 立刻累加到 answer：客户端可能在流中途断开，
+                        # 那时循环体的收尾语句不会执行，只有这里能保住已生成的部分
+                        answer += chunk.text_delta
+                        yield AgentEvent("text_delta", {"text": chunk.text_delta})
+                    if chunk.finish:
+                        final_calls = chunk.tool_calls
 
-            if text:
-                answer += text
-            if not final_calls:
-                await record()
-                yield AgentEvent("done", {"session_id": session_id, "text": answer})
-                return
+                if not final_calls:
+                    completed = True
+                    yield AgentEvent("done", {"session_id": session_id, "text": answer})
+                    return
 
-            calls.extend(final_calls)
-            messages.append(_assistant_message(text, final_calls))
-            for call in final_calls:
-                yield AgentEvent(
-                    "tool_start",
-                    {"id": call.id, "name": call.name, "arguments": call.arguments},
-                )
-                try:
-                    result, label = await execute_tool(call, path)
-                except Exception as exc:  # 工具失败降级为一段说明，让模型自行收尾
-                    result = f"检索失败：{exc}"
-                    label = f"{call.name} 失败：{exc}"
-                yield AgentEvent(
-                    "tool_end", {"id": call.id, "name": call.name, "summary": label}
-                )
-                messages.append(
-                    Message(role="tool", tool_call_id=call.id, content=result)
-                )
+                calls.extend(final_calls)
+                messages.append(_assistant_message(text, final_calls))
+                for call in final_calls:
+                    yield AgentEvent(
+                        "tool_start",
+                        {"id": call.id, "name": call.name, "arguments": call.arguments},
+                    )
+                    try:
+                        result, label = await execute_tool(call, path)
+                    except Exception as exc:  # 工具失败降级为一段说明，让模型自行收尾
+                        result = f"检索失败：{exc}"
+                        label = f"{call.name} 失败：{exc}"
+                    yield AgentEvent(
+                        "tool_end", {"id": call.id, "name": call.name, "summary": label}
+                    )
+                    messages.append(
+                        Message(role="tool", tool_call_id=call.id, content=result)
+                    )
 
-        await record()
-        yield AgentEvent(
-            "error",
-            {
-                "message": f"达到工具调用轮数上限（{MAX_TOOL_ROUNDS} 轮），已停止",
-                "session_id": session_id,
-                "text": answer,
-            },
-        )
-    except Exception as exc:
-        await record()
-        yield AgentEvent(
-            "error",
-            {"message": f"{type(exc).__name__}: {exc}", "session_id": session_id, "text": answer},
-        )
+            yield AgentEvent(
+                "error",
+                {
+                    "message": f"达到工具调用轮数上限（{MAX_TOOL_ROUNDS} 轮），已停止",
+                    "session_id": session_id,
+                    "text": answer,
+                },
+            )
+        except Exception as exc:
+            yield AgentEvent(
+                "error",
+                {
+                    "message": f"{type(exc).__name__}: {exc}",
+                    "session_id": session_id,
+                    "text": answer,
+                },
+            )
+    finally:
+        # 助手输出在正常结束、异常、断开三种路径下落库一次；断开时答案被截断，
+        # 补一句标记，避免下次加载历史时被当成完整回答。
+        # 注意：HTTP 断开是取消任务，这次写库可能被 CancelledError 打断——用户提问
+        # 在上方已经落库，所以丢的只是这半截回答，不重试也不吞掉取消信号。
+        await save_answer(interrupted=not completed and bool(answer))

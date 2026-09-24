@@ -34,13 +34,31 @@ class ChatRequest(BaseModel):
 
 async def _sse(req: ChatRequest):
     """SSE 流：每个 AgentEvent 一行 `data: {json}`。session_id 为空的请求
-    先把新建的 id 作为首个事件发出，前端据此续聊。"""
-    if not req.session_id:
-        req.session_id = await ensure_session(None)
-        yield f"data: {json.dumps({'type': 'session', 'data': {'session_id': req.session_id}}, ensure_ascii=False)}\n\n"
-    async for event in run_agent(req.session_id, req.message):
-        payload = {"type": event.type, "data": event.data}
-        yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+    先把新建的 id 作为首个事件发出，前端据此续聊。
+
+    整个流包在 try/except 里：run_agent 抛出、或写库 / json.dumps 失败时，
+    HTTP 状态码已经发出去了，只能尽量补一个 error 事件再结束——否则前端
+    收到的是 200 加静默截断，会一直等 done。
+    """
+    try:
+        if not req.session_id:
+            req.session_id = await ensure_session(None)
+            yield _sse_line("session", {"session_id": req.session_id})
+        async for event in run_agent(req.session_id, req.message):
+            yield _sse_line(event.type, event.data)
+    except Exception as exc:
+        yield _sse_line("error", {"message": f"{type(exc).__name__}: {exc}"})
+
+
+def _sse_line(event_type: str, data: dict) -> str:
+    """异常兜底也要保证可序列化：data 里可能带着无法 json 化的对象。"""
+    try:
+        payload = json.dumps({"type": event_type, "data": data}, ensure_ascii=False)
+    except (TypeError, ValueError):
+        payload = json.dumps(
+            {"type": event_type, "data": {"message": "服务器内部错误"}}, ensure_ascii=False
+        )
+    return f"data: {payload}\n\n"
 
 
 @app.post("/api/chat")
