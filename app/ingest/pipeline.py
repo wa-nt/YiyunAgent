@@ -7,6 +7,7 @@ from app.helpers import embedding_to_blob
 from app.ingest.chunker import chunk_text
 from app.ingest.loaders import load
 from app.llm.embed import embed_texts
+from app.retrieval.bm25_search import invalidate
 
 
 def _now() -> str:
@@ -45,6 +46,7 @@ async def ingest(source: str | Path, db_path: str | Path | None = None) -> int:
         except Exception:
             await conn.rollback()
             raise
+    invalidate()
     return len(chunks)
 
 
@@ -72,3 +74,4 @@ async def delete_document(doc_id: int, db_path: str | Path | None = None) -> Non
         await conn.execute("DELETE FROM chunks WHERE doc_id = ?", (doc_id,))
         await conn.execute("DELETE FROM documents WHERE id = ?", (doc_id,))
         await conn.commit()
+    invalidate()
