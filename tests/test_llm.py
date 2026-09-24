@@ -75,9 +75,11 @@ async def test_openai_stream_aggregates_tool_call():
     def chunk(delta):
         return SimpleNamespace(choices=[SimpleNamespace(delta=delta)], usage=None)
 
-    async def fake_create(**kwargs):
+    def fake_create(**kwargs):
         assert kwargs["stream"] is True
-        deltas = [
+
+        async def gen():
+            deltas = [
             chunk(SimpleNamespace(content="你", tool_calls=None)),
             chunk(SimpleNamespace(content="好", tool_calls=None)),
             chunk(
@@ -109,8 +111,10 @@ async def test_openai_stream_aggregates_tool_call():
                 usage=SimpleNamespace(prompt_tokens=3, completion_tokens=2),
             ),
         ]
-        for d in deltas:
-            yield d
+            for d in deltas:
+                yield d
+
+        return gen()
 
     client.client = SimpleNamespace(
         chat=SimpleNamespace(completions=SimpleNamespace(create=fake_create))
