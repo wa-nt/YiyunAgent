@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, AsyncIterator
 
+from app.agent.context import govern_context
 from app.config import settings
 from app.db import get_db
 from app.llm import get_llm
@@ -141,8 +142,8 @@ def assemble_messages(
     history: list[Message], user_message: str, memory: str | None = None
 ) -> list[Message]:
     """组装发给模型的 prompt view。召回的长期记忆作为一条 system 消息插在 system
-    prompt 之后。T8 的上下文治理（compaction、工具结果清理、token 预算）同样从这里
-    接入，替换本函数即可，不改 Agent 循环。
+    prompt 之后。T8 的上下文治理（工具结果清理、历史压缩、token 预算）由 run_agent
+    在每次调用模型前对这里的产物走一遍 govern_context，不改 Agent 循环。
 
     memory 由 run_agent 先调 recall_memories 取好（本函数是同步的，召回是异步的）。
     """
@@ -241,6 +242,10 @@ async def run_agent(
         try:
             llm = get_llm()
             for _ in range(MAX_TOOL_ROUNDS):
+                # 每轮都重新治理：轮内追加的工具结果同样要进预算。治理结果接着用作
+                # 下一轮的基底，历史摘要因此只生成一次（不然每轮都会重调一次摘要 LLM）；
+                # 它仍然只活在 prompt view 里，下一轮重新加载原始历史再压一次。
+                messages = await govern_context(messages, llm=llm)
                 text = ""
                 final_calls: list[ToolCall] = []
                 async for chunk in llm.chat_stream(messages, tools=[SEARCH_TOOL]):

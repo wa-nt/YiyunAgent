@@ -38,5 +38,15 @@ class Settings(BaseSettings):
     memory_dedup_ratio: float = 0.92
     memory_decay: float = 0.9
 
+    # 上下文治理（T8）。三个策略各自独立可开关：T10 的消融实验靠单因素对照
+    # （只关一个、其余不动）验证各自贡献，所以不要把它们合并成一个总开关
+    context_compaction_enabled: bool = True
+    context_tool_clean_enabled: bool = True
+    context_token_budget_enabled: bool = True
+    # prompt view 的总预算（token，按 1 token ≈ 4 字符估算）
+    context_max_tokens: int = 8000
+    # 历史超过 N 条时触发压缩；保留最近 N/2 条完整对话，更早的由 LLM 生成摘要
+    context_compaction_threshold: int = 10
+
 
 settings = Settings()
