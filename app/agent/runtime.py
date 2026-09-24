@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import uuid
 from dataclasses import dataclass, field
@@ -10,6 +11,8 @@ from app.config import settings
 from app.db import get_db
 from app.llm import get_llm
 from app.llm.types import Message, ToolCall, ToolDef
+from app.memory.recall import recall_memories
+from app.memory.writer import extract_and_store
 from app.retrieval.hybrid import hybrid_search
 from app.retrieval.types import RetrievedChunk
 
@@ -38,6 +41,30 @@ SEARCH_TOOL = ToolDef(
 class AgentEvent:
     type: str  # text_delta | tool_start | tool_end | done | error
     data: dict[str, Any] = field(default_factory=dict)
+
+
+# 未完成的记忆写入任务。fire-and-forget 不能裸 create_task：任务只被事件循环弱引用，
+# 随时可能被 GC 掉；同时测试与 CLI 需要在同一事件循环里 await 到写入结束。
+_pending_writes: set[asyncio.Task] = set()
+
+
+def spawn_memory_write(
+    session_id: str, user_message: str, answer: str, db_path: str
+) -> asyncio.Task:
+    """把一轮对话的记忆抽取丢到后台，不阻塞 SSE 流；失败在 extract_and_store 内消化。"""
+    task = asyncio.create_task(
+        extract_and_store(session_id, user_message, answer, db_path),
+        name=f"memory-write:{session_id}",
+    )
+    _pending_writes.add(task)
+    task.add_done_callback(_pending_writes.discard)
+    return task
+
+
+async def drain_memory_writes() -> None:
+    """等所有在途的记忆写入结束（测试与 CLI 收尾用，不影响 HTTP 流）。"""
+    while _pending_writes:
+        await asyncio.gather(*list(_pending_writes), return_exceptions=True)
 
 
 def _now() -> str:
@@ -91,14 +118,19 @@ async def list_messages(session_id: str, db_path: str | None = None) -> list[dic
     return [dict(row) for row in rows]
 
 
-def assemble_messages(history: list[Message], user_message: str) -> list[Message]:
-    """组装发给模型的 prompt view。T7/T8 的上下文治理（compaction、工具结果清理、
-    token 预算）从这里接入，替换本函数即可，不改 Agent 循环。"""
-    return [
-        Message(role="system", content=SYSTEM_PROMPT),
-        *history,
-        Message(role="user", content=user_message),
-    ]
+def assemble_messages(
+    history: list[Message], user_message: str, memory: str | None = None
+) -> list[Message]:
+    """组装发给模型的 prompt view。召回的长期记忆作为一条 system 消息插在 system
+    prompt 之后。T8 的上下文治理（compaction、工具结果清理、token 预算）同样从这里
+    接入，替换本函数即可，不改 Agent 循环。
+
+    memory 由 run_agent 先调 recall_memories 取好（本函数是同步的，召回是异步的）。
+    """
+    messages = [Message(role="system", content=SYSTEM_PROMPT)]
+    if memory:
+        messages.append(Message(role="system", content=memory))
+    return [*messages, *history, Message(role="user", content=user_message)]
 
 
 def format_chunks(chunks: list[RetrievedChunk]) -> str:
@@ -148,7 +180,9 @@ async def run_agent(
     await ensure_session(session_id, path)
 
     history = await load_history(session_id, HISTORY_LIMIT, path)
-    messages = assemble_messages(history, user_message)
+    # 召回是同步等价的（要进本轮提示词），但失败只降级为无记忆，不抛
+    memory = await recall_memories(user_message, path)
+    messages = assemble_messages(history, user_message, memory)
 
     # 用户提问立刻落库，不等本轮结束：客户端中途关页面时任务会被取消
     # （CancelledError），清理阶段的 await 会被打断，只有提前写才能保证提问不丢。
@@ -176,6 +210,10 @@ async def run_agent(
             mark = "（回答未完成）"
             content = f"{content}\n{mark}" if content else mark
         await _save_message(session_id, "assistant", content, path)
+        # 只在完整轮次后抽取记忆：中断路径的后台任务会被 CancelledError 掐掉，
+        # 且半截回答本身就是噪声。整个写入 fire-and-forget，不阻塞 SSE。
+        if not interrupted:
+            spawn_memory_write(session_id, user_message, answer, path)
 
     try:
         try:

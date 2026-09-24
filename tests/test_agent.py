@@ -8,6 +8,7 @@ from app.agent import runtime
 from app.db import get_db, init_db
 from app.llm.types import StreamChunk, ToolCall
 from app.main import app
+from app.memory import writer as memory_writer
 from app.retrieval.bm25_search import invalidate
 from app.retrieval.types import RetrievedChunk
 
@@ -42,16 +43,29 @@ class BoomLLM:
         yield  # pragma: no cover —— 让它成为异步生成器
 
 
+class _SilentWriterLLM:
+    """记忆抽取桩：T5 的用例只管 Agent 循环，不产生真实的抽取调用。"""
+
+    async def chat(self, messages, tools=None):
+        from app.llm.types import ChatResult
+
+        return ChatResult(text="[]")
+
+
 @pytest.fixture
 async def db(tmp_path, monkeypatch):
     """tmp 数据库 + 隔离的 BM25 索引缓存 + 默认 db_path 指向 tmp。
 
     run_agent 不建表（生产由 main.py 的 lifespan 负责），所以这里显式 init_db。
+    记忆写入是 fire-and-forget，这里换成空抽取桩并在收尾 drain，避免测试
+    真的去调外部 LLM（配置了 API key 时会发真实请求）。
     """
     monkeypatch.setattr(runtime.settings, "db_path", str(tmp_path / "app.db"))
+    monkeypatch.setattr(memory_writer, "get_llm", lambda: _SilentWriterLLM())
     invalidate()
     await init_db(tmp_path / "app.db", DIM)
     yield tmp_path / "app.db"
+    await runtime.drain_memory_writes()
     invalidate()
 
 
@@ -252,7 +266,9 @@ async def test_assemble_messages_is_the_assembly_hook(db, monkeypatch):
     # T7/T8 的治理接入点：替换 assemble_messages 应当影响发给模型的消息
     seen: list[list] = []
 
-    def spy(history, user_message):
+    def spy(history, user_message, memory=None):
+        # 该用例的 memories 表是空的，召回无结果；记忆注入在 tests/test_memory.py 覆盖
+        assert memory is None
         msgs = runtime.Message(
             role="system", content="被治理过的 system"
         )

@@ -29,5 +29,10 @@ class Settings(BaseSettings):
     chunk_size: int = 500
     chunk_overlap: int = 80
 
+    memory_enabled: bool = True
+    memory_recall_top_k: int = 5
+    memory_dedup_threshold: float = 0.85
+    memory_decay: float = 0.9
+
 
 settings = Settings()
