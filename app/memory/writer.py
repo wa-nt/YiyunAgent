@@ -46,31 +46,52 @@ CONFLICT_PROMPT = (
 )
 
 # 重要性规则兜底用的信号。content 按 EXTRACT_PROMPT 的约定是第三人称，
-# 所以偏好正则同时覆盖第一/第三人称写法（LLM 偶尔不守约定）
+# 所以偏好正则同时覆盖第一/第三人称写法（LLM 偶尔不守约定），且「不」为可选前缀
+# （「用户不喜欢吃辣」「用户不爱吃辣」都是偏好）
 _VALUE_HINTS = re.compile(r"\d|[一二三四五六七八九十](?:年|月|日|岁|次|个|点)")
 _PREFERENCE_HINTS = re.compile(
-    "(?:我|用户|本人)(?:喜欢|讨厌|偏好|想|需要|习惯|爱|不爱)"
+    "(?:我|用户|本人)(?:不)?(?:喜欢|讨厌|偏好|想|需要|习惯|爱)"
 )
 # 拉丁词信号只认长度 ≥3 且非停用词的 token（避免把 "the"/"for" 当成专有名词）
 _LATIN_TOKEN = re.compile(r"[A-Za-z]{3,}")
 _LATIN_STOPWORDS = frozenset(
     {"the", "and", "for", "you", "are", "was", "with", "that", "this", "not", "but"}
 )
-
-# 归一化去噪：去掉称呼前缀与标点空白，让「同一句话的两种写法」在比较前先对齐
-_PREFIX = re.compile(r"^(?:用户|本人|我)+")
-_NOISE = re.compile(r"[\s，。、；：！？,.;:!?\"'“”‘’（）()\[\]【】\-—…~·]+")
-
-# 敏感信息：命中即整条丢弃，绝不落库（否则每轮都会回灌进 system 提示）
-_API_KEY = re.compile(
-    r"\bsk-[A-Za-z0-9_\-]{8,}|\bAKIA[0-9A-Z]{12,}|\bghp_[A-Za-z0-9]{20,}"
-    r"|\bBearer\s+[A-Za-z0-9._\-]{12,}"
+# 两字母技术名（AI/Go/ML 等）逐个列白名单补回；边界用「非字母数字」而不是 \b——
+# 中文也是 \w，\b 在「在用 AI」这类紧邻写法下不成立（同 _API_KEY 的坑）
+_LATIN_SHORT = re.compile(
+    r"(?<![A-Za-z0-9])(?:AI|ML|DB|UI|OS|Go|go)(?![A-Za-z0-9])|C\+\+"
 )
+
+# 归一化去噪：去掉称呼前缀（含后缀「的」）与标点空白，让「同一句话的两种写法」
+# 在比较前先对齐。小数点不在这里删，见 _DOT
+_PREFIX = re.compile(r"^(?:用户|本人|我)+的?")
+_NOISE = re.compile(r"[\s，。、；：！？,;:!?\"'“”‘’（）()\[\]【】\-—…~]+")
+# 只删不夹在数字之间的小数点：「1.5 公斤」与「15 公斤」是两条不同事实，
+# 若把小数点一并当噪声删掉，两者归一化后完全相同，会被判成重复
+_DOT = re.compile(r"(?<!\d)[.·]+|[.·]+(?!\d)")
+
+# 敏感信息：命中即整条丢弃，绝不落库（否则每轮都会回灌进 system 提示）。
+# 左边界用「非字母数字」而不是 \b：中文也是 \w，\b 在「key 是sk-...」这类
+# 中文紧邻的写法下不成立，会让密钥整条漏过
+_API_KEY = re.compile(
+    r"(?<![A-Za-z0-9])sk-[A-Za-z0-9_\-]{8,}"
+    r"|(?<![A-Za-z0-9])AKIA[0-9A-Z]{12,}"
+    r"|(?<![A-Za-z0-9])ghp_[A-Za-z0-9]{20,}"
+    r"|(?<![A-Za-z0-9])Bearer\s+[A-Za-z0-9._\-]{12,}"
+)
+# 「关键词 + 分隔符 + 凭据形状的值」。判据必须是「值像凭据」而不是「后面还有字」：
+# 只看长度会把「用户在学 tokenizer 的实现原理」「password manager 管理密码」
+# 这类正常记忆整条丢掉。关键词右侧同样要排除字母数字，否则 token 会命中 tokenizer
 _SECRET_WORD = re.compile(
     r"(?:password|passwd|secret|token|api[_\-\s]?key|private[_\-\s]?key"
-    r"|密码|密钥|口令|凭证)\s*[:：=是为]?\s*\S{4,}",
+    r"|密码|密钥|口令|凭证)(?![A-Za-z0-9])"
+    r"[:：=是为]\s*[A-Za-z0-9!@#$%^&*_\-+/=]{6,}",
     re.IGNORECASE,
 )
+
+# 否定词：出现在一侧而不在另一侧时，两句话断言的是相反的事
+_NEGATION = re.compile(r"不|没|未|别|无|非")
 
 
 def _now() -> str:
@@ -78,6 +99,9 @@ def _now() -> str:
 
 
 def _has_latin_name(content: str) -> bool:
+    """含拉丁专名/技术名（≥3 字母且非停用词，或白名单里的两字母技术名）。"""
+    if _LATIN_SHORT.search(content):
+        return True
     return any(
         word.lower() not in _LATIN_STOPWORDS for word in _LATIN_TOKEN.findall(content)
     )
@@ -96,8 +120,9 @@ def estimate_importance(content: str) -> int:
 
 
 def normalize(content: str) -> str:
-    """去称呼前缀与标点空白，用于相似度比较（不改变落库的原文）。"""
-    return _NOISE.sub("", _PREFIX.sub("", content.strip()))
+    """去称呼前缀（含后缀「的」）与标点空白，用于相似度比较（不改变落库的原文）。"""
+    text = _DOT.sub("", _PREFIX.sub("", content.strip()))
+    return _NOISE.sub("", text)
 
 
 _CJK_DIGITS = {
@@ -117,13 +142,17 @@ _NUMBER = re.compile(r"\d+|[一二两三四五六七八九十]")
 
 
 def _numbers(content: str) -> list[str]:
-    """抽出归一化文本里的数字（含中文数字），用于判断两条记忆的「事实」是否一致。"""
+    """抽出归一化文本里的数字（含中文数字），用于判断两条记忆的「事实」是否一致。
+
+    按出现顺序返回而非排序：排序等于只比数字多重集，「买了 3 个苹果和 5 个梨」
+    与「买了 5 个苹果和 3 个梨」会被判成同一件事。
+    """
     tokens = _NUMBER.findall(normalize(content))
-    return sorted(_CJK_DIGITS.get(token, token) for token in tokens)
+    return [_CJK_DIGITS.get(token, token) for token in tokens]
 
 
 def same_facts(a: str, b: str) -> bool:
-    """数字/时间是否一致。日期、数量这类 token 只差一个字就是另一条事实
+    """数字/时间是否一致（按出现顺序）。日期、数量这类 token 只差一个字就是另一条事实
     （「2026 年 3 月投简历」vs「2026 年 6 月投简历」相似度 0.93，光靠阈值拦不住），
     所以数字不同一律不算重复。粗粒度映射（「十」→"10"）会把「二十」与「23」判成不同，
     代价只是多存一行 active 记忆，方向上是安全的。
@@ -131,8 +160,30 @@ def same_facts(a: str, b: str) -> bool:
     return _numbers(a) == _numbers(b)
 
 
+def same_polarity(a: str, b: str) -> bool:
+    """否定词是否只出现在一侧。「用户喜欢用 Markdown 记笔记」vs「用户不喜欢用……」
+    相似度 0.966、数字也一致，但它断言的是相反的事，判成重复就会静默丢掉新说法。
+
+    判据只看「否定词是否只在一侧」这一表面形式，不问两句是否同义：一侧出现「不/没/未」
+    另一侧没有就判为不同事实，于是「用户不喜欢吃辣」与「用户讨厌吃辣」也会并存两行。
+    代价只是多存一行（方向安全，与 same_facts 同一取舍），换来的是不会把否定式
+    新说法静默丢掉。
+    """
+    return bool(_NEGATION.search(normalize(a))) == bool(_NEGATION.search(normalize(b)))
+
+
+def same_claim(a: str, b: str) -> bool:
+    """两条记忆是否在断言同一件事（数字与否定词都一致），判重的语义前提。"""
+    return same_facts(a, b) and same_polarity(a, b)
+
+
 def has_secret(content: str) -> bool:
-    """粗筛敏感信息：API key 形状，或「密码/token/密钥」后跟一段值。"""
+    """粗筛敏感信息：API key 形状，或「密码/token/密钥」后跟一段凭据形状的值。
+
+    判据刻意只认「值本身像凭据」（分隔符基本必现 + 值无 CJK 且长度 ≥6），
+    否则「用户在学 tokenizer」这类正常记忆会被整条丢掉——过滤误伤的代价
+    （静默丢数据）不比漏过更小。
+    """
     return bool(_API_KEY.search(content) or _SECRET_WORD.search(content))
 
 
@@ -175,7 +226,12 @@ def _normalize(payload: Any) -> list[tuple[str, str, int]]:
         if not content:
             continue
         if has_secret(content):
-            logger.info("候选记忆命中敏感信息，已丢弃：%s", content)
+            # 绝不把 content 写进日志——里面正是要拦的密钥/密码。只留长度与掩码头
+            logger.warning(
+                "候选记忆命中敏感信息，已丢弃（长度 %d，掩码 %s***）",
+                len(content),
+                content[:4],
+            )
             continue
         kind = item.get("kind")
         kind = kind.lower() if isinstance(kind, str) else ""
@@ -315,14 +371,15 @@ async def _store(
         )
         return inserted, None
 
-    # 逐条打分：相似度 + 数字是否一致。数字不同的两条即使措辞几乎一样也是不同事实，
-    # 不参与判重（见 same_facts 的说明）。同一份打分结果供冲突窗口与两处判重复用。
+    # 逐条打分：相似度 + 是否在断言同一件事（数字与否定词都一致）。断言不同的两条
+    # 即使措辞几乎一样也是不同事实，不参与判重（见 same_claim 的说明）。
+    # 同一份打分结果供冲突窗口与判重复用。
     scored: list[tuple[float, bool, dict]] = []
     for member in existing:
         scored.append(
             (
                 _similarity(content, member["content"]),
-                same_facts(content, member["content"]),
+                same_claim(content, member["content"]),
                 member,
             )
         )
@@ -333,19 +390,20 @@ async def _store(
     if window[0][0] >= CONFLICT_MIN_SIMILARITY:
         conflicts = await _detect_conflicts(llm, content, window)
     else:
-        logger.info(
+        logger.warning(
             "候选与最相似的旧记忆相似度过低，跳过冲突判定：%.3f < %.2f（%s）",
             window[0][0],
             CONFLICT_MIN_SIMILARITY,
             content,
         )
 
-    def find_dup(status: str) -> tuple[float, dict] | None:
+    def find_dup(*statuses: str) -> tuple[float, dict] | None:
+        """跨状态判重：默认找任意状态，避免同一句话因状态不同而重复入库（MIN-4）。"""
         return next(
             (
                 (sim, member)
                 for sim, aligned, member in scored
-                if member["status"] == status
+                if (not statuses or member["status"] in statuses)
                 and aligned
                 and sim >= settings.memory_dedup_ratio
             ),
@@ -355,31 +413,42 @@ async def _store(
     now = _now()
     if conflicts:
         # 冲突不覆盖旧记忆：新记忆单独入册挂 conflict 态，旧记忆降权后仍可召回
-        conflict_dup = find_dup("conflict")
-        if conflict_dup is None:
-            inserted = await _insert(
-                conn, kind, content, confidence, "conflict", None, session_id
+        dup = find_dup()
+        if dup is not None:
+            # 同一条矛盾语句反复出现时不再堆行，只重新衰减旧记忆
+            inserted = None
+            logger.warning(
+                "候选与已有 %s 记忆重复，不再插入：%s（相似 id=%s，相似度 %.3f）",
+                dup[1]["status"],
+                content,
+                dup[1]["id"],
+                dup[0],
             )
         else:
-            # 同一条矛盾语句反复出现时不再堆 conflict 行，只重新衰减旧记忆
-            inserted = None
-            logger.info(
-                "候选与已有冲突记忆重复，不再插入：%s（相似 id=%s，相似度 %.3f）",
-                content,
-                conflict_dup[1]["id"],
-                conflict_dup[0],
+            inserted = await _insert(
+                conn, kind, content, confidence, "conflict", None, session_id
             )
         for _, member in window:
             if member["id"] in conflicts:
                 await _decay(conn, member, decayed, now)
         return inserted, None
 
-    best = find_dup("active")
-    if best is not None:
-        sim, member = best
+    dup = find_dup()
+    if dup is not None:
+        sim, member = dup
+        if member["status"] == "conflict":
+            # 这句已以冲突态存在（上一轮 LLM 判出、本轮漏判）：不能再插一条 active，
+            # 否则同一句话会以两种状态各存一行
+            logger.warning(
+                "候选已以冲突态存在，不重复插入：%s（相似 id=%s，相似度 %.3f）",
+                content,
+                member["id"],
+                sim,
+            )
+            return None, None
         if confidence <= member["confidence"]:
             # 不静默丢弃：留下候选内容、比较对象与相似度，便于事后排查误判
-            logger.info(
+            logger.warning(
                 "候选与已有记忆重复，丢弃：%s（相似 id=%s，相似度 %.3f，置信度 %.2f <= %.2f）",
                 content,
                 member["id"],

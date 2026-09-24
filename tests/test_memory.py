@@ -253,13 +253,63 @@ def test_estimate_importance_latin_signal_skips_stopwords():
     assert estimate_importance("用户在用 asyncio") == 3
 
 
+def test_estimate_importance_short_latin_whitelist():
+    """MIN-7：两字母技术名（AI/Go/C++ 等）达不到 ≥3 的长度门槛，靠白名单补回。"""
+    for content in ["用户在用 AI", "用户在用 Go", "用户写 C++", "用户在调 ML 模型"]:
+        assert estimate_importance(content) == 3, content
+    assert estimate_importance("用户在用 the") == 2  # 短停用词仍不算
+
+
+def test_preference_hints_cover_negative_and_third_person():
+    """MIN-7：否定式偏好（不喜欢/不想/不需要/不习惯）同样算偏好信号。"""
+    for content in [
+        "用户不喜欢吃辣",
+        "用户不爱吃辣",
+        "用户不想学 Rust",
+        "用户不需要背书",
+        "用户不习惯早起",
+        "我喜欢用 Markdown",
+    ]:
+        assert writer._PREFERENCE_HINTS.search(content), content
+        assert estimate_importance(content) >= 3, content
+
+
 def test_normalize_and_similarity_scale():
     assert normalize("用户喜欢用 Markdown 记笔记") == "喜欢用Markdown记笔记"
     assert normalize("我讨厌用　Markdown，记笔记。") == "讨厌用Markdown记笔记"
+    assert normalize("用户的项目") == "项目"  # 前缀后的「的」一并剥离
     # 标点/空白差异被归一化抹平，视为同一句
     assert writer._similarity("用户偏好用 Markdown 记笔记", "用户偏好用 Markdown 记笔记。") == 1.0
-    # 一词之差改变事实：必须落在 0.92 阈值之下
+    # 一词之差改变事实：必须落在去重阈值之下（阈值取自配置，不硬编码，
+    # 否则把阈值调回有缺陷的旧值也不会有用例变红）
+    ratio = settings.memory_dedup_ratio
+    assert writer._similarity("用户在北京上学", "用户在北京上班") < ratio
     assert writer._similarity("用户在北京上学", "用户在北京上班") < 0.92
+
+
+def test_decimal_point_is_not_stripped():
+    """MIN-3：把小数点当噪声删掉会把「1.5 公斤」与「15 公斤」归一成同一句。"""
+    assert normalize("用户买了 1.5 公斤牛肉") == "买了1.5公斤牛肉"
+    assert normalize("用户买了 15 公斤牛肉") == "买了15公斤牛肉"
+    assert not writer.same_facts("用户买了 1.5 公斤牛肉", "用户买了 15 公斤牛肉")
+    # 非数字相邻的句号仍要删掉
+    assert normalize("用户偏好用 Markdown 记笔记。") == "偏好用Markdown记笔记"
+
+
+def test_numbers_compare_in_order_not_as_multiset():
+    """suggestion 1：排序后比较等于只比数字多重集，会漏掉位置互换的事实差异。"""
+    assert not writer.same_facts("用户买了 3 个苹果和 5 个梨", "用户买了 5 个苹果和 3 个梨")
+    assert writer.same_facts("用户买了 3 个苹果", "用户买了 3 个苹果")
+
+
+def test_same_polarity_detects_negation_flip():
+    """MAJ-3：否定词只出现在一侧时，两句断言的是相反的事。"""
+    assert not writer.same_polarity("用户喜欢用 Markdown 记笔记", "用户不喜欢用 Markdown 记笔记")
+    assert not writer.same_polarity("用户会用 Python 写爬虫", "用户不会用 Python 写爬虫")
+    assert writer.same_polarity("用户偏好用 Markdown 记笔记", "用户偏好用 Markdown 记笔记。")
+    # 守卫是保守的表面形式判据：一侧有「不」一侧没有就判不同，哪怕两句其实同义
+    # （「不喜欢」vs「讨厌」）。代价只是多存一行，方向安全（同 same_facts 的取舍）
+    assert not writer.same_polarity("用户不喜欢吃辣", "用户讨厌吃辣")
 
 
 # ---------- 敏感信息过滤（M5） ----------
@@ -275,6 +325,9 @@ def test_normalize_and_similarity_scale():
         "用户的数据库密码是 hunter2xyz",
         "用户的 API key: 8f3a9c2b1d",
         "用户的密钥为 abcdef123456",
+        "用户的 token=abcdef123456",
+        "password=hunter2xyz",
+        "用户的凭证为 Abc123!@#xyz",
     ],
 )
 async def test_secrets_are_never_stored(db, monkeypatch, content):
@@ -300,6 +353,64 @@ async def test_normal_facts_are_not_flagged_as_secrets(db, monkeypatch):
     await extract_and_store(SESSION, "我在学密码学", "好的", db)
 
     assert len(await memories(db)) == 2
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "用户在学 tokenizer 的实现原理",
+        "用户在学密码学的基础知识",
+        "用户偏好用 password manager 管理密码",
+        "用户的项目需要 API key 轮换机制",
+        "用户在阅读 secret sharing 的论文",
+        "用户偏好用 passwordless 登录",
+        "用户熟悉的 password 哈希算法是 bcrypt",
+    ],
+)
+async def test_secret_filter_does_not_swallow_normal_memories(db, monkeypatch, content):
+    """MAJ-1：过滤用「后面还有字」当判据会把正常记忆整条丢掉，那是静默丢数据。
+    判据必须是「值像凭据」（分隔符基本必现 + 值无 CJK 且够长）。"""
+    llm = MemoryLLM([("fact", content, 3)])
+    use_writer_llm(monkeypatch, llm)
+
+    await extract_and_store(SESSION, "这段对话是正常内容", "好的", db)
+
+    assert [r["content"] for r in await memories(db)] == [content]
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "用户的 OpenAI key 是sk-abcdefgh12345678",
+        "用户的 AWS key 是AKIAIOSFODNN7EXAMPLE",
+        "用户的 GitHub token 是ghp_abcdefghijklmnopqrstuvwxyz012345",
+        "请求头里的凭据是Bearer abcdefghijklmnop1234",
+        "用户的密钥为abcdef123456",
+    ],
+)
+async def test_secrets_are_caught_when_adjacent_to_cjk(db, monkeypatch, content):
+    """MAJ-2：中文也是 \\w，`\\b` 在「是」与「s」之间不成立，中文紧邻的密钥整条漏过。"""
+    llm = MemoryLLM([("fact", content, 5)])
+    use_writer_llm(monkeypatch, llm)
+
+    await extract_and_store(SESSION, "这段对话里有敏感信息", "好的", db)
+
+    assert await memories(db) == []
+
+
+async def test_secret_discard_log_does_not_leak_the_secret(db, monkeypatch, caplog):
+    """MIN-1：日志里绝不能出现要拦的那串密钥本身。"""
+    secret = "用户的 OpenAI key 是 sk-abcdefgh12345678"
+    llm = MemoryLLM([("fact", secret, 5)])
+    use_writer_llm(monkeypatch, llm)
+
+    with caplog.at_level("WARNING", logger="app.memory.writer"):
+        await extract_and_store(SESSION, "这段对话里有敏感信息", "好的", db)
+
+    assert "命中敏感信息" in caplog.text
+    assert "sk-abcdefgh12345678" not in caplog.text
+    assert secret not in caplog.text
+    assert "掩码" in caplog.text
 
 
 async def test_dedup_keeps_single_memory_and_prefers_higher_confidence(db, monkeypatch):
@@ -353,16 +464,18 @@ async def test_dedup_does_not_swallow_different_facts(db, monkeypatch):
 
 
 async def test_dedup_logs_when_discarding(db, monkeypatch, caplog):
-    """丢弃不再是静默的：日志里能看到候选内容、比较对象与相似度。"""
+    """丢弃不再是静默的，且用 WARNING 级——uvicorn 默认下应用 logger 停在 WARNING，
+    INFO 级在生产路径根本看不见（MIN-2）。"""
     llm = MemoryLLM([("preference", "用户偏好用 Markdown 记笔记", 3)])
     use_writer_llm(monkeypatch, llm)
     await extract_and_store(SESSION, "我喜欢用 Markdown 记笔记", "好的", db)
 
-    with caplog.at_level("INFO", logger="app.memory.writer"):
+    with caplog.at_level("WARNING", logger="app.memory.writer"):
         await extract_and_store(SESSION, "我喜欢用 Markdown 记笔记。", "好的", db)
 
     assert "候选与已有记忆重复，丢弃" in caplog.text
     assert "用户偏好用 Markdown 记笔记" in caplog.text
+    assert caplog.records[-1].levelname == "WARNING"
 
 
 async def test_conflict_memory_is_not_duplicated_across_rounds(db, monkeypatch):
@@ -391,6 +504,58 @@ async def test_conflict_memory_is_not_duplicated_across_rounds(db, monkeypatch):
     assert len([r for r in await memories(db) if r["status"] == "conflict"]) == 1
 
 
+async def test_conflict_round_then_missed_conflict_no_duplicate(db, monkeypatch):
+    """MIN-4：上一轮 LLM 判出矛盾、这一轮漏判返回 []，候选会落进普通分支。
+    若判重只比 active，同一句话就会以 conflict 和 active 各存一行。
+    这一轮的候选置信度必须高于冲突行（1.0 > 0.6），否则会被 confidence 比较
+    顺带拦下（返回 None），测不出「跨状态判重」这条。"""
+    old_id = await insert_memory(db, "preference", "用户喜欢用 Markdown 记笔记", 0.8)
+    llm = MemoryLLM(
+        [("preference", "用户讨厌用 Markdown 记笔记", 3)],
+        conflicts=[[old_id]],
+    )
+    use_writer_llm(monkeypatch, llm)
+    await extract_and_store(SESSION, "我讨厌 Markdown", "好的", db)
+    conflicts = [r for r in await memories(db) if r["status"] == "conflict"]
+    assert len(conflicts) == 1 and conflicts[0]["confidence"] == 0.6
+
+    # 第二轮：LLM 漏判（conflicts 脚本已空 → 返回 []），候选置信度更高
+    llm.items = [("preference", "用户讨厌用 Markdown 记笔记", 5)]
+    await extract_and_store(SESSION, "我还是讨厌 Markdown", "好的", db)
+
+    rows = await memories(db)
+    assert [r["status"] for r in rows] == ["active", "conflict"], [
+        (r["status"], r["content"]) for r in rows
+    ]
+
+
+async def test_negated_fact_is_not_deduped_away(db, monkeypatch):
+    """MAJ-3：插入否定词同属「一词之差改变事实」，相似度 0.96 拦不住，靠否定词守卫。"""
+    await insert_memory(db, "preference", "用户喜欢用 Markdown 记笔记", 0.8)
+    llm = MemoryLLM([("preference", "用户不喜欢用 Markdown 记笔记", 4)])
+    use_writer_llm(monkeypatch, llm)
+
+    await extract_and_store(SESSION, "我现在不喜欢 Markdown 了", "好的", db)
+
+    rows = await memories(db)
+    assert [r["content"] for r in rows] == [
+        "用户喜欢用 Markdown 记笔记",
+        "用户不喜欢用 Markdown 记笔记",
+    ]
+    assert rows[0]["confidence"] == 0.8  # 旧记忆未被当作重复而丢弃/覆盖
+
+
+async def test_negation_guard_does_not_block_real_duplicates(db, monkeypatch):
+    """否定词守卫不能矫枉过正：两侧都没有否定词的同一句仍要判重。"""
+    await insert_memory(db, "preference", "用户偏好用 Markdown 记笔记", 0.8)
+    llm = MemoryLLM([("preference", "用户偏好用 Markdown 记笔记。", 3)])
+    use_writer_llm(monkeypatch, llm)
+
+    await extract_and_store(SESSION, "我偏好 Markdown", "好的", db)
+
+    assert len(await memories(db)) == 1
+
+
 async def test_conflict_decay_has_a_floor(db, monkeypatch):
     """m3：反复冲突不能把旧记忆的 confidence 压到 0（等于废掉）。"""
     old_id = await insert_memory(db, "preference", "用户喜欢用 Markdown 记笔记", 0.12)
@@ -413,10 +578,11 @@ async def test_conflict_detection_skipped_when_too_dissimilar(db, monkeypatch, c
     llm = MemoryLLM([("fact", "用户养了一只猫叫咪咪", 4)])
     use_writer_llm(monkeypatch, llm)
 
-    with caplog.at_level("INFO", logger="app.memory.writer"):
+    with caplog.at_level("WARNING", logger="app.memory.writer"):
         await extract_and_store(SESSION, "我养了只猫", "好的", db)
 
     assert caplog.text.count("跳过冲突判定") == 1
+    assert caplog.records[-1].levelname == "WARNING"
     assert llm.conflict_prompts == []
     assert len(await memories(db)) == 2  # 仍按新记忆并存
 
