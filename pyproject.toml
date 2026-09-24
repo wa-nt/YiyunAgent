@@ -15,6 +15,7 @@ dependencies = [
     "sqlite-vec",
     "rank-bm25",
     "httpx",
+    "pymupdf",
     "python-frontmatter",
     "pytest",
     "pytest-asyncio",
