@@ -31,7 +31,10 @@ class Settings(BaseSettings):
 
     memory_enabled: bool = True
     memory_recall_top_k: int = 5
-    memory_dedup_threshold: float = 0.85
+    # 去重阈值：归一化（去称呼前缀/标点/空白）后整句的序列相似度。0.92 是刻意的保守值——
+    # 一词之差改变事实的句子（「用户在北京上学」vs「用户在北京上班」）相似度约 0.86，
+    # 必须落在阈值下方才能并存/判冲突，而不是被当成重复丢掉
+    memory_dedup_ratio: float = 0.92
     memory_decay: float = 0.9
 
 

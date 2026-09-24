@@ -8,23 +8,29 @@ from app.db import get_db
 logger = logging.getLogger(__name__)
 
 RECALL_HEADER = "以下是关于用户的一些长期记忆，供参考："
+MAX_RECALL_TOP_K = 50  # 召回上限：配置写错（负数/极大值）时不至于把整张表灌进提示词
 
 
 async def recall_memories(user_message: str, db_path: str | None = None) -> str | None:
     """召回长期记忆，返回可直接作为 system 消息的文本；无可用记忆时返回 None。
 
-    取 active 状态按 confidence 倒序的 top-N（N = settings.memory_recall_top_k）。
+    取 active 状态按 confidence 倒序的 top-N（N = settings.memory_recall_top_k，
+    钳制在 0..MAX_RECALL_TOP_K：负数会让 SQLite 的 LIMIT -1 变成全量注入，
+    N=0 表示本轮不注入记忆）。
     memories 表没有 embedding 字段，所以 user_message 暂不参与排序，语义召回
     留给 T10（按 query 加权的三路召回）；参数先按接口契约保留。
     """
     if not settings.memory_enabled:
+        return None
+    top_k = min(max(settings.memory_recall_top_k, 0), MAX_RECALL_TOP_K)
+    if top_k == 0:
         return None
     try:
         async with get_db(db_path) as conn:
             rows = await conn.execute_fetchall(
                 "SELECT kind, content FROM memories WHERE status = 'active' "
                 "ORDER BY confidence DESC, id DESC LIMIT ?",
-                (settings.memory_recall_top_k,),
+                (top_k,),
             )
     except Exception as exc:  # 记忆是增强项，召回失败退化为无记忆，不能拖垮回答
         logger.warning("记忆召回失败，本轮按无记忆处理：%s: %s", type(exc).__name__, exc)

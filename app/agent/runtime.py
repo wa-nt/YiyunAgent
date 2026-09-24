@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -15,6 +16,8 @@ from app.memory.recall import recall_memories
 from app.memory.writer import extract_and_store
 from app.retrieval.hybrid import hybrid_search
 from app.retrieval.types import RetrievedChunk
+
+logger = logging.getLogger(__name__)
 
 HISTORY_LIMIT = 20
 MAX_TOOL_ROUNDS = 6
@@ -46,6 +49,8 @@ class AgentEvent:
 # 未完成的记忆写入任务。fire-and-forget 不能裸 create_task：任务只被事件循环弱引用，
 # 随时可能被 GC 掉；同时测试与 CLI 需要在同一事件循环里 await 到写入结束。
 _pending_writes: set[asyncio.Task] = set()
+# 收尾等待记忆写入的上限：写库卡住时不让进程退出被无限拖住
+DRAIN_TIMEOUT = 5.0
 
 
 def spawn_memory_write(
@@ -61,10 +66,24 @@ def spawn_memory_write(
     return task
 
 
-async def drain_memory_writes() -> None:
-    """等所有在途的记忆写入结束（测试与 CLI 收尾用，不影响 HTTP 流）。"""
+async def drain_memory_writes(timeout: float = DRAIN_TIMEOUT) -> None:
+    """等所有在途的记忆写入结束（测试、CLI 与服务退出时用，不影响 HTTP 流）。
+
+    有超时上限：写入卡住时不能让进程退出或测试收尾无限等下去，超时后放弃并告警。
+    """
     while _pending_writes:
-        await asyncio.gather(*list(_pending_writes), return_exceptions=True)
+        done, pending = await asyncio.wait(list(_pending_writes), timeout=timeout)
+        # 显式摘掉本轮看到的任务，不依赖 done_callback 的调度时机，保证循环必然收敛
+        for task in done:
+            _pending_writes.discard(task)
+        if not pending:
+            continue
+        logger.warning("记忆写入在 %.1fs 内未完成，放弃等待：%d 个", timeout, len(pending))
+        for task in pending:
+            task.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
+        for task in pending:
+            _pending_writes.discard(task)
 
 
 def _now() -> str:
@@ -192,12 +211,15 @@ async def run_agent(
     calls: list[ToolCall] = []
     answer_saved = False
 
-    async def save_answer(interrupted: bool = False) -> None:
+    async def save_answer(degraded: bool = False, interrupted: bool = False) -> None:
         """落库助手输出，只落一次。
 
         各终态（done / 两条 error）在 yield 之前就调用它——客户端收到 done 就会
         关闭 SSE，任务随即被取消，那时再写库会被 CancelledError 打断。
         finally 里的调用只兜底「没有任何终态到达」的中断（客户端提前断开）。
+
+        degraded=True 表示本轮以错误收场（工具轮数上限 / LLM 异常），此时照样落库，
+        但不做记忆抽取——从失败轮次里学到的「事实」正是记忆污染的主要来源。
         """
         nonlocal answer_saved
         if answer_saved:
@@ -210,9 +232,9 @@ async def run_agent(
             mark = "（回答未完成）"
             content = f"{content}\n{mark}" if content else mark
         await _save_message(session_id, "assistant", content, path)
-        # 只在完整轮次后抽取记忆：中断路径的后台任务会被 CancelledError 掐掉，
-        # 且半截回答本身就是噪声。整个写入 fire-and-forget，不阻塞 SSE。
-        if not interrupted:
+        # 只在完整成功的轮次后抽取记忆：中断路径的后台任务会被 CancelledError 掐掉，
+        # 半截或失败的问答本身就是噪声。整个写入 fire-and-forget，不阻塞 SSE。
+        if not interrupted and not degraded:
             spawn_memory_write(session_id, user_message, answer, path)
 
     try:
@@ -255,7 +277,7 @@ async def run_agent(
                         Message(role="tool", tool_call_id=call.id, content=result)
                     )
 
-            await save_answer()
+            await save_answer(degraded=True)
             yield AgentEvent(
                 "error",
                 {
@@ -265,7 +287,7 @@ async def run_agent(
                 },
             )
         except Exception as exc:
-            await save_answer()
+            await save_answer(degraded=True)
             yield AgentEvent(
                 "error",
                 {

@@ -7,7 +7,12 @@ from fastapi.responses import StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from app.agent.runtime import ensure_session, list_messages, run_agent
+from app.agent.runtime import (
+    drain_memory_writes,
+    ensure_session,
+    list_messages,
+    run_agent,
+)
 from app.db import init_db
 from app.ingest.pipeline import delete_document, ingest, list_documents
 
@@ -18,6 +23,9 @@ WEB_DIR = Path(__file__).resolve().parent.parent / "web"
 async def lifespan(app: FastAPI):
     await init_db()
     yield
+    # 记忆写入是 fire-and-forget（进程内后台任务），退出前给它一个收尾窗口，
+    # 否则最后几轮对话的记忆会随进程一起消失。drain 自带超时，不会卡住关闭。
+    await drain_memory_writes()
 
 
 app = FastAPI(title="第二大脑 Agent", lifespan=lifespan)

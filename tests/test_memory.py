@@ -15,6 +15,7 @@ from app.memory.writer import (
     EXTRACT_PROMPT,
     estimate_importance,
     extract_and_store,
+    normalize,
 )
 
 DIM = 8
@@ -91,7 +92,7 @@ async def db(tmp_path, monkeypatch):
     monkeypatch.setattr(settings, "db_path", str(tmp_path / "app.db"))
     monkeypatch.setattr(settings, "memory_enabled", True)
     monkeypatch.setattr(settings, "memory_recall_top_k", 5)
-    monkeypatch.setattr(settings, "memory_dedup_threshold", 0.85)
+    monkeypatch.setattr(settings, "memory_dedup_ratio", 0.92)
     monkeypatch.setattr(settings, "memory_decay", 0.9)
     path = tmp_path / "app.db"
     await init_db(path, DIM)
@@ -215,13 +216,90 @@ async def test_unknown_kind_falls_back_to_fact_and_rule_scores_importance(db, mo
     assert rows[0]["confidence"] == 2 / 5
 
 
+async def test_kind_is_lowercased_and_non_string_content_dropped(db, monkeypatch):
+    llm = MemoryLLM(
+        raw_extraction=json.dumps(
+            [
+                {"kind": "Fact", "content": "用户在准备大模型实习面试", "importance": 3},
+                {"kind": "fact", "content": 12345, "importance": 5},
+                {"kind": "fact", "content": None, "importance": 5},
+            ],
+            ensure_ascii=False,
+        )
+    )
+    use_writer_llm(monkeypatch, llm)
+
+    await extract_and_store(SESSION, "我在准备实习", "好的", db)
+
+    rows = await memories(db)
+    assert len(rows) == 1
+    assert rows[0]["kind"] == "fact"
+    assert rows[0]["content"] == "用户在准备大模型实习面试"
+
+
 def test_estimate_importance_rule():
     assert estimate_importance("嗯") == 2
     assert estimate_importance("我喜欢用 vim") == 4  # 偏好 +1、拉丁词 +1
+    assert estimate_importance("用户偏好用 vim") == 4  # 第三人称同样命中偏好词
     assert estimate_importance("我需要在 2026 年 3 月前投 20 份简历") == 4  # 数字 +1、偏好 +1
     long_plain = "这是一段只用来说明篇幅的中文记忆内容" * 4  # 80 字，无数字与偏好词
     assert len(long_plain) > 50 and estimate_importance(long_plain) == 3
     assert estimate_importance("我讨厌在 2026 年 3 月前用 vim 写 " + "很长" * 30) == 5
+
+
+def test_estimate_importance_latin_signal_skips_stopwords():
+    assert estimate_importance("the for and") == 2  # 停用词不算专有名词信号
+    assert estimate_importance("用户在用 not") == 2
+    assert estimate_importance("用户在用 asyncio") == 3
+
+
+def test_normalize_and_similarity_scale():
+    assert normalize("用户喜欢用 Markdown 记笔记") == "喜欢用Markdown记笔记"
+    assert normalize("我讨厌用　Markdown，记笔记。") == "讨厌用Markdown记笔记"
+    # 标点/空白差异被归一化抹平，视为同一句
+    assert writer._similarity("用户偏好用 Markdown 记笔记", "用户偏好用 Markdown 记笔记。") == 1.0
+    # 一词之差改变事实：必须落在 0.92 阈值之下
+    assert writer._similarity("用户在北京上学", "用户在北京上班") < 0.92
+
+
+# ---------- 敏感信息过滤（M5） ----------
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "用户的 OpenAI key 是 sk-abcdefgh12345678",
+        "用户的 AWS key 是 AKIAIOSFODNN7EXAMPLE",
+        "用户的 GitHub token 是 ghp_abcdefghijklmnopqrstuvwxyz012345",
+        "请求头里的凭据是 Bearer abcdefghijklmnop1234",
+        "用户的数据库密码是 hunter2xyz",
+        "用户的 API key: 8f3a9c2b1d",
+        "用户的密钥为 abcdef123456",
+    ],
+)
+async def test_secrets_are_never_stored(db, monkeypatch, content):
+    """密码/密钥落库后每轮都会回灌进 system 提示，删库才能补救，必须在入口拦掉。"""
+    llm = MemoryLLM([("fact", content, 5)])
+    use_writer_llm(monkeypatch, llm)
+
+    await extract_and_store(SESSION, "这段对话里有敏感信息", "好的", db)
+
+    assert await memories(db) == []
+
+
+async def test_normal_facts_are_not_flagged_as_secrets(db, monkeypatch):
+    """过滤不能误伤正常记忆：提到「密码」但没跟具体值的不算泄漏。"""
+    llm = MemoryLLM(
+        [
+            ("fact", "用户在学密码学", 3),
+            ("preference", "用户偏好用 Markdown 记笔记", 4),
+        ]
+    )
+    use_writer_llm(monkeypatch, llm)
+
+    await extract_and_store(SESSION, "我在学密码学", "好的", db)
+
+    assert len(await memories(db)) == 2
 
 
 async def test_dedup_keeps_single_memory_and_prefers_higher_confidence(db, monkeypatch):
@@ -246,6 +324,101 @@ async def test_dedup_keeps_single_memory_and_prefers_higher_confidence(db, monke
     assert old["status"] == "superseded" and old["content"] == "用户偏好用 Markdown 记笔记"
     assert new["status"] == "active" and new["supersedes"] == old["id"]
     assert new["confidence"] == 1.0
+
+
+async def test_dedup_does_not_swallow_one_word_fact_change(db, monkeypatch):
+    """C1：「用户在北京上学」与「用户在北京上班」相似度 0.86，曾被 0.85 的阈值
+    判成重复并静默丢弃。一词之差改变事实的句子必须并存（或走冲突），不能消失。"""
+    await insert_memory(db, "fact", "用户在北京上学", 0.8)
+    llm = MemoryLLM([("fact", "用户在北京上班", 4)])
+    use_writer_llm(monkeypatch, llm)
+
+    await extract_and_store(SESSION, "我现在在北京上班了", "好的", db)
+
+    rows = await memories(db)
+    assert [r["content"] for r in rows] == ["用户在北京上学", "用户在北京上班"]
+    assert [r["status"] for r in rows] == ["active", "active"]
+    assert rows[0]["confidence"] == 0.8  # 旧记忆原样保留
+
+
+async def test_dedup_does_not_swallow_different_facts(db, monkeypatch):
+    """措辞相近但事实不同的两条（日期/数字不同）同样不能被当成重复丢掉。"""
+    await insert_memory(db, "fact", "用户计划在 2026 年 3 月投简历", 0.8)
+    llm = MemoryLLM([("fact", "用户计划在 2026 年 6 月投简历", 4)])
+    use_writer_llm(monkeypatch, llm)
+
+    await extract_and_store(SESSION, "时间改到 6 月了", "好的", db)
+
+    assert len(await memories(db)) == 2
+
+
+async def test_dedup_logs_when_discarding(db, monkeypatch, caplog):
+    """丢弃不再是静默的：日志里能看到候选内容、比较对象与相似度。"""
+    llm = MemoryLLM([("preference", "用户偏好用 Markdown 记笔记", 3)])
+    use_writer_llm(monkeypatch, llm)
+    await extract_and_store(SESSION, "我喜欢用 Markdown 记笔记", "好的", db)
+
+    with caplog.at_level("INFO", logger="app.memory.writer"):
+        await extract_and_store(SESSION, "我喜欢用 Markdown 记笔记。", "好的", db)
+
+    assert "候选与已有记忆重复，丢弃" in caplog.text
+    assert "用户偏好用 Markdown 记笔记" in caplog.text
+
+
+async def test_conflict_memory_is_not_duplicated_across_rounds(db, monkeypatch):
+    """M1：同一条矛盾语句反复出现只应有一行 conflict，旧记忆也不再重复衰减。"""
+    old_id = await insert_memory(db, "preference", "用户喜欢用 Markdown 记笔记", 0.8)
+    llm = MemoryLLM(
+        [
+            ("preference", "用户讨厌用 Markdown 记笔记", 4),
+            ("preference", "用户讨厌用 Markdown 记笔记", 4),
+        ],
+        conflicts=[[old_id], [old_id]],
+    )
+    use_writer_llm(monkeypatch, llm)
+
+    # 同一批候选里两条相同的矛盾语句
+    await extract_and_store(SESSION, "我讨厌 Markdown", "好的", db)
+
+    rows = await memories(db)
+    conflicts = [r for r in rows if r["status"] == "conflict"]
+    assert len(conflicts) == 1
+    # 旧记忆只衰减一次（0.8 × 0.9，而不是 × 0.81）
+    assert rows[0]["confidence"] == pytest.approx(0.72)
+
+    # 下一轮再来同一条矛盾语句：仍不新增 conflict 行
+    await extract_and_store(SESSION, "我还是讨厌 Markdown", "好的", db)
+    assert len([r for r in await memories(db) if r["status"] == "conflict"]) == 1
+
+
+async def test_conflict_decay_has_a_floor(db, monkeypatch):
+    """m3：反复冲突不能把旧记忆的 confidence 压到 0（等于废掉）。"""
+    old_id = await insert_memory(db, "preference", "用户喜欢用 Markdown 记笔记", 0.12)
+    llm = MemoryLLM(
+        [("preference", "用户讨厌用 Markdown 记笔记", 4)],
+        conflicts=[[old_id]] * 5,
+    )
+    use_writer_llm(monkeypatch, llm)
+
+    for _ in range(5):
+        await extract_and_store(SESSION, "我讨厌 Markdown", "好的", db)
+
+    rows = await memories(db)
+    assert rows[0]["confidence"] >= writer.MIN_CONFIDENCE
+
+
+async def test_conflict_detection_skipped_when_too_dissimilar(db, monkeypatch, caplog):
+    """suggestion：与最相似旧记忆差异过大时不必问 LLM，省一次调用。"""
+    await insert_memory(db, "fact", "用户在学密码学入门", 0.8)
+    llm = MemoryLLM([("fact", "用户养了一只猫叫咪咪", 4)])
+    use_writer_llm(monkeypatch, llm)
+
+    with caplog.at_level("INFO", logger="app.memory.writer"):
+        await extract_and_store(SESSION, "我养了只猫", "好的", db)
+
+    assert caplog.text.count("跳过冲突判定") == 1
+    assert llm.conflict_prompts == []
+    assert len(await memories(db)) == 2  # 仍按新记忆并存
 
 
 async def test_conflict_marks_new_memory_and_decays_old(db, monkeypatch):
@@ -337,6 +510,39 @@ async def test_recall_respects_top_k(db, monkeypatch):
 
     assert "用户在准备面试" in text and "用户在北京" in text
     assert "猫" not in text
+
+
+async def test_recall_clamps_top_k_against_bad_config(db, monkeypatch):
+    """m1：负值会让 SQLite 的 LIMIT -1 变成全量注入，必须钳住。"""
+    for i in range(60):
+        await insert_memory(db, "fact", f"用户的事实{i}", 0.5)
+
+    monkeypatch.setattr(settings, "memory_recall_top_k", -1)
+    assert await recall_memories("hi", db) is None  # 负值钳到 0：一条都不注入
+
+    monkeypatch.setattr(settings, "memory_recall_top_k", 0)
+    assert await recall_memories("hi", db) is None  # 0 表示本轮不注入
+
+    monkeypatch.setattr(settings, "memory_recall_top_k", 3)
+    assert (await recall_memories("hi", db)).count("\n- ") == 3
+
+    monkeypatch.setattr(settings, "memory_recall_top_k", 10_000)
+    capped = await recall_memories("hi", db)
+    assert capped.count("\n- ") == recall_module.MAX_RECALL_TOP_K
+
+
+async def test_extract_truncates_both_user_message_and_answer(db, monkeypatch):
+    """m4：只截助手回答是不够的，超长用户消息同样会撑爆抽取 prompt。"""
+    llm = MemoryLLM([])
+    use_writer_llm(monkeypatch, llm)
+
+    await extract_and_store(SESSION, "长" * 9000, "好" * 9000, db)
+
+    prompt = llm.chats[0][1].content
+    assert "长" * writer.CONTEXT_LIMIT in prompt
+    assert "长" * (writer.CONTEXT_LIMIT + 1) not in prompt
+    assert "好" * (writer.CONTEXT_LIMIT + 1) not in prompt
+    assert len(prompt) < 2 * writer.CONTEXT_LIMIT + 100
 
 
 async def test_recall_returns_none_without_memories(db):
@@ -475,6 +681,96 @@ async def test_interrupted_answer_does_not_spawn_memory_write(db, monkeypatch):
     assert await memories(db) == []
 
 
+class ToolLoopLLM:
+    """每轮都请求工具调用，把 run_agent 逼到工具轮数上限。"""
+
+    async def chat_stream(self, messages, tools=None):
+        yield StreamChunk(
+            finish=True,
+            tool_calls=[
+                ToolCall(id="c1", name="search_knowledge", arguments={"query": "x"})
+            ],
+        )
+
+
+class BoomStreamLLM:
+    """吐一段回答后抛异常，走 error 分支。"""
+
+    async def chat_stream(self, messages, tools=None):
+        yield StreamChunk(text_delta="半截")
+        raise RuntimeError("llm 挂了")
+
+
+async def test_degraded_rounds_do_not_extract_memories(db, monkeypatch):
+    """M2：工具轮数上限 / LLM 异常这两条失败轮次照样落库，但不抽取记忆——
+    从失败轮次里学到的「事实」正是记忆污染的主要来源。"""
+    calls: list[str] = []
+
+    def recorder():
+        calls.append("get_llm")
+        return MemoryLLM([("fact", "用户的知识库里有 RAG 笔记", 5)])
+
+    for llm in (ToolLoopLLM(), BoomStreamLLM()):
+        monkeypatch.setattr(runtime, "get_llm", lambda llm=llm: llm)
+        monkeypatch.setattr(runtime, "hybrid_search", _no_chunks)
+        monkeypatch.setattr(writer, "get_llm", recorder)
+
+        events = await collect_events(SESSION)
+
+        assert events[-1].type == "error"
+        await runtime.drain_memory_writes()
+
+    # 两条失败路径都不该唤起抽取
+    assert calls == []
+    assert await memories(db) == []
+
+
+async def _no_chunks(query, k=8, mode="hybrid", db_path=None):
+    return []
+
+
+async def test_successful_round_after_degraded_one_still_extracts(db, monkeypatch):
+    """degraded 只影响失败那一轮，正常轮次照常学习。"""
+    monkeypatch.setattr(runtime, "get_llm", lambda: ToolLoopLLM())
+    monkeypatch.setattr(runtime, "hybrid_search", _no_chunks)
+    use_writer_llm(monkeypatch, MemoryLLM([]))
+    await collect_events(SESSION)
+    await runtime.drain_memory_writes()
+
+    monkeypatch.setattr(runtime, "get_llm", lambda: StreamLLM())
+    use_writer_llm(monkeypatch, MemoryLLM([("preference", "用户偏好用 Markdown 记笔记", 4)]))
+    events = await collect_events(SESSION)
+    await runtime.drain_memory_writes()
+
+    assert events[-1].type == "done"
+    assert [r["content"] for r in await memories(db)] == ["用户偏好用 Markdown 记笔记"]
+
+
+async def test_drain_gives_up_after_timeout(db, monkeypatch, caplog):
+    """M6：写入卡死时 drain 必须有上限，不能让测试收尾或进程退出无限等下去。"""
+    stream = StreamLLM()
+    monkeypatch.setattr(runtime, "get_llm", lambda: stream)
+    gated = GatedMemoryLLM([("preference", "用户偏好用 Markdown 记笔记", 4)])
+    use_writer_llm(monkeypatch, gated)
+
+    events = await collect_events(SESSION)
+    assert events[-1].type == "done"
+
+    with caplog.at_level("WARNING", logger="app.agent.runtime"):
+        await runtime.drain_memory_writes(timeout=0.05)
+
+    assert "放弃等待" in caplog.text
+    assert runtime._pending_writes == set()  # 卡住的任务被摘掉并取消
+    assert await memories(db) == []
+
+    gated.gate.set()  # 放行，避免留下悬空任务影响后续用例
+
+
+async def test_drain_is_noop_without_pending_writes(db):
+    await runtime.drain_memory_writes(timeout=0.05)
+    assert runtime._pending_writes == set()
+
+
 class HangingLLM:
     """吐一个 text_delta 后挂住，供中断路径使用。"""
 
@@ -514,3 +810,30 @@ async def test_chat_end_to_end_learns_and_recalls_memory(db, monkeypatch):
     sent = stream.calls[-1]
     assert sent[1].content.startswith("以下是关于用户的一些长期记忆")
     assert "用户偏好用 Markdown 记笔记" in sent[1].content
+
+async def test_lifespan_drains_pending_memory_writes(db, monkeypatch):
+    """m5：进程退出前要给在途写入一个收尾窗口，否则最后几轮记忆随进程消失。"""
+    from app import main as main_module
+
+    stream = StreamLLM()
+    monkeypatch.setattr(runtime, "get_llm", lambda: stream)
+    gated = GatedMemoryLLM([("preference", "用户偏好用 Markdown 记笔记", 4)])
+    use_writer_llm(monkeypatch, gated)
+
+    drained: list[int] = []
+    real_drain = runtime.drain_memory_writes
+
+    async def spy_drain(timeout: float = runtime.DRAIN_TIMEOUT) -> None:
+        # 退出时确实还有在途写入，drain 就是为了等它们
+        drained.append(len(runtime._pending_writes))
+        await real_drain(timeout)
+
+    monkeypatch.setattr(main_module, "drain_memory_writes", spy_drain)
+
+    async with main_module.lifespan(main_module.app):
+        await collect_events(SESSION)
+        # 退出前写入还卡在 gate 上
+        gated.gate.set()
+    # lifespan 退出时调用了 drain，且写入已落库
+    assert drained and drained[0] >= 1
+    assert [r["content"] for r in await memories(db)] == ["用户偏好用 Markdown 记笔记"]
