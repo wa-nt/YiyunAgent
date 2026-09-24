@@ -27,9 +27,18 @@ SUMMARY_PREFIX = "[历史摘要]"
 TOOL_OMITTED = "[之前的工具结果已省略]"
 TRUNCATION_NOTE = "[上下文已截断，部分历史可能丢失]"
 
-CHARS_PER_TOKEN = 4  # 简单字符估算：1 token ≈ 4 字符
+# 简单字符估算：1 token ≈ 4 字符。这是偏乐观的口径，会**低估**实际占用：中文约 1~1.5
+# 字符/token，也就是同样一段中文的真实 token 数约为本估算的 3~4 倍。用它把关够挡住上下文
+# 爆炸，但不等于真实计费口径；不引 tiktoken 是为了不新增依赖，见 T8 brief 的边界说明
+CHARS_PER_TOKEN = 4
 KEEP_TOOL_ROUNDS = 2  # 保留最近 2 轮的工具结果，更早的换成占位符
 SUMMARY_INPUT_LIMIT = 4000  # 送进摘要 prompt 的历史文本上限（字符）
+# 占位符内联 query 时的上限：query 是模型自由生成的、没有长度上限，原样塞进占位符会让
+# 「清理」反而放大 prompt（见 _omitted）
+MAX_QUERY_IN_PLACEHOLDER = 40
+# 异常日志里保留的信息长度：provider 异常的 str() 常带着响应体（可能回显对话内容），
+# 只留类型 + 一小段，够定位问题即可（与 T7 敏感信息日志的口径一致）
+ERROR_TEXT_LIMIT = 200
 MIN_COMPACTION_THRESHOLD = 2  # 阈值下限：低于 2 条时压缩会每轮空转
 
 SUMMARY_PROMPT = (
@@ -65,17 +74,18 @@ async def govern_context(
 ) -> list[Message]:
     """治理 prompt view：工具结果清理 → 历史压缩 → token 预算截断。
 
-    返回新的列表（未改动时原样返回入参），入参与其中的 Message 对象都不被修改。
-    max_tokens 缺省取 settings.context_max_tokens；三个策略各自读自己的开关，
-    关掉的策略在这一步被完全跳过，互不影响（消融实验依赖这一点）。llm 只在压缩时
-    用得上，缺省取 app.llm.get_llm()；run_agent 传入本轮实例，测试可注入桩。
+    返回的总是新的 list；内容没变时 Message 对象与入参共享（本模块从不原地改 Message）。
+    max_tokens 缺省取 settings.context_max_tokens；三个策略各自读自己的开关，关掉的
+    策略在这一步被完全跳过，互不影响（消融实验依赖这一点）。llm 只在压缩时用得上，
+    缺省取 app.llm.get_llm()；run_agent 传入本轮实例，测试可注入桩。
     """
     if not messages:
-        return messages
+        return list(messages)
     budget = settings.context_max_tokens if max_tokens is None else max_tokens
     governed = _clean_tool_results(messages)
     governed = await _compact_history(governed, llm)
-    return _apply_token_budget(governed, budget)
+    # 最外层再包一次：各策略无变化时会把入参原样返回，调用方拿到的应是新 list
+    return list(_apply_token_budget(governed, budget))
 
 
 # ---------- 历史压缩 ----------
@@ -92,6 +102,9 @@ async def _compact_history(
     if not settings.context_compaction_enabled:
         return messages
     if any(_is_summary(m) for m in messages):
+        # 兜底，正常链路不可达：run_agent 每轮从 load_history 重新组装，已有历史的摘要
+        # 一定是本函数刚生成的。命中说明调用方自己拼了带摘要的视图（如直接复用上一轮的
+        # 治理产物），此时不重复压缩也不再调一次摘要 LLM
         return messages
 
     threshold = max(settings.context_compaction_threshold, MIN_COMPACTION_THRESHOLD)
@@ -125,9 +138,14 @@ def _keep_boundary(history: list[Message], keep: int) -> int:
 
 
 async def _summarize(messages: list[Message], llm: LLMClient | None) -> str | None:
-    """用 LLM 把一段历史压成摘要文本；失败（含未配 API key）返回 None。"""
+    """用 LLM 把一段历史压成摘要文本；失败（含未配 API key）返回 None。
+
+    送进 prompt 的文本有 SUMMARY_INPUT_LIMIT 上限，超出时保留**尾部**：被压区间里越
+    靠近保留窗口的条目越可能与后续对话关联，丢它们比丢最开头更亏。这仍是有损的——
+    被截掉的部分不会以任何形式进入摘要。
+    """
     lines = [f"{m.role}：{m.content.strip()}" for m in messages if m.content.strip()]
-    transcript = "\n".join(lines)[:SUMMARY_INPUT_LIMIT]
+    transcript = "\n".join(lines)[-SUMMARY_INPUT_LIMIT:]
     if not transcript:
         return None
     try:
@@ -138,7 +156,9 @@ async def _summarize(messages: list[Message], llm: LLMClient | None) -> str | No
             ]
         )
     except Exception as exc:  # 摘要失败退化为保留完整历史，不影响本轮回答
-        logger.warning("历史压缩失败，本轮不压缩：%s: %s", type(exc).__name__, exc)
+        # 只记类型与截断后的信息：provider 异常的 str() 常带着响应体，可能回显对话内容
+        detail = str(exc)[:ERROR_TEXT_LIMIT]
+        logger.warning("历史压缩失败，本轮不压缩：%s: %s", type(exc).__name__, detail)
         return None
     summary = result.text.strip()
     return summary or None
@@ -167,9 +187,26 @@ def _clean_tool_results(messages: list[Message]) -> list[Message]:
 
 
 def _omitted(message: Message, queries: dict[str, str]) -> Message:
-    """工具结果的占位符；能查到原始 query 时写进占位符，方便模型与人工回溯。"""
+    """工具结果的占位符；能查到原始 query 时截断后写进占位符，方便模型与人工回溯。
+
+    硬约束：占位符不得比原内容长。query 是模型自由生成的、没有长度上限，而工具结果
+    可能很短（无命中时只有十几个字），原样内联会让「清理」反过来放大 prompt，进而让
+    token 预算去删本该保留的摘要和记忆。拿不到更短的占位符时就返回原文——宁可不清，
+    也不放大。
+    """
     query = queries.get(message.tool_call_id or "")
-    content = f'[之前检索过 "{query}"，结果已省略]' if query else TOOL_OMITTED
+    candidates = [TOOL_OMITTED]
+    if query:
+        trimmed = (
+            query
+            if len(query) <= MAX_QUERY_IN_PLACEHOLDER
+            else query[:MAX_QUERY_IN_PLACEHOLDER] + "…"
+        )
+        candidates.insert(0, f'[之前检索过 "{trimmed}"，结果已省略]')
+    # 优先带 query 的版本（信息更多），它不比原文短才退回通用占位符，再不行就保留原文
+    content = next((c for c in candidates if len(c) < len(message.content)), None)
+    if content is None:
+        return message
     return message.model_copy(update={"content": content})
 
 
@@ -204,45 +241,59 @@ def _query_by_call_id(messages: list[Message]) -> dict[str, str]:
 def _apply_token_budget(messages: list[Message], max_tokens: int) -> list[Message]:
     """超预算时按「最早历史 → 工具结果 → 摘要 → 记忆」的优先级丢内容。
 
-    第一项删的是完整轮次（不把一轮问答劈开）；工具结果按轮次从最早开始换占位符。
-    丢不掉（没东西可丢）说明视图本身是完整的，此时不注明截断；只要动过内容就在
-    system 消息里注明「上下文已截断」，免得模型把残缺的历史当成全部事实。
+    第一项删的是完整轮次（不把一轮问答劈开）；工具结果按轮次从最早开始换占位符，且只在
+    真的更省 token 时才换（见 _omitted）。丢不掉（没东西可丢）说明视图本身是完整的，
+    此时不注明截断；只要动过内容就在 system 消息里注明「上下文已截断」，免得模型把残缺
+    的历史当成全部事实。
+
+    截断提示本身也占预算，所以内部目标先扣掉它的长度，保证「加完提示」的最终结果仍不超
+    预算。若视图里已有提示（run_agent 每轮都治理一次），不再追加，也不会重复扣。
+
+    有个不可再压的下限：system prompt + 截断提示 + 当前提问。预算给到比这个下限还小
+    （如 max_tokens=5）时无法满足，此时保留这些必需消息而不是删光——删掉当前提问就没有
+    可回答的东西了，删 system prompt 会丢工具契约。这一档是诚实的「做不到」，不是漏算。
     """
     if not settings.context_token_budget_enabled:
         return messages
     if prompt_tokens(messages) <= max_tokens:
         return messages
 
+    has_note = any(m.content == TRUNCATION_NOTE for m in messages)
+    target = max_tokens if has_note else max_tokens - estimate_tokens(TRUNCATION_NOTE)
+
     out = list(messages)
     truncated = False
 
     start, end = _history_span(out)
-    while start < end and prompt_tokens(out) > max_tokens:
+    while start < end and prompt_tokens(out) > target:
         stop = _round_end(out, start, end)
         del out[start:stop]
         end -= stop - start
         truncated = True
 
-    if prompt_tokens(out) > max_tokens:
+    if prompt_tokens(out) > target:
         queries = _query_by_call_id(out)
         for i in [i for rnd in _tool_rounds(out) for i in rnd]:
-            if prompt_tokens(out) <= max_tokens:
+            if prompt_tokens(out) <= target:
                 break
             replaced = _omitted(out[i], queries)
-            if replaced.content != out[i].content:
+            # 按 token 收益判定，而不是「内容变了没有」：占位符更长时会越换越大
+            if prompt_tokens([replaced]) < prompt_tokens([out[i]]):
                 out[i] = replaced
                 truncated = True
 
     # 摘要是「已确认结论」的浓缩，记忆是跨会话的用户画像，都比工具结果更值得留
     for drop in (_is_summary, _is_memory):
-        if prompt_tokens(out) <= max_tokens:
+        if prompt_tokens(out) <= target:
             break
         kept = [m for m in out if not drop(m)]
         if len(kept) != len(out):
             out = kept
             truncated = True
 
-    return _with_truncation_note(out) if truncated else messages
+    if not truncated:
+        return messages
+    return out if has_note else _with_truncation_note(out)
 
 
 def _with_truncation_note(messages: list[Message]) -> list[Message]:
@@ -268,8 +319,12 @@ def _history_span(messages: list[Message]) -> tuple[int, int]:
     """历史区间的 [start, end)：前缀之后、最后一条用户消息之前。
 
     组装好的视图是「system 前缀 + 历史 + 当前提问」。Agent 循环里追加的 assistant/tool
-    消息都排在当前提问之后，所以循环各轮的历史区间为空——压缩针对的是已有历史，不会
-    把本轮刚产生的检索证据压掉。
+    消息都排在当前提问之后，所以循环各轮的历史区间仍是已有历史——压缩针对的是已有历史，
+    不会把本轮刚产生的检索证据压掉。
+
+    找不到用户消息时（调用方自己拼的视图，正常链路不会出现：assemble_messages 总会把
+    当前提问放在末尾）返回空区间。没有「当前提问」这个锚点就分不清哪段是历史、哪段是
+    正在进行的回合，此时宁可不删——乱删会把模型这一轮要看的消息删掉。
     """
     start = _prefix_end(messages)
     end = len(messages)
@@ -277,6 +332,8 @@ def _history_span(messages: list[Message]) -> tuple[int, int]:
         if messages[i].role == "user":
             end = i
             break
+    else:
+        return start, start
     return start, end
 
 
