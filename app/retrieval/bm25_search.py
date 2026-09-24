@@ -1,3 +1,4 @@
+import asyncio
 import re
 from pathlib import Path
 
@@ -32,25 +33,33 @@ class BM25Index:
         self._terms: list[frozenset[str]] = []
         self._meta: dict[int, tuple[int, str, str | None]] = {}
         self._bm25: BM25Okapi | None = None
+        self._load_lock = asyncio.Lock()
 
     async def load(self) -> None:
         if self._loaded:
             return
-        async with get_db(self._db_path) as conn:
-            rows = await conn.execute_fetchall(
-                "SELECT c.id, c.doc_id, c.content, d.title FROM chunks c "
-                "LEFT JOIN documents d ON d.id = c.doc_id ORDER BY c.id"
-            )
-        corpus: list[list[str]] = []
-        for row in rows:
-            content = row["content"] or ""
-            self._ids.append(row["id"])
-            self._meta[row["id"]] = (row["doc_id"], content, row["title"])
-            corpus.append(tokenize(content))
-        self._terms = [frozenset(tokens) for tokens in corpus]
-        # 空语料或全部切不出 token（avgdl = 0）会让 BM25Okapi 除零
-        self._bm25 = BM25Okapi(corpus) if any(corpus) else None
-        self._loaded = True
+        async with self._load_lock:
+            if self._loaded:
+                return
+            async with get_db(self._db_path) as conn:
+                rows = await conn.execute_fetchall(
+                    "SELECT c.id, c.doc_id, c.content, d.title FROM chunks c "
+                    "LEFT JOIN documents d ON d.id = c.doc_id ORDER BY c.id"
+                )
+            ids: list[int] = []
+            meta: dict[int, tuple[int, str, str | None]] = {}
+            corpus: list[list[str]] = []
+            for row in rows:
+                content = row["content"] or ""
+                ids.append(row["id"])
+                meta[row["id"]] = (row["doc_id"], content, row["title"])
+                corpus.append(tokenize(content))
+            self._ids = ids
+            self._meta = meta
+            self._terms = [frozenset(tokens) for tokens in corpus]
+            # 空语料或全部切不出 token（avgdl = 0）会让 BM25Okapi 除零
+            self._bm25 = BM25Okapi(corpus) if any(corpus) else None
+            self._loaded = True
 
     def search(self, query: str, k: int) -> list[RetrievedChunk]:
         if self._bm25 is None:
@@ -86,6 +95,7 @@ class BM25Index:
 
 
 _indexes: dict[str, BM25Index] = {}
+_indexes_lock = asyncio.Lock()
 
 
 def _cache_key(db_path: str | Path | None) -> str:
@@ -96,8 +106,11 @@ async def _get_index(db_path: str | Path | None) -> BM25Index:
     key = _cache_key(db_path)
     index = _indexes.get(key)
     if index is None:
-        index = BM25Index(db_path)
-        _indexes[key] = index
+        async with _indexes_lock:
+            index = _indexes.get(key)
+            if index is None:
+                index = BM25Index(db_path)
+                _indexes[key] = index
     await index.load()
     return index
 

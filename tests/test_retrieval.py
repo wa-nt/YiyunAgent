@@ -1,3 +1,4 @@
+import asyncio
 import json
 import math
 from collections import Counter
@@ -7,6 +8,7 @@ import pytest
 from app.config import settings
 from app.db import get_db, init_db
 from app.ingest import pipeline
+from app.retrieval import bm25_search as bm25_module
 from app.retrieval import hybrid as hybrid_module
 from app.retrieval.bm25_search import bm25_search, invalidate, tokenize
 from app.retrieval.entity_search import entity_search, extract_entities
@@ -116,11 +118,34 @@ async def test_bm25_hits_chinese_keyword(db):
     assert await bm25_search("量子引力波", k=5, db_path=db) == []
 
 
+async def test_bm25_concurrent_cold_start_loads_once(db):
+    # 并发冷启动不允许双重加载（_ids 出现重复）
+    await asyncio.gather(*[bm25_search("缓存", k=5, db_path=db) for _ in range(8)])
+    index = bm25_module._indexes[bm25_module._cache_key(db)]
+    assert index._loaded
+    assert len(index._ids) == len(set(index._ids))
+
+
 async def test_extract_entities_keeps_names_only():
     assert extract_entities("KV Cache 与 asyncio") == ["KV", "Cache", "asyncio"]
-    assert extract_entities("缓存机制") == ["缓存机制"]
-    # 单字中文、超长中文串（句子片段）、纯标点都不当实体
-    assert extract_entities("的 分布式训练需要多卡同步梯度") == []
+    assert extract_entities("缓存机制") == ["缓存机制", "缓存", "存机", "机制"]
+    # 超长中文串（句子片段）不再整段弃用，切 2 字子串参与匹配
+    assert extract_entities("分布式训练需要多卡同步梯度") == [
+        "分布",
+        "布式",
+        "式训",
+        "训练",
+        "练需",
+        "需要",
+        "要多",
+        "多卡",
+        "卡同",
+        "同步",
+        "步梯",
+        "梯度",
+    ]
+    # 单字中文、纯标点都不当实体
+    assert extract_entities("的") == []
     assert extract_entities("!!!") == []
 
 
@@ -133,6 +158,12 @@ async def test_entity_search_ranks_by_hit_count(db):
 
     assert [h.chunk_id for h in await entity_search("asyncio", db_path=db)] == [4]
     assert await entity_search("!!!", db_path=db) == []
+
+
+async def test_entity_search_recalls_via_bigram_substrings(db):
+    # 「混合检索怎么实现」超过 8 字且不是正文连续子串，靠 2 字子串「混合」「检索」命中
+    hits = await entity_search("混合检索怎么实现", k=5, db_path=db)
+    assert 3 in [h.chunk_id for h in hits]
 
 
 async def test_hybrid_vector_mode_only_uses_vector_route(db, monkeypatch):
@@ -205,6 +236,37 @@ async def test_hybrid_fusion_ranks_dual_route_hits_first(db, monkeypatch):
         ordered.index(cid) for cid in single
     )
     assert ordered[0] in dual
+
+
+async def test_hybrid_fusion_includes_entity_only_hit(db, monkeypatch):
+    """实体路独有的 chunk（向量 / BM25 都不含）必须出现在 hybrid 结果里，
+    锁死三路都参与 RRF。"""
+    from app.retrieval.types import RetrievedChunk
+
+    def chunk(chunk_id: int) -> RetrievedChunk:
+        return RetrievedChunk(
+            chunk_id=chunk_id, doc_id=1, content=f"chunk {chunk_id}", title=None, score=1.0
+        )
+
+    async def fake_embed_texts(texts: list[str]) -> list[list[float]]:
+        return [QUERY_VEC for _ in texts]
+
+    async def fake_vector_search(*args, **kwargs):
+        return [chunk(1), chunk(2)]
+
+    async def fake_bm25_search(*args, **kwargs):
+        return [chunk(1), chunk(2)]
+
+    async def fake_entity_search(*args, **kwargs):
+        return [chunk(1), chunk(99)]
+
+    monkeypatch.setattr(hybrid_module, "embed_texts", fake_embed_texts)
+    monkeypatch.setattr(hybrid_module, "vector_search", fake_vector_search)
+    monkeypatch.setattr(hybrid_module, "bm25_search", fake_bm25_search)
+    monkeypatch.setattr(hybrid_module, "entity_search", fake_entity_search)
+
+    hits = await hybrid_search("任意查询", k=8, mode="hybrid", db_path=db)
+    assert 99 in [h.chunk_id for h in hits]
 
 
 async def test_invalidate_picks_up_newly_inserted_chunk(db):

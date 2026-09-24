@@ -4,16 +4,21 @@ from pathlib import Path
 from app.db import get_db
 from app.retrieval.types import RetrievedChunk
 
-# 保守启发式：英文词（2+ 字符）与 2-8 字的中文片段才当作候选实体，
-# 更长的中文串通常是句子片段而不是专名，整段弃用 —— 宁可漏召回。
+# 保守启发式：英文词（2+ 字符）与中文片段当作候选实体。2-8 字的中文串
+# 整体保留，再叠加 2 字子串参与 LIKE 匹配 —— 超过 8 字的长串（通常是句子
+# 片段）不再整段弃用，靠 bigram 子串召回包含其中专名的正文。
 _WORD = re.compile(r"[A-Za-z][A-Za-z0-9]+")
 _CJK = re.compile(r"[\u4e00-\u9fff]+")
 
 
 def extract_entities(query: str) -> list[str]:
-    candidates = _WORD.findall(query) + [
-        run for run in _CJK.findall(query) if 2 <= len(run) <= 8
-    ]
+    candidates = _WORD.findall(query)
+    for run in _CJK.findall(query):
+        if len(run) < 2:
+            continue
+        if len(run) <= 8:
+            candidates.append(run)
+        candidates.extend(run[i : i + 2] for i in range(len(run) - 1))
     seen: dict[str, None] = {}
     for token in candidates:
         seen.setdefault(token, None)
