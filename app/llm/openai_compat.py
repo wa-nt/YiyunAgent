@@ -57,15 +57,23 @@ def to_openai_tools(tools: list[ToolDef]) -> list[dict[str, Any]]:
     ]
 
 
+def _make_tool_call(raw_id: Any, name: Any, raw_args: Any, fallback_id: str) -> ToolCall:
+    try:
+        args = json.loads(raw_args or "{}")
+    except (json.JSONDecodeError, TypeError):
+        args = {"_raw": raw_args}
+    if not isinstance(args, dict):
+        args = {"_raw": args}
+    return ToolCall(
+        id=raw_id or fallback_id, name=name or "unknown", arguments=args
+    )
+
+
 def _parse_tool_calls(raw: list[Any]) -> list[ToolCall]:
-    calls = []
-    for tc in raw:
-        try:
-            args = json.loads(tc.function.arguments or "{}")
-        except json.JSONDecodeError:
-            args = {"_raw": tc.function.arguments}
-        calls.append(ToolCall(id=tc.id, name=tc.function.name, arguments=args))
-    return calls
+    return [
+        _make_tool_call(tc.id, tc.function.name, tc.function.arguments, f"call_{i}")
+        for i, tc in enumerate(raw)
+    ]
 
 
 class OpenAICompatClient:
@@ -122,19 +130,18 @@ class OpenAICompatClient:
             if delta.content:
                 yield StreamChunk(text_delta=delta.content)
             for tc in delta.tool_calls or []:
-                slot = pending.setdefault(tc.index, {"id": "", "name": "", "args": ""})
+                # 部分兼容端点省略 index，按到达顺序归入新槽位
+                idx = tc.index if tc.index is not None else len(pending)
+                slot = pending.setdefault(idx, {"id": "", "name": "", "args": ""})
                 if tc.id:
                     slot["id"] = tc.id
                 if tc.function:
-                    if tc.function.name:
-                        slot["name"] += tc.function.name
+                    if tc.function.name and not slot["name"]:
+                        slot["name"] = tc.function.name
                     if tc.function.arguments:
                         slot["args"] += tc.function.arguments
-        calls = []
-        for slot in pending.values():
-            try:
-                args = json.loads(slot["args"] or "{}")
-            except json.JSONDecodeError:
-                args = {"_raw": slot["args"]}
-            calls.append(ToolCall(id=slot["id"], name=slot["name"], arguments=args))
+        calls = [
+            _make_tool_call(slot["id"], slot["name"], slot["args"], f"call_{i}")
+            for i, (idx, slot) in enumerate(sorted(pending.items()))
+        ]
         yield StreamChunk(finish=True, tool_calls=calls, usage=usage)

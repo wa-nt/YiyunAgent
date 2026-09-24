@@ -18,6 +18,7 @@ class Settings(BaseSettings):
 
     anthropic_api_key: Optional[str] = None
     anthropic_model: str = "claude-sonnet-4-5"
+    anthropic_max_tokens: int = 4096
 
     embed_base_url: Optional[str] = None
     embed_api_key: Optional[str] = None

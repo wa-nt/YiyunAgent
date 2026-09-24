@@ -1,7 +1,5 @@
 from types import SimpleNamespace
 
-import pytest
-
 from app.llm.anthropic import AnthropicClient, to_anthropic_payload, to_anthropic_tools
 from app.llm.openai_compat import OpenAICompatClient, to_openai_messages, to_openai_tools
 from app.llm.types import Message, ToolCall, ToolDef
@@ -53,16 +51,13 @@ def _openai_response():
 
 async def test_openai_chat():
     client = OpenAICompatClient(api_key="k", model="m")
-    client.client = SimpleNamespace(
-        chat=SimpleNamespace(
-            completions=SimpleNamespace(create=_openai_response)
-        )
-    )
 
     async def fake_create(**kwargs):
         return _openai_response()
 
-    client.client.chat.completions.create = fake_create
+    client.client = SimpleNamespace(
+        chat=SimpleNamespace(completions=SimpleNamespace(create=fake_create))
+    )
     result = await client.chat(MSGS, TOOLS)
     assert result.text == "好的"
     assert result.tool_calls[0].name == "search"
@@ -80,37 +75,37 @@ async def test_openai_stream_aggregates_tool_call():
 
         async def gen():
             deltas = [
-            chunk(SimpleNamespace(content="你", tool_calls=None)),
-            chunk(SimpleNamespace(content="好", tool_calls=None)),
-            chunk(
+                chunk(SimpleNamespace(content="你", tool_calls=None)),
+                chunk(SimpleNamespace(content="好", tool_calls=None)),
+                chunk(
+                    SimpleNamespace(
+                        content=None,
+                        tool_calls=[
+                            SimpleNamespace(
+                                index=0,
+                                id="c1",
+                                function=SimpleNamespace(name="search", arguments='{"q"'),
+                            )
+                        ],
+                    )
+                ),
+                chunk(
+                    SimpleNamespace(
+                        content=None,
+                        tool_calls=[
+                            SimpleNamespace(
+                                index=0,
+                                id=None,
+                                function=SimpleNamespace(name=None, arguments=': "x"}'),
+                            )
+                        ],
+                    )
+                ),
                 SimpleNamespace(
-                    content=None,
-                    tool_calls=[
-                        SimpleNamespace(
-                            index=0,
-                            id="c1",
-                            function=SimpleNamespace(name="search", arguments='{"q"'),
-                        )
-                    ],
-                )
-            ),
-            chunk(
-                SimpleNamespace(
-                    content=None,
-                    tool_calls=[
-                        SimpleNamespace(
-                            index=0,
-                            id=None,
-                            function=SimpleNamespace(name=None, arguments=': "x"}'),
-                        )
-                    ],
-                )
-            ),
-            SimpleNamespace(
-                choices=[],
-                usage=SimpleNamespace(prompt_tokens=3, completion_tokens=2),
-            ),
-        ]
+                    choices=[],
+                    usage=SimpleNamespace(prompt_tokens=3, completion_tokens=2),
+                ),
+            ]
             for d in deltas:
                 yield d
 
@@ -152,3 +147,116 @@ async def test_anthropic_chat():
     assert result.text == "好的"
     assert result.tool_calls[0].arguments == {"q": "x"}
     assert result.usage.tokens_out == 5
+
+
+def test_anthropic_merges_parallel_tool_results():
+    msgs = [
+        Message(role="user", content="查两个"),
+        Message(
+            role="assistant",
+            tool_calls=[
+                ToolCall(id="c1", name="search", arguments={"q": "a"}),
+                ToolCall(id="c2", name="search", arguments={"q": "b"}),
+            ],
+        ),
+        Message(role="tool", tool_call_id="c1", content="结果A"),
+        Message(role="tool", tool_call_id="c2", content="结果B"),
+    ]
+    _, out = to_anthropic_payload(msgs)
+    assert [m["role"] for m in out] == ["user", "assistant", "user"]
+    assert len(out[2]["content"]) == 2
+    assert all(b["type"] == "tool_result" for b in out[2]["content"])
+
+
+async def test_openai_malformed_arguments_do_not_crash():
+    client = OpenAICompatClient(api_key="k", model="m")
+    tc = SimpleNamespace(
+        id=None, function=SimpleNamespace(name=None, arguments="[1,2]")
+    )
+
+    async def fake_create(**kwargs):
+        return SimpleNamespace(
+            choices=[
+                SimpleNamespace(message=SimpleNamespace(content=None, tool_calls=[tc]))
+            ],
+            usage=None,
+        )
+
+    client.client = SimpleNamespace(
+        chat=SimpleNamespace(completions=SimpleNamespace(create=fake_create))
+    )
+    result = await client.chat(MSGS)
+    assert result.tool_calls[0].id == "call_0"
+    assert result.tool_calls[0].arguments == {"_raw": [1, 2]}
+
+
+async def test_openai_stream_without_index():
+    client = OpenAICompatClient(api_key="k", model="m")
+
+    def tc_delta(idx, name, args):
+        return SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    delta=SimpleNamespace(
+                        content=None,
+                        tool_calls=[
+                            SimpleNamespace(
+                                index=idx,
+                                id=None,
+                                function=SimpleNamespace(name=name, arguments=args),
+                            )
+                        ],
+                    )
+                )
+            ],
+            usage=None,
+        )
+
+    async def fake_create(**kwargs):
+        async def gen():
+            # 两个并列调用，端点省略 index
+            yield tc_delta(None, "a", '{"x":1}')
+            yield tc_delta(None, "b", '{"y":2}')
+
+        return gen()
+
+    client.client = SimpleNamespace(
+        chat=SimpleNamespace(completions=SimpleNamespace(create=fake_create))
+    )
+    chunks = [c async for c in client.chat_stream(MSGS)]
+    final = chunks[-1]
+    names = [t.name for t in final.tool_calls]
+    assert names == ["a", "b"]
+
+
+async def test_anthropic_stream():
+    client = AnthropicClient(api_key="k", model="m")
+
+    class FakeStream:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        @property
+        def text_stream(self):
+            async def gen():
+                yield "你"
+                yield "好"
+
+            return gen()
+
+        async def get_final_message(self):
+            return _anthropic_response()
+
+    def fake_stream(**kwargs):
+        assert kwargs["system"] == "你是助手"
+        return FakeStream()
+
+    client.client = SimpleNamespace(messages=SimpleNamespace(stream=fake_stream))
+    chunks = [c async for c in client.chat_stream(MSGS, TOOLS)]
+    assert "".join(c.text_delta for c in chunks) == "你好"
+    final = chunks[-1]
+    assert final.finish and final.tool_calls[0].name == "search"
+    assert final.usage.tokens_in == 10

@@ -7,7 +7,9 @@ def get_llm() -> LLMClient:
         from app.llm.anthropic import AnthropicClient
 
         return AnthropicClient(
-            api_key=settings.anthropic_api_key, model=settings.anthropic_model
+            api_key=settings.anthropic_api_key,
+            model=settings.anthropic_model,
+            max_tokens=settings.anthropic_max_tokens,
         )
     from app.llm.openai_compat import OpenAICompatClient
 
