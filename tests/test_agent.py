@@ -359,6 +359,77 @@ async def test_disconnect_keeps_partial_answer_in_next_history(db, monkeypatch):
     assert saved[3]["content"] == "第二次回答"
 
 
+async def test_answer_is_persisted_before_done_event(db, monkeypatch):
+    """done 一到客户端就会关掉 SSE、任务随即被取消。助手消息必须在 done 之前
+    落库，否则正常成功路径下 assistant 行会永久丢失（复审实测 0/8）。"""
+    use_llm(monkeypatch, FakeLLM([[chunk("答案"), final()]]))
+    fake_chunks(monkeypatch, [])
+
+    stream = runtime.run_agent(SESSION, "问题")
+    async for event in stream:
+        if event.type == "done":
+            # 还没关流：done 之前就应该已经落库，且是完整回答（无未完成标记）
+            saved = await messages_of(SESSION, db)
+            assert [m["role"] for m in saved] == ["user", "assistant"]
+            assert saved[1]["content"] == "答案"
+            break
+    await stream.aclose()
+
+    # 关流后不会重复落库
+    assert [m["role"] for m in await messages_of(SESSION, db)] == ["user", "assistant"]
+
+
+async def test_get_llm_failure_yields_error_event(db, monkeypatch):
+    """get_llm() 自己抛（比如没配 API key）也必须发 error 事件，不能逃出生成器。"""
+
+    def boom():
+        raise RuntimeError("没有配置 API key")
+
+    monkeypatch.setattr(runtime, "get_llm", boom)
+    fake_chunks(monkeypatch, [])
+
+    events = await collect()
+
+    assert [e.type for e in events] == ["error"]
+    assert "没有配置 API key" in events[0].data["message"]
+    # 提问仍然落库
+    assert (await messages_of(SESSION, db))[0]["content"] == "什么是 RAG？"
+
+
+class PartialThenBoomLLM:
+    """吐半个回答后抛异常。"""
+
+    async def chat_stream(self, messages, tools=None):
+        yield chunk("半截")
+        raise RuntimeError("llm 挂了")
+
+
+async def test_no_incomplete_marker_on_round_limit(db, monkeypatch):
+    """「未完成」标记只属于中断路径，不能误加到工具轮数上限。"""
+    use_llm(monkeypatch, FakeLLM([[chunk("半截回答"), *tool_round()]]))
+    fake_chunks(monkeypatch, [])
+
+    events = await collect()
+    assert events[-1].type == "error"
+
+    saved = await messages_of(SESSION, db)
+    assert "半截回答" in saved[1]["content"]
+    assert "未完成" not in saved[1]["content"]
+
+
+async def test_no_incomplete_marker_on_llm_exception(db, monkeypatch):
+    """LLM 异常路径同理：回答由 error 事件交代，历史里不打「未完成」标记。"""
+    use_llm(monkeypatch, PartialThenBoomLLM())
+    fake_chunks(monkeypatch, [])
+
+    events = await collect()
+    assert [e.type for e in events] == ["text_delta", "error"]
+
+    saved = await messages_of(SESSION, db)
+    assert "半截" in saved[1]["content"]
+    assert "未完成" not in saved[1]["content"]
+
+
 # ---------- API 层 ----------
 
 
@@ -459,22 +530,6 @@ async def test_chat_session_event_survives_ensure_session_failure(client, monkey
     assert resp.status_code == 200
     assert [e["type"] for e in events] == ["error"]
     assert "建会话失败" in events[-1]["data"]["message"]
-
-
-async def test_chat_error_event_is_json_serializable(client, monkeypatch):
-    """兜底事件里的 data 可能带着无法 json 化的对象，不能让 SSE 再炸一次。"""
-    leaky = object()
-
-    async def boom(session_id, message, db_path=None):
-        yield runtime.AgentEvent("text_delta", {"text": "开头"})
-        raise RuntimeError(leaky)  # 异常消息本身带不可序列化内容
-
-    monkeypatch.setattr("app.main.run_agent", boom)
-
-    resp = await client.post("/api/chat", json={"session_id": "s1", "message": "hi"})
-    events = parse_sse(resp.text)
-
-    assert events[-1]["type"] == "error"
 
 
 async def test_ingest_and_documents_endpoints(client, monkeypatch):

@@ -51,14 +51,8 @@ async def _sse(req: ChatRequest):
 
 
 def _sse_line(event_type: str, data: dict) -> str:
-    """异常兜底也要保证可序列化：data 里可能带着无法 json 化的对象。"""
-    try:
-        payload = json.dumps({"type": event_type, "data": data}, ensure_ascii=False)
-    except (TypeError, ValueError):
-        payload = json.dumps(
-            {"type": event_type, "data": {"message": "服务器内部错误"}}, ensure_ascii=False
-        )
-    return f"data: {payload}\n\n"
+    """SSE 一行。事件数据都由 runtime 用 JSON 可序列化的值构造，无需再做兜底。"""
+    return f"data: {json.dumps({'type': event_type, 'data': data}, ensure_ascii=False)}\n\n"
 
 
 @app.post("/api/chat")

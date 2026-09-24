@@ -157,23 +157,29 @@ async def run_agent(
     answer = ""
     calls: list[ToolCall] = []
     answer_saved = False
-    completed = False
 
     async def save_answer(interrupted: bool = False) -> None:
-        """落库助手输出，只落一次。正常结束、异常、断开都走这里。"""
+        """落库助手输出，只落一次。
+
+        各终态（done / 两条 error）在 yield 之前就调用它——客户端收到 done 就会
+        关闭 SSE，任务随即被取消，那时再写库会被 CancelledError 打断。
+        finally 里的调用只兜底「没有任何终态到达」的中断（客户端提前断开）。
+        """
         nonlocal answer_saved
         if answer_saved:
             return
         answer_saved = True
         content = _assistant_message(answer, calls).content
         if interrupted:
-            mark = "（回答未完成：客户端断开）"
+            # 中断路径（客户端断开 / 生成器被关闭）没有终态事件，回答是半截的，
+            # 留个标记，避免下次加载历史时被当成完整回答
+            mark = "（回答未完成）"
             content = f"{content}\n{mark}" if content else mark
         await _save_message(session_id, "assistant", content, path)
 
     try:
-        llm = get_llm()
         try:
+            llm = get_llm()
             for _ in range(MAX_TOOL_ROUNDS):
                 text = ""
                 final_calls: list[ToolCall] = []
@@ -188,7 +194,7 @@ async def run_agent(
                         final_calls = chunk.tool_calls
 
                 if not final_calls:
-                    completed = True
+                    await save_answer()
                     yield AgentEvent("done", {"session_id": session_id, "text": answer})
                     return
 
@@ -211,6 +217,7 @@ async def run_agent(
                         Message(role="tool", tool_call_id=call.id, content=result)
                     )
 
+            await save_answer()
             yield AgentEvent(
                 "error",
                 {
@@ -220,6 +227,7 @@ async def run_agent(
                 },
             )
         except Exception as exc:
+            await save_answer()
             yield AgentEvent(
                 "error",
                 {
@@ -229,8 +237,6 @@ async def run_agent(
                 },
             )
     finally:
-        # 助手输出在正常结束、异常、断开三种路径下落库一次；断开时答案被截断，
-        # 补一句标记，避免下次加载历史时被当成完整回答。
-        # 注意：HTTP 断开是取消任务，这次写库可能被 CancelledError 打断——用户提问
-        # 在上方已经落库，所以丢的只是这半截回答，不重试也不吞掉取消信号。
-        await save_answer(interrupted=not completed and bool(answer))
+        # 走到这里说明没有终态事件发出过（客户端断开、生成器被关闭），
+        # 尽力落库一次；任务已被取消时这次写库可能被打断，丢的只是半截回答。
+        await save_answer(interrupted=True)
