@@ -76,8 +76,14 @@ def _parse_content(blocks: list[Any]) -> tuple[str, list[ToolCall]]:
         if b.type == "text":
             text_parts.append(b.text)
         elif b.type == "tool_use":
-            args = b.input if isinstance(b.input, dict) else {"_raw": b.input}
-            calls.append(ToolCall(id=b.id, name=b.name, arguments=args))
+            args = b.input if isinstance(b.input, dict) else ({} if b.input is None else {"_raw": b.input})
+            calls.append(
+                ToolCall(
+                    id=b.id or f"call_{len(calls)}",
+                    name=b.name or "unknown",
+                    arguments=args,
+                )
+            )
     return "".join(text_parts), calls
 
 

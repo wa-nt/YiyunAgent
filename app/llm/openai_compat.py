@@ -130,9 +130,14 @@ class OpenAICompatClient:
             if delta.content:
                 yield StreamChunk(text_delta=delta.content)
             for tc in delta.tool_calls or []:
-                # 部分兼容端点省略 index，按到达顺序归入新槽位
-                idx = tc.index if tc.index is not None else len(pending)
-                slot = pending.setdefault(idx, {"id": "", "name": "", "args": ""})
+                # 部分兼容端点省略 index：无 name 的分片视为上一个调用的续传
+                if tc.index is not None:
+                    idx = tc.index
+                elif tc.function and tc.function.name:
+                    idx = (max(pending) + 1) if pending else 0
+                else:
+                    idx = (max(pending) if pending else 0)
+                slot = pending.setdefault(idx, {"id": "", "name": "", "args": "", "seq": len(pending)})
                 if tc.id:
                     slot["id"] = tc.id
                 if tc.function:
@@ -142,6 +147,8 @@ class OpenAICompatClient:
                         slot["args"] += tc.function.arguments
         calls = [
             _make_tool_call(slot["id"], slot["name"], slot["args"], f"call_{i}")
-            for i, (idx, slot) in enumerate(sorted(pending.items()))
+            for i, slot in enumerate(
+                sorted(pending.values(), key=lambda s: s["seq"])
+            )
         ]
         yield StreamChunk(finish=True, tool_calls=calls, usage=usage)
