@@ -75,7 +75,7 @@ async def test_openai_stream_aggregates_tool_call():
     def chunk(delta):
         return SimpleNamespace(choices=[SimpleNamespace(delta=delta)], usage=None)
 
-    def fake_create(**kwargs):
+    async def fake_create(**kwargs):
         assert kwargs["stream"] is True
 
         async def gen():
