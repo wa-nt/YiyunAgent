@@ -8,11 +8,19 @@
 注入点（真实运行与测试共用同一套机制）：
 - llm 参数：替换 runtime.get_llm 的返回值；测试传 FakeLLM，真实评测传 None（走配置）
 - config_overrides：评测期间临时改写 settings（消融矩阵的开关来源），结束后恢复
-- 检索/记忆观测：包装 runtime.hybrid_search 与 runtime.recall_memories 记录本轮
-  实际检索到的标识符与召回的记忆文本，用 contextvar 按样本隔离（并发安全）
+- 检索/记忆观测：包装 runtime.hybrid_search 与 runtime.recall_memories 记录**每次调用**
+  实际检索到的标识符（按轮次分段）与召回的记忆文本，用 contextvar 按样本隔离（并发安全）
 
 检索标识符约定：expected_chunks 里写**文档标题**（chunk 自增 id 在重新 ingest
 后不稳定，不能进评测集）。runner 把每个检索到的 chunk 映射为标题参与比对。
+
+每个样本可能有多轮检索（ReAct 循环），观测器按**每次检索调用**分段记录，评分时
+对每篇期望文档取「在任一轮中的最好排名」（见 metrics.retrieval_metrics_rounds）：
+把多轮结果拼成一个列表再按 k 截断会让第 2 轮的命中系统性落到 k 之后。
+
+db_path 是**一次性的 scratch 库**：run_eval 开始时删掉它（含 -wal/-shm）再重新 ingest，
+否则每次运行都会把同一批文档追加一遍（ingest 是纯追加），语料翻倍、首跑数字不可复现。
+默认值与 CLI 一致（data/eval.db），**不回落 settings.db_path**——那是应用在用的知识库。
 
 用法：
     python -m eval.runner --dataset eval/dataset/eval.json
@@ -31,19 +39,28 @@ import time
 import uuid
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal, get_args, get_origin
 
 from app.agent import runtime
-from app.config import settings
+from app.config import Settings, settings
 from app.db import get_db, init_db
 from app.ingest.pipeline import ingest
-from eval.metrics import aggregate_metrics, answer_metrics, memory_metrics, retrieval_metrics
+from app.tracing import drain_traces
+from eval.metrics import (
+    aggregate_metrics,
+    answer_metrics,
+    memory_metrics,
+    retrieval_metrics_rounds,
+)
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_DATASET = "eval/dataset/eval.json"
 DEFAULT_DB_PATH = "data/eval.db"
 RESULTS_DIR = Path("eval/results")
+# SQLite 除主库文件外的旁路文件。删库时要一起删：WAL 里可能有未回写的页，
+# 只删主库会让新库从旧 WAL 里「继承」上次运行的残留行
+DB_SIDECARS = ("-wal", "-shm")
 # 消融矩阵里参与快照的开关字段，结果目录里的配置快照只记这些（定价等无关字段不记）
 CONFIG_SNAPSHOT_FIELDS = (
     "memory_enabled",
@@ -54,10 +71,10 @@ CONFIG_SNAPSHOT_FIELDS = (
     "tracing_enabled",
 )
 
-# 当前样本的观测收集器：检索到的标识符 / 召回的记忆文本。按样本隔离（contextvars
-# 随 asyncio.Task 上下文复制，并发样本互不串扰）
-_current_retrieved: contextvars.ContextVar[list[str] | None] = contextvars.ContextVar(
-    "eval_retrieved", default=None
+# 当前样本的观测收集器：按**每次检索调用**分段记录到的标识符 / 召回的记忆文本。
+# 按样本隔离（contextvars 随 asyncio.Task 上下文复制，并发样本互不串扰）
+_current_retrieved: contextvars.ContextVar[list[list[str]] | None] = (
+    contextvars.ContextVar("eval_retrieved", default=None)
 )
 _current_recalled: contextvars.ContextVar[list[str] | None] = contextvars.ContextVar(
     "eval_recalled", default=None
@@ -84,13 +101,19 @@ class EvalResult:
     created_at: str
     samples: list[SampleResult] = field(default_factory=list)
     metrics: dict[str, Any] = field(default_factory=dict)
+    dataset_version: Any = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
-    def save(self, results_dir: Path = RESULTS_DIR) -> Path:
-        """落盘到 eval/results/{timestamp}/result.json，含 git hash 与配置快照。"""
-        out_dir = results_dir / time.strftime("%Y%m%d-%H%M%S")
+    def save(self, results_dir: Path = RESULTS_DIR, name: str | None = None) -> Path:
+        """落盘到 eval/results/{timestamp}[-{name}]/result.json，含 git hash 与配置快照。
+
+        目录名带 name（消融矩阵传组名）：8 组消融通常落在同一秒里，只有秒级时间戳时
+        后面的组会覆盖前面组的目录，只留下最后一组的 result.json 与逐样本 trace。
+        """
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        out_dir = results_dir / (f"{stamp}-{name}" if name else stamp)
         out_dir.mkdir(parents=True, exist_ok=True)
         path = out_dir / "result.json"
         path.write_text(
@@ -106,6 +129,52 @@ def load_dataset(dataset_path: str | Path) -> dict[str, Any]:
     if not dataset.get("samples"):
         raise ValueError(f"评测集为空或缺少 samples 字段：{path}")
     return dataset
+
+
+async def _reset_db(db_path: str | Path) -> None:
+    """删掉评测库及其 WAL 旁路文件，让本次运行的 ingest 从空库开始。
+
+    ingest 是纯追加、不带判重，不清库就会把同一批文档一遍遍灌进去（语料翻倍，
+    hit@k 随运行次数单调下滑）。删文件比「按 source 幂等」干净：chunk 自增 id 也
+    跟着回到初始值，两次运行的 trace 可以直接逐字节对比。
+
+    删之前必须等在途的 trace 写入结束（T9 的埋点是 fire-and-forget）：工具 trace 落
+    的正是这个评测库，任务没跑完就删文件在 Windows 上会直接 PermissionError
+    （「另一个程序正在使用此文件」），Linux 上则是把 trace 悄悄写进已删除的 inode。
+    """
+    await drain_traces()
+    path = Path(db_path)
+    for suffix in ("", *DB_SIDECARS):
+        Path(f"{path}{suffix}").unlink(missing_ok=True)
+
+
+def _error_result(sample: dict[str, Any], exc: BaseException) -> SampleResult:
+    """gather 兜住的漏网异常 → 一条失败样本记录（与逐样本记错的口径一致）。
+
+    指标直接给「空回答」的形状与分值：error 非空时聚合里的 errors 已经把它标出来了，
+    但分类明细也得有可读的值。这里不走 answer_metrics——没有回答就是 0 分，不能因为
+    样本恰好没标 expected_contains 而被算成「无约束 → 满分」。
+
+    各字段用 .get 读：走到这里的原因可能就是样本字段缺失（构造错误的评测集），
+    兜底函数自己再抛一次 KeyError 会把「记下来继续跑」变成「整轮炸掉」。
+    """
+    return SampleResult(
+        id=sample.get("id", "<unknown>"),
+        category=sample.get("category", "unknown"),
+        query=sample.get("query", ""),
+        answer="",
+        error=f"{type(exc).__name__}: {exc}",
+        metrics={
+            "retrieval": None,
+            "answer": {
+                "keyword_coverage": 0.0,
+                "matched": [],
+                "missed": list(sample.get("expected_answer_contains", [])),
+                "violated": [],
+            },
+            "memory": memory_metrics(None, sample.get("expected_memories", [])),
+        },
+    )
 
 
 def git_commit() -> str:
@@ -126,12 +195,42 @@ def config_snapshot() -> dict[str, Any]:
     return {name: getattr(settings, name) for name in CONFIG_SNAPSHOT_FIELDS}
 
 
+def _literal_values(name: str) -> tuple[Any, ...] | None:
+    """settings 字段是 Literal 时返回它的允许取值，否则 None。
+
+    校验范围只看 Literal：这类字段的取值是**闭集**（retrieval_mode 的
+    vector/bm25/hybrid），拼错一个字母没有「退化为默认」的合理语义，只会在下游
+    炸成 500。bool/数值字段不在守卫范围内——它们的非法值（字符串 "false"）语义
+    模糊，交给 pydantic 的默认行为即可。
+    """
+    annotation = Settings.model_fields[name].annotation
+    return get_args(annotation) if get_origin(annotation) is Literal else None
+
+
 class _settings_override:
-    """评测期间临时改写 settings，退出时恢复原值（消融开关的载体）。"""
+    """评测期间临时改写 settings，退出时恢复原值（消融开关的载体）。
+
+    入口做两道校验，都是**评测开始前**报错：
+    - 字段必须存在（裸 setattr 绕过 pydantic，拼错字段名会被 pydantic 当场拒绝，
+      不校验的话报错点会漂到 __enter__ 的半途，已改的字段留在原地）
+    - Literal 字段的取值必须在允许集合里（否则 hybrid_search 抛 ValueError，
+      经 asyncio.gather 冒成整轮评测异常）
+    """
 
     def __init__(self, overrides: dict[str, Any] | None) -> None:
         self._overrides = overrides or {}
         self._saved: dict[str, Any] = {}
+        self._validate()
+
+    def _validate(self) -> None:
+        for name, value in self._overrides.items():
+            if name not in Settings.model_fields:
+                raise ValueError(f"未知的配置字段：{name!r}")
+            allowed = _literal_values(name)
+            if allowed is not None and value not in allowed:
+                raise ValueError(
+                    f"配置 {name} 的取值非法：{value!r}，允许：{list(allowed)}"
+                )
 
     def __enter__(self) -> None:
         for name, value in self._overrides.items():
@@ -156,7 +255,8 @@ def _install_observers() -> dict[str, Any]:
         chunks = await original_search(query, k=k, mode=mode, db_path=db_path)
         sink = _current_retrieved.get()
         if sink is not None:
-            sink.extend(c.title or f"chunk {c.chunk_id}" for c in chunks)
+            # 每次调用记一段：多轮检索的排名要按轮次分开算（见 retrieval_metrics_rounds）
+            sink.append([c.title or f"chunk {c.chunk_id}" for c in chunks])
         return chunks
 
     async def recording_recall(user_message, db_path=None):
@@ -209,25 +309,28 @@ async def _seed_sample(sample: dict[str, Any], session_id: str, db_path: str) ->
 async def _run_sample(
     sample: dict[str, Any], db_path: str, k: int
 ) -> SampleResult:
-    """执行阶段 + 评分阶段：消费 run_agent 事件流直到终态，然后算指标。"""
-    session_id = f"eval-{sample['id']}-{uuid.uuid4().hex[:6]}"
-    await _seed_sample(sample, session_id, db_path)
+    """执行阶段 + 评分阶段：消费 run_agent 事件流直到终态，然后算指标。
 
-    retrieved: list[str] = []
+    run_agent 内部的故障（LLM 异常、工具失败）会以 error 事件的形式到达这里，记进
+    SampleResult.error；本函数自己不捕获异常，样本级的任何故障由调用方 guarded 兜住
+    （见 run_eval），保证「一个样本炸掉不影响整轮」的口径只有一处实现。
+    """
+    session_id = f"eval-{sample['id']}-{uuid.uuid4().hex[:6]}"
+    rounds: list[list[str]] = []
     recalled: list[str] = []
-    token_r = _current_retrieved.set(retrieved)
-    token_m = _current_recalled.set(recalled)
     answer = ""
     error: str | None = None
+    token_r = _current_retrieved.set(rounds)
+    token_m = _current_recalled.set(recalled)
     try:
+        await _seed_sample(sample, session_id, db_path)
         async for event in runtime.run_agent(session_id, sample["query"], db_path):
             if event.type == "text_delta":
                 answer += event.data.get("text", "")
-            elif event.type == "done":
+            elif event.type in ("done", "error"):
                 answer = event.data.get("text", answer)
-            elif event.type == "error":
-                answer = event.data.get("text", answer)
-                error = event.data.get("message", "unknown error")
+                if event.type == "error":
+                    error = event.data.get("message", "unknown error")
     finally:
         _current_retrieved.reset(token_r)
         _current_recalled.reset(token_m)
@@ -240,15 +343,22 @@ async def _run_sample(
         category=sample["category"],
         query=sample["query"],
         answer=answer,
-        retrieved=retrieved,
+        # 扁平化只用于产物可读（trace 里看到实际检索到的顺序）；评分按 rounds 分轮算
+        retrieved=[title for rnd in rounds for title in rnd],
         recalled_memory="\n".join(recalled) or None,
         error=error,
     )
     result.metrics = {
         "retrieval": (
-            retrieval_metrics(retrieved, expected_chunks, k) if expected_chunks else None
+            retrieval_metrics_rounds(rounds, expected_chunks, k)
+            if expected_chunks
+            else None
         ),
-        "answer": answer_metrics(answer, sample.get("expected_answer_contains", [])),
+        "answer": answer_metrics(
+            answer,
+            sample.get("expected_answer_contains", []),
+            sample.get("expected_answer_excludes", []),
+        ),
         "memory": memory_metrics(
             result.recalled_memory, sample.get("expected_memories", [])
         ),
@@ -267,9 +377,13 @@ async def run_eval(
 ) -> EvalResult:
     """跑一遍评测集，返回聚合结果。
 
-    - config_overrides：评测期间生效的 settings 改写（消融矩阵用），结束恢复
-    - db_path：评测库；默认 settings.db_path。llm trace 只写 settings.db_path
-    （进程级口径），要收集 trace 就把 settings.db_path 指到同一个库
+    - config_overrides：评测期间生效的 settings 改写（消融矩阵用），结束恢复；
+      取值非法（未知字段 / Literal 字段给了集合外的值）在这里就报错，不等到检索时报
+    - db_path：评测用的**一次性 scratch 库**，默认 data/eval.db。每次运行开始时
+      连同 -wal/-shm 一起删掉重建：ingest 是纯追加，不清库的话第二次运行会把同一批
+      文档再灌一遍，语料翻倍、首跑数字不可复现（实测三次运行 hit@k 0.82→0.54→0.36）。
+      注意 llm trace 的落库口径是进程级的（只认 settings.db_path，见 app/tracing.py），
+      要收集 trace 就把 settings.db_path 指到同一个库
     - llm：注入的模型桩；None 时走 app.llm.get_llm 的真实配置
     - sample_ids：只跑指定子集（小规模冒烟用）
     - concurrency：asyncio.gather 的并发上限，避免打满 rate limit
@@ -279,10 +393,13 @@ async def run_eval(
     if sample_ids is not None:
         wanted = set(sample_ids)
         samples = [s for s in samples if s["id"] in wanted]
-    path = db_path or settings.db_path
+    # 不回落 settings.db_path：那是**在用的应用库**，删掉它等于删用户的知识库；
+    # 评测库必须是独立的 scratch 文件（与 CLI 的默认值一致）
+    path = db_path or DEFAULT_DB_PATH
     docs_dir = Path(dataset_path).parent / "docs"
 
     with _settings_override(config_overrides):
+        await _reset_db(path)
         await init_db(path)
         for doc in dataset.get("docs", []):
             await ingest(docs_dir / doc, path)
@@ -294,17 +411,51 @@ async def run_eval(
         semaphore = asyncio.Semaphore(concurrency)
 
         async def guarded(sample: dict[str, Any]) -> SampleResult:
+            """样本级故障一律转成 SampleResult.error（逐样本口径）。
+
+            异常在这里被吃掉是**必须**的：让它冒到 gather 的话，gather 会在第一个异常
+            处立刻向上抛，但其余任务不被取消、继续在后台跑，而下面的 finally 随即撤掉
+            观测器与 LLM 桩、with 块退出还会把 settings 恢复默认——在飞的样本于是拿到
+            「默认配置 + 真实客户端」，直接打真实 API 烧配额（见下方 gather 的说明）。
+            """
             async with semaphore:
-                return await _run_sample(sample, path, k)
+                try:
+                    return await _run_sample(sample, path, k)
+                except Exception as exc:
+                    logger.warning(
+                        "样本 %s 失败：%s: %s",
+                        sample.get("id"),
+                        type(exc).__name__,
+                        exc,
+                    )
+                    return _error_result(sample, exc)
 
         try:
-            results = await asyncio.gather(*(guarded(s) for s in samples))
+            # return_exceptions=True 是**必需**的，不是顺手加的：默认行为在第一个异常时
+            # 立刻向上抛，其余任务不被取消、继续在后台跑；下面的 finally 随即撤掉观测器与
+            # LLM 桩、with 块退出还会把 settings 恢复默认——在飞的样本于是拿到「默认配置 +
+            # 真实客户端」，直接打真实 API 烧配额。开了这个开关后 gather 等所有任务真正
+            # 结束才返回，恢复动作因此一定发生在最后一个请求之后。
+            outcomes = await asyncio.gather(
+                *(guarded(s) for s in samples), return_exceptions=True
+            )
         finally:
             _restore_observers(originals)
             runtime.get_llm = original_get_llm
 
         # 快照要在 override 生效期内拍：出了 with 块 settings 已恢复成默认值
         snapshot = config_snapshot()
+
+    results: list[SampleResult] = []
+    for sample, outcome in zip(samples, outcomes, strict=True):
+        if isinstance(outcome, BaseException) and not isinstance(outcome, Exception):
+            # 取消 / 键盘中断是「整轮别跑了」的信号，不该被降级成一个失败样本
+            raise outcome
+        results.append(
+            outcome
+            if isinstance(outcome, SampleResult)
+            else _error_result(sample, outcome)
+        )
 
     sample_dicts = [
         {"id": r.id, "category": r.category, "error": r.error, "metrics": r.metrics}
@@ -315,8 +466,9 @@ async def run_eval(
         git_commit=git_commit(),
         config=snapshot,
         created_at=time.strftime("%Y-%m-%dT%H:%M:%S"),
-        samples=list(results),
+        samples=results,
         metrics=aggregate_metrics(sample_dicts),
+        dataset_version=dataset.get("version"),
     )
 
 
@@ -341,9 +493,9 @@ async def _main_async(argv: list[str] | None = None) -> None:
         )
         if not args.no_save:
             for name, result in results.items():
-                path = result.save()
+                path = result.save(name=name)
                 logger.info("组 %s 结果已保存：%s", name, path)
-            report_path = save_report(render_ablation_report(results))
+            report_path = save_report(render_ablation_report(results), name="ablation")
             logger.info("消融报告已保存：%s", report_path)
         for name, result in results.items():
             overall = result.metrics["overall"]

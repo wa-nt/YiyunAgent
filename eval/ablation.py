@@ -61,6 +61,10 @@ async def run_ablation(
 
     work_dir 指定时把各组库放在该目录下（便于复査）；默认用临时目录，
     跑完即弃——每组的持久产物是 EvalResult.save() 落盘的 result.json。
+
+    库的清理由 run_eval 自己在开头做（删库文件后重新 ingest），所以 work_dir 模式
+    下重跑同一组不会把文档再灌一遍——这也意味着 work_dir 是**评测专用**目录，
+    别把要留的东西放进去。
     """
     names = groups or list(ABLATION_GROUPS)
     unknown = [n for n in names if n not in ABLATION_GROUPS]

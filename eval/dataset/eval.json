@@ -1,6 +1,6 @@
 {
-  "version": 1,
-  "description": "T10 评测集：围绕一个虚构用户的笔记库（Python/ML/求职/生活）。expected_chunks 用文档标题（chunk 自增 id 重新 ingest 后不稳定）。",
+  "version": 2,
+  "description": "T10 评测集：围绕一个虚构用户的笔记库（Python/ML/求职/生活）。expected_chunks 用文档标题（chunk 自增 id 重新 ingest 后不稳定）。字段与取舍见 README.md：v2 新增 expected_answer_excludes 与 3 条长会话样本（压缩轴）。",
   "docs": [
     "python-decorators.md",
     "python-async.md",
@@ -335,9 +335,10 @@
       "query": "我从来没说过我喜欢 Java，你为什么觉得我喜欢 Java？",
       "expected_chunks": [],
       "expected_answer_contains": ["没有"],
+      "expected_answer_excludes": ["Spring", "JVM"],
       "expected_memories": [],
       "sessions": [],
-      "notes": "对抗：不能编造不存在的偏好"
+      "notes": "对抗：不能编造不存在的偏好。excludes 挡住「顺着话题编出一段 Java 技术栈」的胡答"
     },
     {
       "id": "eval-033",
@@ -345,8 +346,9 @@
       "query": "我笔记里关于 Rust 的所有权机制是怎么说的？",
       "expected_chunks": [],
       "expected_answer_contains": ["没有"],
+      "expected_answer_excludes": ["借用检查器", "生命周期标注"],
       "sessions": [],
-      "notes": "对抗：知识库里不存在的内容应明确说明，不编造"
+      "notes": "对抗：知识库里不存在的内容应明确说明，不编造（编造必然要提借用检查器/生命周期标注）"
     },
     {
       "id": "eval-034",
@@ -354,8 +356,9 @@
       "query": "我去年写的 Kubernetes 部署笔记里推荐用什么 Ingress？",
       "expected_chunks": [],
       "expected_answer_contains": ["没有"],
+      "expected_answer_excludes": ["nginx", "Traefik"],
       "sessions": [],
-      "notes": "对抗：带时间限定的虚构笔记，应说明未找到"
+      "notes": "对抗：带时间限定的虚构笔记，应说明未找到；excludes 挡住「报一个控制器名字」"
     },
     {
       "id": "eval-035",
@@ -363,8 +366,81 @@
       "query": "把机器学习笔记里关于强化学习的部分总结一下。",
       "expected_chunks": [],
       "expected_answer_contains": ["没有"],
+      "expected_answer_excludes": ["Q-learning", "DQN", "策略梯度"],
       "sessions": [],
-      "notes": "对抗：文档存在但该主题不存在，不能张冠李戴"
+      "notes": "对抗：文档存在但该主题不存在，不能张冠李戴；excludes 挡住「硬造一段强化学习内容」"
+    },
+    {
+      "id": "eval-036",
+      "category": "single-hop",
+      "query": "聊了这么多，回到装饰器：带参数的装饰器为什么要写成三层嵌套？",
+      "expected_chunks": ["Python 装饰器笔记"],
+      "expected_answer_contains": ["三层嵌套"],
+      "sessions": [
+        {"role": "user", "content": "我最近在准备跳槽，先帮我把手头笔记理一理。"},
+        {"role": "assistant", "content": "好的。你的笔记分 Python、机器学习、求职和生活四类，我先按类别过一遍。"},
+        {"role": "user", "content": "Python 那块我想先复习装饰器。"},
+        {"role": "assistant", "content": "装饰器的第一个要点是 functools.wraps：不写它，包装函数的 __name__ 和 docstring 会被覆盖掉。"},
+        {"role": "user", "content": "记下了。还有别的坑吗？"},
+        {"role": "assistant", "content": "类装饰器实现 __call__ 即可，适合需要维护状态的场景。"},
+        {"role": "user", "content": "那带参数的装饰器呢？我看到笔记里画了三个箭头。"},
+        {"role": "assistant", "content": "那是三层嵌套：参数层、装饰器层、包装层，三层的职责不一样。"},
+        {"role": "user", "content": "先不展开，我待会再问。"},
+        {"role": "assistant", "content": "好。装饰器常见用途还有日志、重试、缓存和权限校验。"},
+        {"role": "user", "content": "缓存是 lru_cache 对吧？"},
+        {"role": "assistant", "content": "对，functools.lru_cache，适合纯函数且参数可哈希的场景。"},
+        {"role": "user", "content": "我先记这条，等下细问嵌套。"},
+        {"role": "assistant", "content": "随时问，相关笔记我都能查到。"}
+      ],
+      "notes": "长会话样本（14 条历史，> context_compaction_threshold=10）：唯一能让「历史压缩」这条消融轴真正生效的样本形态"
+    },
+    {
+      "id": "eval-037",
+      "category": "single-hop",
+      "query": "刚才说事件循环不能阻塞，笔记里给的挪走办法具体是什么？",
+      "expected_chunks": ["Python asyncio 笔记"],
+      "expected_answer_contains": ["to_thread"],
+      "sessions": [
+        {"role": "user", "content": "接着上午的话题，asyncio 现在到哪一步了？"},
+        {"role": "assistant", "content": "上午看的是并发控制：gather 跑多个协程、Semaphore 限流。"},
+        {"role": "user", "content": "限流是为了不打满下游接口对吧？"},
+        {"role": "assistant", "content": "对，也避免在循环里裸 create_task 上千个协程。"},
+        {"role": "user", "content": "fire-and-forget 的任务有什么讲究？"},
+        {"role": "assistant", "content": "要保存引用（比如 add_done_callback），否则任务可能被 GC 掉，跑一半就没了。"},
+        {"role": "user", "content": "超时用 wait_for？"},
+        {"role": "assistant", "content": "是，取消任务时记得处理 CancelledError，不然会被静默吞掉。"},
+        {"role": "user", "content": "接下来想看事件循环阻塞那部分。"},
+        {"role": "assistant", "content": "核心一句：事件循环里禁止阻塞调用，阻塞会拖住所有协程。"},
+        {"role": "user", "content": "那怎么办？"},
+        {"role": "assistant", "content": "笔记里给了把阻塞 I/O 挪到线程池的办法，具体函数名你回头自己看一遍记得更牢。"},
+        {"role": "user", "content": "行，我先往下过别的。"},
+        {"role": "assistant", "content": "好，需要时我把那段原文调出来。"}
+      ],
+      "notes": "长会话样本（14 条历史）：压缩轴对照，问句刻意在历史上文出现过但未给答案"
+    },
+    {
+      "id": "eval-038",
+      "category": "multi-hop",
+      "query": "我打算投大模型岗，笔记里简历和面试分别要求准备什么？",
+      "expected_chunks": ["求职笔记：简历", "求职笔记：面试"],
+      "expected_answer_contains": ["STAR", "自我介绍"],
+      "sessions": [
+        {"role": "user", "content": "投递方向定了，先投大模型应用岗。"},
+        {"role": "assistant", "content": "那求职类的两篇笔记正好都用得上：简历和面试。"},
+        {"role": "user", "content": "简历那篇的重点是什么？"},
+        {"role": "assistant", "content": "核心是项目经历按 STAR 写，每条带可量化结果。"},
+        {"role": "user", "content": "技术栈那部分怎么写？"},
+        {"role": "assistant", "content": "按熟练度排序，不熟的别写「精通」；一页纸原则，针对 JD 定制关键词过 ATS。"},
+        {"role": "user", "content": "面试那篇呢？"},
+        {"role": "assistant", "content": "自我介绍要准备 1 分钟版和 3 分钟版各一份。"},
+        {"role": "user", "content": "项目深挖会问什么？"},
+        {"role": "assistant", "content": "每个项目要准备「遇到过最难的问题」和「如果重做会怎么改」。"},
+        {"role": "user", "content": "算法题呢？"},
+        {"role": "assistant", "content": "先说思路再写代码，卡壳时主动沟通，别闷着。"},
+        {"role": "user", "content": "反问环节呢？"},
+        {"role": "assistant", "content": "问团队技术栈和新人培养，薪资留到 HR 面再谈。"}
+      ],
+      "notes": "长会话样本（14 条历史，跨两篇文档）+ 多跳：压缩轴与检索轴的交叉对照"
     }
   ]
 }

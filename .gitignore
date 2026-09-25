@@ -7,5 +7,8 @@ __pycache__/
 *.db-shm
 data/
 .superpowers/
+# T10 评测产物：每次运行都生成，不进版本库（结果靠 git commit + 配置快照复现）
+eval/results/
+eval/reports/
 node_modules/
 dist/
