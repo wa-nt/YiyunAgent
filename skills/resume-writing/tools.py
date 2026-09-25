@@ -30,11 +30,26 @@ LONG_BULLET = 120
 # 每种问题最多列几条例子（全列出来等于没重点）
 MAX_EXAMPLES = 5
 
-# 列表符号：`- item` / `• item` / `1. item` / `2) item` / `3、item`。
+# 列表符号：`- item` / `• item` / `1. item` / `2) item` / `3、item` / `**加粗条目**`。
 # 必须是**真正的**列表符号才剥——不能用 lstrip("0123456789.、) ") 这种字符集合，
 # 那会把 bullet 正文开头的数字一起吃掉（「3 年 Go 后端开发经验」→「年 Go 后端开发
 # 经验」）：既篡改了回显给用户看的内容，又让这条本来含量化的经历被判成「无量化」。
-_BULLET_MARK = re.compile(r"^\s*(?:[-•*·>]|\d+[.、)）])\s*")
+#
+# 两个细节都是踩过的坑：
+# - 数字标记后必须**不是数字**：`\d+[.、)）](?!\d)` 才拦得住小数点。写成
+#   `\d+[.、)）]` 的话「1.5 年经验」会被剥成「5 年经验」——**编造出一个错误数字**，
+#   比剥不掉更危险（用户会以为工具在认真读他的简历）。用 (?!\d) 而不是
+#   `(?=\s|$)`：后者要求标记后必须有空白，中文列表「3、负责缓存层」没有空格就会被
+#   漏掉，弱动词检测跟着失效。
+# - 加粗标记要按 `\*{1,2}` / `_{1,2}` 整体匹配，不能依赖 `[-•*·>]` 的单字符类：
+#   后者对 `**负责…**` 只吃一个 `*`，正文变成 `*负责…`，`startswith(WEAK_STARTS)`
+#   失配，整篇加粗 Markdown 简历的弱动词检测会静默归零。
+# - 整组用 `(?:...)+` 重复：`- **负责…**` 这种「短横线 + 加粗」的组合要连剥两次。
+#   组内 `\s*` 只负责吃掉符号之间的空格，行尾空白由调用方的 .strip() 处理。
+_BULLET_MARK = re.compile(r"^(?:\s*(?:\*{1,2}|_{1,2}|[-•·>]|\d+[.、)）](?!\d)))+")
+# 行尾的加粗闭合标记（`**负责…**` 的结尾）。只在这一行**以加粗标记开头**时才剥，
+# 避免把正文中间的 `*`（如 `**A** 和 **B**`）也吃掉。
+_BULLET_TAIL = re.compile(r"\*{1,2}$|_+$")
 
 # JD 里提取英文技术词的字符集。取词后再剥掉尾部标点（见 _jd_keywords）
 _EN_TOKEN = re.compile(r"[A-Za-z][A-Za-z0-9+#._/-]{1,}")
@@ -51,20 +66,23 @@ _STOPWORDS = {
     "is", "to", "of", "in", "on", "at", "by", "as", "be", "a", "an", "it", "its",
     "if", "using", "use", "used", "good", "plus", "etc", "such", "while", "when",
     "who", "which", "what", "more", "than", "other", "also", "well", "new", "able",
+    "know", "knowing", "comfortable", "bonus", "deep", "how", "build", "hands",
+    "proven", "track", "record", "highly", "self", "driven", "passion", "passionate",
+    "motivated", "like", "want", "need", "own", "across", "into", "over",
     # 招聘结构用语
     "job", "role", "team", "work", "working", "years", "year", "experience",
     "experienced", "requirements", "requirement", "responsibilities", "responsibility",
-    "include", "including", "include", "familiar", "familiarity", "preferred",
-    "plus", "nice", "required", "require", "strong", "solid", "excellent",
+    "include", "including", "familiar", "familiarity", "preferred",
+    "nice", "required", "require", "requires", "strong", "solid", "excellent",
     "proficient", "proficiency", "knowledge", "understanding", "ability", "skills",
     "skill", "candidate", "candidates", "position", "company", "opportunity",
-    "benefits", "offer", "salary", "we're", "you'll", "our", "join", "looking",
+    "benefits", "offer", "salary", "we're", "you'll", "join", "looking",
     "seeking", "hiring", "description", "qualifications", "background", "degree",
     "bachelor", "master", "related", "field", "building", "improving", "reliability",
     "backend", "frontend", "fullstack", "engineer", "developer", "development",
     "senior", "junior", "lead", "staff", "principal", "intern", "engineers",
     "design", "develop", "maintain", "scale", "scaling", "ensure", "help", "support",
-    "reliable", "reliability", "services", "service", "scalable", "quality",
+    "reliable", "services", "service", "scalable", "quality",
     "practices", "environment", "tools", "technologies", "solutions", "deliver",
     "delivery", "collaborate", "collaboration", "communication", "problem",
     "solving", "fast", "paced", "complex", "large", "world", "best", "great",
@@ -157,7 +175,12 @@ async def analyze_resume(args: dict[str, Any], db_path: str | None) -> tuple[str
 
 
 async def jd_keyword_gap(args: dict[str, Any], db_path: str | None) -> tuple[str, str]:
-    """JD 与简历的字面关键词覆盖比对。db_path 不用。"""
+    """JD 与简历的字面关键词覆盖比对。db_path 不用。
+
+    这是**启发式**比对，不是能力诊断：英文侧只认技术名词（字符集取词 + 停用词表过滤），
+    非技能词可能计入缺口，所以覆盖率与缺口数只作线索。这个上限写在返回文本里了——
+    结论要连着口径一起给用户，别把「未覆盖 5 个词」说成「你缺这 5 项能力」。
+    """
     jd = _text_arg(args, "jd")
     resume = _text_arg(args, "resume_text")
     if not jd or not resume:
@@ -188,6 +211,10 @@ async def jd_keyword_gap(args: dict[str, Any], db_path: str | None) -> tuple[str
         "真没做过（不要为了过筛编造，面试会穿）与做过但简历里没写这个说法"
         "（这类才值得补进简历，用真实经历的具体写法）。请先和用户确认每个缺口属于哪一类，"
         "再给修改建议。",
+        "启发式上限（务必连同结论一起告知用户）：英文侧只保证识别**技术名词**，"
+        "靠字符集取词 + 停用词表过滤，非技能词（动词、形容词、职位描述用语）仍可能"
+        "混进缺口；`/` 与 `'` 切分也可能把复合词拆错。所以未覆盖数**偏保守**，"
+        "只能当作线索，不能当作「简历缺这些能力」的证据——是否真缺请逐条人工确认。",
     ]
     summary = f"jd_keyword_gap：{len(hit)}/{len(keywords)} 覆盖，缺 {len(missing)} 个词"
     return "\n".join(lines), summary
@@ -204,12 +231,26 @@ def _text_arg(args: dict[str, Any], key: str) -> str:
 def _bullets(text: str) -> list[str]:
     """按行拆条目，只剥**真正的**列表符号与首尾空白；太短的行（分节标题等）不算条目。
 
-    剥符号用 `_BULLET_MARK`（要求符号后跟空白/标点），所以行首的数字与正文一起保留：
-    「3 年 Go 后端开发经验」原样返回，「1. 负责支付网关」剥成「负责支付网关」。
+    剥符号用 `_BULLET_MARK`，所以行首的数字与正文一起保留：
+    「3 年 Go 后端开发经验」原样返回，「1. 负责支付网关」剥成「负责支付网关」，
+    「1.5 年经验」也原样保留（小数点不是列表符号，见 _BULLET_MARK 的注释）。
+
+    Markdown 加粗条目（`**负责…**`）连首尾标记一起剥：前导 `**` 由 `_BULLET_MARK`
+    吃掉，闭合的 `**` 由 `_BULLET_TAIL` 收掉。**只有前导部分确实含加粗标记时才收尾**
+    ——否则会把「正文刚好以 `_` 结尾」的正常条目误剥（如「环境变量 _DEBUG_」）。
+
+    已知限制：行内**多次**加粗（`**负责 A**和 **B**`）只剥首尾两处，中间的 `**` 留在
+    正文里。不影响弱动词判定（正文开头已是「负责 A」），代价只是回显里多几个星号；
+    宁可留着也不做全量 `**` 替换——那会顺手改掉正文里合法的单字符 `*`。
     """
     out: list[str] = []
     for raw in text.splitlines():
-        line = _BULLET_MARK.sub("", raw).strip()
+        stripped = raw.strip()
+        lead = _BULLET_MARK.match(stripped)
+        head = lead.group(0) if lead else ""
+        line = (stripped[len(head):] if lead else stripped).strip()
+        if ("*" in head or "_" in head) and _BULLET_TAIL.search(line):
+            line = _BULLET_TAIL.sub("", line).strip()
         if len(line) >= 8:  # 8 字以内多是「教育经历」「技能」这类分节标题
             out.append(line)
     return out

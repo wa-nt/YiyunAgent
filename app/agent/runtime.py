@@ -270,6 +270,10 @@ def _apply_skill(
     「一个坏文件不该让这一轮对话报错」。少兜这一层的话，异常会穿透 run_agent 的
     try（那个 try 在 `path = db_path or ...` 之后才开始，且用户提问此时还没落库），
     用户看到的是 error 事件、提问也丢了；坏文件还留在盘上，之后每一轮都失败。
+
+    **连渲染与埋点一起包**（不是只包加载）：render_skill_prompt 也是这条链路上的一环，
+    它抛异常同样是「本轮没有 skill」该覆盖的失败。只包前半段的话，承诺与实现之间会
+    留一道同型的缝——探测成功但渲染失败时照样整轮报错、提问落不了库。
     """
     if not settings.skills_enabled:
         return None, [], {}
@@ -281,15 +285,15 @@ def _apply_skill(
         skill: Skill | None = get_skill(matched.name, metas)
         if skill is None:
             return None, [], {}
+        detail = "触发词：" + "、".join(matched.triggers)
+        record_skill(skill.meta.name, detail, db_path)
+        logger.debug("触发 skill：%s（%s）", skill.meta.name, detail)
+        return render_skill_prompt(skill), list(skill.tools), dict(skill.tool_fns)
     except Exception as exc:
         logger.warning(
             "skill 探测失败，本轮按无 skill 处理：%s: %s", type(exc).__name__, exc
         )
         return None, [], {}
-    detail = "触发词：" + "、".join(matched.triggers)
-    record_skill(skill.meta.name, detail, db_path)
-    logger.debug("触发 skill：%s（%s）", skill.meta.name, detail)
-    return render_skill_prompt(skill), list(skill.tools), dict(skill.tool_fns)
 
 
 async def run_agent(

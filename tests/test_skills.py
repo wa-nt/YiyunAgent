@@ -415,6 +415,45 @@ def test_reserved_names_match_runtime_search_tool():
     assert SEARCH_TOOL.name in RESERVED_TOOL_NAMES
 
 
+def test_duplicate_tool_in_same_tools_py_keeps_first(skills_root, caplog):
+    """同一份 tools.py 里声明两次同名工具：前者胜出，后者跳过并告警。
+
+    这是**跨来源**重名的守卫之一（另一来源是内置工具，见
+    test_reserved_tool_name_is_rejected）。两份声明里后一份静默胜出的话，
+    工具集里会出现两个同名 ToolDef 而只有一份实现可达——模型看到重复定义、
+    作者以为后写的生效，都不会有任何提示。
+
+    同一个 skill 内的重名用模块级的同名函数实现，所以这里用两个不同名的函数
+    声明同一个工具名，模拟「复制粘贴时忘了改 name」这种真实写法。
+    """
+    write_skill(
+        skills_root,
+        "demo-skill",
+        tools_py=(
+            "from app.llm.types import ToolDef\n"
+            'TOOLS = [\n'
+            '    ToolDef(name="echo_tool", description="第一份"),\n'
+            '    ToolDef(name="echo_tool", description="第二份"),\n'
+            '    ToolDef(name="other_tool", description="正常注册"),\n'
+            ']\n'
+            "async def echo_tool(args, db_path):\n"
+            "    return 'first', 'echo_tool'\n"
+            "async def other_tool(args, db_path):\n"
+            "    return 'ok', 'other_tool'\n"
+        ),
+    )
+    metas = load_skills(skills_root)
+
+    with caplog.at_level(logging.WARNING, logger="app.skills.loader"):
+        skill = get_skill("demo-skill", metas)
+
+    # 同名工具只留一份（第一份），其余工具不受影响
+    assert [t.name for t in skill.tools] == ["echo_tool", "other_tool"]
+    assert skill.tools[0].description == "第一份"
+    assert set(skill.tool_fns) == {"echo_tool", "other_tool"}
+    assert "重名工具 echo_tool" in caplog.text
+
+
 # ---------- 触发：关键词匹配 ----------
 
 
@@ -696,6 +735,36 @@ async def test_skill_probe_exception_degrades_to_no_skill(db, monkeypatch, caplo
     assert [e.type for e in events] == ["text_delta", "done"]
     assert [m.role for m in llm.calls[0]] == ["system", "user"]
     assert "skill 探测失败" in caplog.text and "目录炸了" in caplog.text
+
+
+async def test_skill_render_exception_degrades_to_no_skill(
+    db, skills_root, monkeypatch, caplog
+):
+    """m-1：渲染正文失败也要退化为「本轮无 skill」，不能只包住加载那一段。
+
+    把 render_skill_prompt 换成抛异常的桩——它在渲染阶段（探测成功之后）才被调用，
+    只包前半段的话异常会穿透 run_agent，症状与 C1 完全同型：整轮报错、提问落不了库。
+    """
+    write_skill(skills_root, "demo-skill")
+
+    def boom(skill):
+        raise RuntimeError("渲染炸了")
+
+    monkeypatch.setattr(runtime, "render_skill_prompt", boom)
+    monkeypatch.setattr(settings, "tracing_enabled", True)
+    llm = FakeLLM([answer()])
+    monkeypatch.setattr(runtime, "get_llm", lambda: llm)
+
+    with caplog.at_level(logging.WARNING, logger="app.agent.runtime"):
+        events = [e async for e in runtime.run_agent(SESSION, "来个演示", db)]
+    await tracing.drain_traces()
+
+    assert [e.type for e in events] == ["text_delta", "done"]
+    assert events[-1].data["text"] == "好"
+    # 提问与回答都要落库（C1 的原始症状就是这两行都没有）
+    assert [m["role"] for m in await messages_of(SESSION, db)] == ["user", "assistant"]
+    assert [m.role for m in llm.calls[0]] == ["system", "user"]  # 没有注入正文
+    assert "渲染炸了" in caplog.text
 
 
 async def test_trigger_recorded_as_skill_trace(db, skills_root, monkeypatch):
@@ -997,6 +1066,102 @@ async def test_builtin_analyze_resume_keeps_leading_numbers():
     assert "负责日志收集工作" in result
 
 
+async def test_builtin_analyze_resume_keeps_decimal_numbers():
+    """M-A 回归：小数点不能被当成列表符号。
+
+    修复前 `\\d+[.、)）]` 不要求标记后不是数字，「1.5 年经验」会被剥成「5 年经验」
+    ——**编造出一个错误数字**，比剥不掉更危险：用户会以为工具在认真读他的简历。
+    「1.2 万 QPS」同理变成「2 万 QPS」。
+
+    计量口径：`analyze_resume` 的结果里只回显**有问题的**条目（无量化/弱动词/超长），
+    所以不能靠断言正文判断小数点有没有被剥。用一条既无量化、又会因剥字被篡改的条目
+    来钉：剥字后它变成「年…」仍无量化、不在弱动词表里，但会以被篡改的正文出现在
+    「无任何量化」的例子里——正是这个回显必须干净。`_bullets` 的直接用例另见
+    tests 里对 `skills/resume-writing/tools.py` 的模块级断言。
+    """
+    metas = load_skills("skills")
+    fn = get_skill("resume-writing", metas).tool_fns["analyze_resume"]
+
+    result, _ = await fn(
+        {
+            "resume_text": (
+                "1.5 年 Go 后端开发经验\n"
+                "1.2 万 QPS 的支付网关\n"
+                "3.5 年工作经验\n"
+                "负责日志收集平台\n"
+            )
+        },
+        None,
+    )
+
+    # 前三条有量化，第四条没有 → 只有最后一条会出现在无量化例子里
+    assert "无任何量化：1 条" in result
+    assert "负责日志收集平台" in result
+    # 被篡改过的数字一个都不能出现（剥掉小数点后它们会变成「5 年」「2 万」「.5 年」等）
+    for corrupted in ("5 年 Go", "2 万 QPS", "年 Go 后端", "年工作经验"):
+        assert corrupted not in result
+
+
+def test_bullet_mark_keeps_decimals_and_strips_real_markers():
+    """`_BULLET_MARK` 的单元口径：小数不是列表符号，真标记才剥。
+
+    直接测正则所在模块，避免受 analyze_resume 只回显问题条目的影响。
+    """
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "_rw_tools_units", "skills/resume-writing/tools.py"
+    )
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+
+    # 小数点：原样保留（编造数字是这里最危险的回退）
+    assert mod._bullets("1.5 年 Go 后端开发经验") == ["1.5 年 Go 后端开发经验"]
+    assert mod._bullets("1.2 万 QPS 的支付网关") == ["1.2 万 QPS 的支付网关"]
+    assert mod._bullets("3.5 年工作经验的工程师") == ["3.5 年工作经验的工程师"]
+    # 真标记：数字 + 标点剥掉，正文保留
+    assert mod._bullets("1. 主导支付网关重构") == ["主导支付网关重构"]
+    assert mod._bullets("2) 负责订单系统的重构") == ["负责订单系统的重构"]
+    assert mod._bullets("3、负责缓存层的重构") == ["负责缓存层的重构"]
+    # 年份区间不是列表符号
+    assert mod._bullets("2020-2023 在 X 公司做后端") == ["2020-2023 在 X 公司做后端"]
+    # 正文里/结尾的 _ 与 * 不能误剥：只有前导部分确实含加粗标记时才收尾
+    assert mod._bullets("调试开关名为 _DEBUG_") == ["调试开关名为 _DEBUG_"]
+    assert mod._bullets("- 环境变量 _DEBUG_") == ["环境变量 _DEBUG_"]
+    assert mod._bullets("缓存命中率统计 3*") == ["缓存命中率统计 3*"]
+    # 短行仍被当作分节标题剔掉
+    assert mod._bullets("1.5 年") == []
+
+
+async def test_builtin_analyze_resume_handles_markdown_bold():
+    """M-B 回归：Markdown 加粗条目（`**负责…**`）不能被剥出一个残留 `*`。
+
+    修复前只吃一个 `*`，正文变 `*负责…`，`startswith(WEAK_STARTS)` 失配——整篇用
+    加粗排版的简历，弱动词检测静默归零（工具看起来没发现问题，实际是根本没在看）。
+    """
+    metas = load_skills("skills")
+    fn = get_skill("resume-writing", metas).tool_fns["analyze_resume"]
+
+    result, _ = await fn(
+        {
+            "resume_text": (
+                "- **负责后端接口开发**\n"
+                "**参与分布式改造项目**\n"
+                "__负责缓存层的重构__\n"
+                "*负责日志收集服务*\n"
+                "实现登录接口，P99 从 800ms 降到 120ms\n"
+            )
+        },
+        None,
+    )
+
+    # 四条加粗的职责式条目都要被识别出来，且剥出来的正文不带残留标记
+    assert "弱动词/职责式开头：4 条" in result
+    for residue in ("*负责", "**负责", "*参与", "__负责"):
+        assert residue not in result
+    assert "负责后端接口开发" in result
+
+
 async def test_builtin_analyze_resume_without_text_asks_for_input():
     metas = load_skills("skills")
     fn = get_skill("resume-writing", metas).tool_fns["analyze_resume"]
@@ -1050,3 +1215,51 @@ async def test_builtin_jd_keyword_gap_strips_punctuation_and_jd_boilerplate():
     assert label == "jd_keyword_gap：2/2 覆盖，缺 0 个词"
     for boilerplate in ("Requirements", "experience", "backend", "Responsibilities"):
         assert boilerplate not in hit_line + missing_line
+
+
+async def test_builtin_jd_keyword_gap_states_its_heuristic_limits():
+    """M-C：英文侧只保证识别技术名词，非技能词可能计入缺口——这个上限必须写进输出。
+
+    不写清楚的话，模型会把「未覆盖 3 个词」直接说成「你缺这 3 项能力」，而其中可能
+    混着 `deep`/`how`/`build` 这类根本不是技能的词。停用词表只能压小误差，压不到零，
+    所以口径说明是这部分的**契约**而不是可选文案。
+    """
+    metas = load_skills("skills")
+    fn = get_skill("resume-writing", metas).tool_fns["jd_keyword_gap"]
+
+    jd = "Requires deep knowledge of Go and know how to build reliable services."
+    result, _ = await fn({"jd": jd, "resume_text": "用 Go 写过服务"}, None)
+
+    assert "启发式上限" in result
+    assert "只保证识别" in result and "技术名词" in result
+    # 仍然会剩下非技能词（这正是要如实告知的原因，不是要假装它不存在）
+    assert "未覆盖" in result
+
+
+def test_stopwords_has_no_duplicate_literals():
+    """m-3：_STOPWORDS 里不能有字面重复项。
+
+    重复项是无声的维护噪声：改一处以为生效、实际另一处还在，或者删掉一个看着没用的
+    词却发现同名的另一个还在起作用。用源码里的字面量比对，而不是 len(set())——
+    后者对重复天然免疫，测不出任何东西。
+    """
+    import re as _re
+
+    src = open("skills/resume-writing/tools.py", encoding="utf-8").read()
+    start = src.index("_STOPWORDS = {")
+    end = src.index("}", src.index('"great"')) + 1
+    literals = _re.findall(r'"([^"]+)"', src[start:end])
+
+    duplicates = sorted(
+        word for word in set(literals) if literals.count(word) > 1
+    )
+    assert duplicates == [], f"停用词表有字面重复项：{duplicates}"
+    # 顺带确认比较基准没跑偏（字面量条数应与集合大小一致）
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "_rw_tools_stopwords", "skills/resume-writing/tools.py"
+    )
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    assert len(literals) == len(mod._STOPWORDS)
