@@ -12,8 +12,16 @@
   不手写 YAML 解析器：多一个只认三个字段的解析器，比多用一个已有依赖更容易出错。
 - 不做热更新（brief 的边界）：每轮重新扫目录、现读现解析，普通文件量级下开销可忽略，
   也省掉了缓存失效那一套。改 SKILL.md 下一轮就生效，反而比缓存更好用。
-- skills 目录是用户可写的地方，所以单个 skill 的格式问题只跳过它并告警，不抛异常：
-  一个手误不该让整个 Agent 起不来。
+- skills 目录是用户可写的地方，所以单个 skill 的任何问题都只跳过它并告警，不抛异常：
+  一个手误（乃至一个存成 GBK 的文件）不该让整个 Agent 起不来。这条纪律是**三层**的，
+  因为坏文件会留在盘上、每一轮都会再读到：
+  1. `_read_meta` 把读取错误收成 None（含 UnicodeDecodeError——Windows 记事本「另存为
+     ANSI」存出来的 GBK 文件，或 UTF-16 文件）
+  2. `load_skills` 每个目录再兜一层，保证一个坏 skill 不影响同一个目录里其它 skill
+  3. `runtime._apply_skill` 整体兜底，保证探测环节无论出什么都不会打断这一轮对话
+- 读取用 utf-8-sig：带 BOM 的 UTF-8（记事本默认的「UTF-8」）否则会被 frontmatter 判成
+  「没有 frontmatter」，skill 静默消失且原因看不出来。**不做编码猜测**（不试 GBK）：
+  猜错会把正文解成乱码注入提示词，比明确报错更难排查。
 """
 
 from __future__ import annotations
@@ -32,6 +40,15 @@ logger = logging.getLogger(__name__)
 
 SKILL_FILE = "SKILL.md"
 TOOLS_FILE = "tools.py"
+
+# SKILL.md 的编码。utf-8-sig 兼容「无 BOM 的 UTF-8」与「带 BOM 的 UTF-8」两种，
+# 写出来的文件都是无 BOM 的
+SKILL_ENCODING = "utf-8-sig"
+
+# runtime 自己拥有的工具名，skill 不得占用（占用会让 skill 的同名实现永远不可达）。
+# 改动 app/agent/runtime.py 的 SEARCH_TOOL.name 时必须同步这里——tests/test_skills.py
+# 有一条用例把两者钉在一起，漂移会当场变红。
+RESERVED_TOOL_NAMES = frozenset({"search_knowledge"})
 
 # skill 专用工具的调用约定，与 app/agent/runtime.py 的 execute_tool 同一口径：
 # 入参 (工具参数, db_path)，返回 (结果文本, 展示用摘要)
@@ -64,6 +81,10 @@ def load_skills(skills_dir: str | Path) -> dict[str, SkillMeta]:
 
     注册顺序 = 目录名排序（触发词命中数并列时的兜底顺序依赖它，所以是显式的）。
     目录不存在返回 {}：没配 skill 的部署不该在每轮对话里报错或刷日志。
+
+    每个目录单独兜异常：`_read_meta` 已经把能想到的错误收成 None 了，但这是用户可写
+    的目录，不可预料的失败（权限、路径过长、解析器自身的奇怪异常）必须只影响它自己。
+    没有这一层的话，一个坏目录会让排在它**后面**的所有 skill 一起消失。
     """
     root = Path(skills_dir)
     if not root.is_dir():
@@ -72,7 +93,13 @@ def load_skills(skills_dir: str | Path) -> dict[str, SkillMeta]:
     for entry in sorted(root.iterdir()):
         if not entry.is_dir():
             continue
-        meta = _read_meta(entry)
+        try:
+            meta = _read_meta(entry)
+        except Exception as exc:  # 单个 skill 的任何故障都只跳过它
+            logger.warning(
+                "skill 目录读取异常，已跳过 %s：%s: %s", entry, type(exc).__name__, exc
+            )
+            continue
         if meta is None:
             continue
         if meta.name in metas:
@@ -88,7 +115,9 @@ def get_skill(name: str, skills: dict[str, SkillMeta]) -> Skill | None:
     if meta is None:
         return None
     try:
-        loaded = frontmatter.loads((meta.dir / SKILL_FILE).read_text(encoding="utf-8"))
+        loaded = frontmatter.loads(
+            (meta.dir / SKILL_FILE).read_text(encoding=SKILL_ENCODING)
+        )
     except Exception as exc:  # 文件被删/编码不对：本轮当没触发，不影响对话
         logger.warning(
             "skill %s 正文加载失败，本轮跳过：%s: %s", name, type(exc).__name__, exc
@@ -104,14 +133,25 @@ def get_skill(name: str, skills: dict[str, SkillMeta]) -> Skill | None:
 
 
 def _read_meta(skill_dir: Path) -> SkillMeta | None:
-    """解析一个 skill 目录的 frontmatter；不是 skill 目录或格式不对则返回 None。"""
+    """解析一个 skill 目录的 frontmatter；不是 skill 目录或格式不对则返回 None。
+
+    读取失败要连 UnicodeDecodeError 一起收：编码不对的文件（记事本存成 ANSI 的 GBK、
+    UTF-16）是**永久性**故障——它一直躺在盘上，每一轮都会被读到。让异常穿透的话，
+    不只是这个 skill 失效，而是整轮对话报错、提问都落不了库（见 runtime._apply_skill）。
+    """
     path = skill_dir / SKILL_FILE
     if not path.is_file():
         return None  # 没有 SKILL.md：当普通目录跳过，不告警（resources/ 之类很常见）
     try:
-        text = path.read_text(encoding="utf-8")
-    except OSError as exc:
-        logger.warning("SKILL.md 读取失败，已跳过 %s：%s", path, exc)
+        text = path.read_text(encoding=SKILL_ENCODING)
+    except (OSError, UnicodeDecodeError) as exc:
+        logger.warning(
+            "SKILL.md 读取失败（编码需为 UTF-8%s），已跳过 %s：%s: %s",
+            "（可带 BOM）",
+            path,
+            type(exc).__name__,
+            exc,
+        )
         return None
     try:
         metadata = frontmatter.loads(text).metadata
@@ -184,8 +224,13 @@ def _load_tools(meta: SkillMeta) -> tuple[list[ToolDef], dict[str, ToolFn]]:
     用 importlib 而不是 exec（brief 里提的是 exec）：exec 把整段代码塞进当前命名
     空间，出错只有行号、定位不到文件；import 有独立的模块命名空间，也不污染调用方。
 
-    权衡：模块不注册进 sys.modules，所以 tools.py 不能 `import` 同目录的其它模块
-    （要共享代码就放进同一个 tools.py）。当前两个内置 skill 的工具都是自包含的。
+    两个已知权衡：
+
+    - 模块不注册进 sys.modules，所以 tools.py 不能 `import` 同目录的其它模块
+      （要共享代码就放进同一个 tools.py）。当前内置 skill 的工具都是自包含的。
+    - **每次触发都重新执行模块顶层代码**（不做缓存，换来的是「改完下一轮就生效」）。
+      顶层放常量、正则、纯函数定义没问题；要连数据库、起客户端、读大文件的初始化
+      请放进工具函数内部或做模块级惰性缓存，否则每次触发都会重做一遍。
     """
     path = meta.dir / TOOLS_FILE
     module_name = f"_skill_tools_{meta.name.replace('-', '_')}"
@@ -213,6 +258,18 @@ def _load_tools(meta: SkillMeta) -> tuple[list[ToolDef], dict[str, ToolFn]]:
     for tool in declared:
         if not isinstance(tool, ToolDef):
             logger.warning("skill %s 的 TOOLS 里有非 ToolDef 条目，已跳过：%r", meta.name, tool)
+            continue
+        # 与内置工具重名时跳过：runtime 的分发顺序是先 search_knowledge 再查 skill 工具，
+        # 放行的话模型会看到两个同名工具、而 skill 的实现永远不可达（静默失效）
+        if tool.name in RESERVED_TOOL_NAMES:
+            logger.warning(
+                "skill %s 的工具名 %s 与内置工具冲突，该工具未注册（改名后再试）",
+                meta.name,
+                tool.name,
+            )
+            continue
+        if tool.name in fns:
+            logger.warning("skill %s 的 TOOLS 里有重名工具 %s，后者已跳过", meta.name, tool.name)
             continue
         fn = getattr(module, tool.name, None)
         if not callable(fn):

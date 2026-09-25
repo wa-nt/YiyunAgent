@@ -14,6 +14,7 @@ brief 里标注的可选路径（留给 T10 做对比），`detect_skill` 保持
 from __future__ import annotations
 
 import logging
+import math
 from dataclasses import dataclass
 
 from app.config import settings
@@ -74,12 +75,19 @@ def match_skill(user_message: str, skills: dict[str, SkillMeta]) -> SkillMatch |
 
 
 def _threshold() -> float:
-    """触发阈值，钳制在 [0, 1]。配错了（如按百分数写成 70）当 1.0 处理并告警。
+    """触发阈值，钳制在 [0, 1]。配错了当最严（1.0）处理并告警。
 
     静默按原值比较的话，70 会让**任何** skill 都触发不了，而现象只是「skill 好像
     没生效」，最难从结果反推——所以这里偏向喊一声。
+
+    NaN 必须单独判：`0 <= nan <= 1` 是 False，而 `min(max(nan, 0), 1)` 仍是 nan，
+    接着 `confidence < nan` 恒为 False——阈值被**静默关成最松**（谁都触发），与
+    「配错当最严」正好相反，且日志里看不出异常。
     """
     value = settings.skills_trigger_threshold
+    if math.isnan(value):
+        logger.warning("skills_trigger_threshold 是 NaN，已按 1.0（最严）处理")
+        return 1.0
     if 0.0 <= value <= 1.0:
         return value
     logger.warning(

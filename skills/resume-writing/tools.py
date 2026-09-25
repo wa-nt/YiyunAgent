@@ -30,12 +30,44 @@ LONG_BULLET = 120
 # 每种问题最多列几条例子（全列出来等于没重点）
 MAX_EXAMPLES = 5
 
-# JD 关键词里要忽略的英文虚词
+# 列表符号：`- item` / `• item` / `1. item` / `2) item` / `3、item`。
+# 必须是**真正的**列表符号才剥——不能用 lstrip("0123456789.、) ") 这种字符集合，
+# 那会把 bullet 正文开头的数字一起吃掉（「3 年 Go 后端开发经验」→「年 Go 后端开发
+# 经验」）：既篡改了回显给用户看的内容，又让这条本来含量化的经历被判成「无量化」。
+_BULLET_MARK = re.compile(r"^\s*(?:[-•*·>]|\d+[.、)）])\s*")
+
+# JD 里提取英文技术词的字符集。取词后再剥掉尾部标点（见 _jd_keywords）
+_EN_TOKEN = re.compile(r"[A-Za-z][A-Za-z0-9+#._/-]{1,}")
+# 词尾标点：英文逗号句点分号冒号，以及中文顿号逗号句号
+_TRAILING_PUNCT = ".,;:、，。！？!?）)"
+
+# JD 关键词里要忽略的词：英文虚词 + JD 的**结构用语**（职位名、年限、招聘套话）。
+# 后一类不忽略的话，每份 JD 都会稳定贡献 5-8 个「永远不可能覆盖」的词，覆盖率被
+# 系统性压低，看起来像简历缺了很多东西——而它们根本不是技能。
 _STOPWORDS = {
+    # 虚词 / 连接词
     "and", "or", "the", "with", "for", "you", "your", "our", "are", "will", "have",
-    "has", "that", "this", "from", "not", "but", "all", "any", "can", "must", "team",
-    "work", "job", "role", "we", "is", "to", "of", "in", "on", "at", "by", "as", "be",
-    "a", "an", "it", "its", "if", "using", "use", "used", "good", "plus", "etc",
+    "has", "that", "this", "from", "not", "but", "all", "any", "can", "must", "we",
+    "is", "to", "of", "in", "on", "at", "by", "as", "be", "a", "an", "it", "its",
+    "if", "using", "use", "used", "good", "plus", "etc", "such", "while", "when",
+    "who", "which", "what", "more", "than", "other", "also", "well", "new", "able",
+    # 招聘结构用语
+    "job", "role", "team", "work", "working", "years", "year", "experience",
+    "experienced", "requirements", "requirement", "responsibilities", "responsibility",
+    "include", "including", "include", "familiar", "familiarity", "preferred",
+    "plus", "nice", "required", "require", "strong", "solid", "excellent",
+    "proficient", "proficiency", "knowledge", "understanding", "ability", "skills",
+    "skill", "candidate", "candidates", "position", "company", "opportunity",
+    "benefits", "offer", "salary", "we're", "you'll", "our", "join", "looking",
+    "seeking", "hiring", "description", "qualifications", "background", "degree",
+    "bachelor", "master", "related", "field", "building", "improving", "reliability",
+    "backend", "frontend", "fullstack", "engineer", "developer", "development",
+    "senior", "junior", "lead", "staff", "principal", "intern", "engineers",
+    "design", "develop", "maintain", "scale", "scaling", "ensure", "help", "support",
+    "reliable", "reliability", "services", "service", "scalable", "quality",
+    "practices", "environment", "tools", "technologies", "solutions", "deliver",
+    "delivery", "collaborate", "collaboration", "communication", "problem",
+    "solving", "fast", "paced", "complex", "large", "world", "best", "great",
 }
 # JD 里值得匹配的中文技能词。ATS 做的是字面匹配，这里保持一致：只认出现在表里的词，
 # 不用分词器猜（猜出来的「关键词」会淹掉真正的信号）
@@ -170,10 +202,14 @@ def _text_arg(args: dict[str, Any], key: str) -> str:
 
 
 def _bullets(text: str) -> list[str]:
-    """按行拆条目，剥掉列表符号与空白；太短的行（分节标题等）不算条目。"""
+    """按行拆条目，只剥**真正的**列表符号与首尾空白；太短的行（分节标题等）不算条目。
+
+    剥符号用 `_BULLET_MARK`（要求符号后跟空白/标点），所以行首的数字与正文一起保留：
+    「3 年 Go 后端开发经验」原样返回，「1. 负责支付网关」剥成「负责支付网关」。
+    """
     out: list[str] = []
     for raw in text.splitlines():
-        line = raw.strip().lstrip("-•*·>").lstrip("0123456789.、) ").strip()
+        line = _BULLET_MARK.sub("", raw).strip()
         if len(line) >= 8:  # 8 字以内多是「教育经历」「技能」这类分节标题
             out.append(line)
     return out
@@ -187,18 +223,22 @@ def _examples(items: list[str]) -> list[str]:
 
 
 def _jd_keywords(jd: str) -> list[str]:
-    """从 JD 里提取待匹配的关键词：英文技术词（原样）+ 词汇表里命中的中文技能词。
+    """从 JD 里提取待匹配的关键词：英文技术词 + 词汇表里命中的中文技能词。
 
-    英文词保留原文，比对时整体 casefold（Python 与 python 是同一个词）。
+    英文词**剥掉词尾标点后**才进结果：`out` 里的词会原样拿去和简历做子串比较，
+    留一个「Kubernetes.」的话，简历里明明写着 Kubernetes 也判成未覆盖，覆盖率
+    系统性偏低（JD 的句末词几乎都带标点，一份 JD 能少算七八个词）。
+    比对时统一 casefold（Python 与 python 是同一个词）。
     """
     seen: set[str] = set()
     out: list[str] = []
-    for token in re.findall(r"[A-Za-z][A-Za-z0-9+#._/-]{1,}", jd):
-        key = token.casefold().rstrip(".,;:、")
+    for token in _EN_TOKEN.findall(jd):
+        word = token.strip(_TRAILING_PUNCT)
+        key = word.casefold()
         if len(key) < 2 or key in _STOPWORDS or key in seen:
             continue
         seen.add(key)
-        out.append(token)
+        out.append(word)
     for word in CN_KEYWORDS:
         if word in jd and word.casefold() not in seen:
             seen.add(word.casefold())

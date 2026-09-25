@@ -240,6 +240,62 @@ def test_duplicate_name_keeps_first(skills_root, caplog):
     assert "名称重复" in caplog.text
 
 
+# ---------- 加载：编码兜底（C1 / M1） ----------
+
+
+def test_non_utf8_skill_md_is_skipped_without_killing_the_scan(skills_root, caplog):
+    """GBK / UTF-16 的 SKILL.md 只跳过它自己，同一目录里其它 skill 照常加载。
+
+    这是 C1 的回归：编码错误的文件会**永久**留在盘上、每轮都被读到，穿透异常的话
+    不只是这个 skill 失效，而是整轮对话报错（见下面 run_agent 那条用例）。
+    """
+    body = "---\nname: gbk\ndescription: 中文说明\ntriggers:\n  - 演示\n---\n正文\n"
+    for dir_name, encoding in (("gbk-skill", "gbk"), ("utf16-skill", "utf-16")):
+        skill_dir = skills_root / dir_name
+        skill_dir.mkdir()
+        (skill_dir / "SKILL.md").write_bytes(body.encode(encoding))
+    # 排在最前面的坏目录最容易掩盖「一个坏 skill 拖垮后面所有 skill」
+    write_skill(skills_root, "zzz-good")
+
+    with caplog.at_level(logging.WARNING, logger="app.skills.loader"):
+        metas = load_skills(skills_root)
+
+    assert list(metas) == ["zzz-good"]
+    assert "读取失败" in caplog.text and "UnicodeDecodeError" in caplog.text
+
+
+def test_utf8_bom_skill_md_is_read(skills_root):
+    """带 BOM 的 UTF-8（记事本默认「UTF-8」）必须正常加载，不能静默消失（M1）。
+
+    修复前 BOM 让正文不以 `---` 开头，frontmatter 解析为空 → 报「缺少 name」跳过。
+    """
+    skill_dir = skills_root / "bom-skill"
+    skill_dir.mkdir()
+    text = "---\nname: bom-skill\ntriggers:\n  - 演示\n---\n\n正文\n"
+    (skill_dir / "SKILL.md").write_bytes(("\ufeff" + text).encode("utf-8"))
+
+    metas = load_skills(skills_root)
+
+    assert list(metas) == ["bom-skill"]
+    skill = get_skill("bom-skill", metas)
+    assert skill is not None and "正文" in skill.content
+    assert "\ufeff" not in skill.content  # BOM 不能留在正文里进提示词
+
+
+def test_get_skill_body_unreadable_encoding_returns_none(skills_root, caplog):
+    """注册后正文被改成 GBK：本轮当没触发，不抛（get_skill 侧的同类兜底）。"""
+    write_skill(skills_root, "demo-skill")
+    metas = load_skills(skills_root)
+    (skills_root / "demo-skill" / "SKILL.md").write_bytes(
+        "---\nname: demo-skill\n---\n中文正文\n".encode("gbk")
+    )
+
+    with caplog.at_level(logging.WARNING, logger="app.skills.loader"):
+        assert get_skill("demo-skill", metas) is None
+
+    assert "正文加载失败" in caplog.text
+
+
 # ---------- 加载：按需读正文与 tools.py ----------
 
 
@@ -301,6 +357,62 @@ def test_tools_py_failures_degrade_to_no_tools(skills_root, caplog):
     assert "没有可调用的 ghost" in caplog.text
     assert "tools.py 加载失败" in caplog.text
     assert "缺少 TOOLS 列表" in caplog.text
+
+
+def test_non_tooldef_entry_is_skipped(skills_root, caplog):
+    """TOOLS 里混进非 ToolDef 条目（手写 tools.py 时的常见笔误）只跳过该条。"""
+    write_skill(
+        skills_root,
+        "demo-skill",
+        tools_py=(
+            "from app.llm.types import ToolDef\n"
+            'TOOLS = ["echo_tool", {"name": "dict_tool"}, '
+            'ToolDef(name="echo_tool", description="真的")]\n'
+            "async def echo_tool(args, db_path):\n    return 'ok', 'echo_tool'\n"
+        ),
+    )
+    metas = load_skills(skills_root)
+
+    with caplog.at_level(logging.WARNING, logger="app.skills.loader"):
+        skill = get_skill("demo-skill", metas)
+
+    # 两个坏条目被跳过，真正的 ToolDef 正常注册
+    assert [t.name for t in skill.tools] == ["echo_tool"]
+    assert set(skill.tool_fns) == {"echo_tool"}
+    assert caplog.text.count("非 ToolDef 条目") == 2
+
+
+def test_reserved_tool_name_is_rejected(skills_root, caplog):
+    """skill 声明 search_knowledge 会被忽略：放行的话模型看到两个同名工具，
+    runtime 的分发先查内置工具，skill 的实现永远不可达（静默失效）。"""
+    write_skill(
+        skills_root,
+        "demo-skill",
+        tools_py=(
+            "from app.llm.types import ToolDef\n"
+            'TOOLS=[ToolDef(name="search_knowledge",description="假的检索")]\n'
+            "async def search_knowledge(args, db_path):\n    return '假检索', '假检索'\n"
+        ),
+    )
+    metas = load_skills(skills_root)
+
+    with caplog.at_level(logging.WARNING, logger="app.skills.loader"):
+        skill = get_skill("demo-skill", metas)
+
+    assert skill.tools == () and skill.tool_fns == {}
+    assert "与内置工具冲突" in caplog.text
+
+
+def test_reserved_names_match_runtime_search_tool():
+    """RESERVED_TOOL_NAMES 必须覆盖 runtime 真正拥有的工具名。
+
+    这份名单是手写的：runtime 改了 SEARCH_TOOL.name 而这里没跟上，m2 的守卫就静默
+    失效（重名工具又能注册进来了）。这条用例把两侧钉在一起。
+    """
+    from app.agent.runtime import SEARCH_TOOL
+    from app.skills.loader import RESERVED_TOOL_NAMES
+
+    assert SEARCH_TOOL.name in RESERVED_TOOL_NAMES
 
 
 # ---------- 触发：关键词匹配 ----------
@@ -383,6 +495,24 @@ def test_threshold_out_of_range_is_clamped(skills_root, caplog, monkeypatch):
         assert trigger.match_skill("简历和面试", metas).name == "a"  # 钳到 0.0
 
     assert caplog.text.count("应在 [0, 1] 内") == 2
+
+
+def test_nan_threshold_is_treated_as_strictest(skills_root, caplog, monkeypatch):
+    """NaN 阈值按 1.0 处理（最严），而不是被静默关成最松。
+
+    `0 <= nan <= 1` 是 False，`min(max(nan, 0), 1)` 仍是 nan，`confidence < nan`
+    恒为 False——修复前 NaN 让**任何**命中都触发，与「配错当最严」正好相反。
+    """
+    write_skill(skills_root, "a-one", name="a", triggers="  - 简历\n")
+    write_skill(skills_root, "b-two", name="b", triggers="  - 面试\n")
+    metas = load_skills(skills_root)
+
+    with caplog.at_level(logging.WARNING, logger="app.skills.trigger"):
+        monkeypatch.setattr(settings, "skills_trigger_threshold", float("nan"))
+        assert trigger.match_skill("简历和面试", metas) is None  # 0.5 < 1.0，不触发
+        assert trigger.match_skill("只有简历", metas) is not None  # 1.0 >= 1.0，仍触发
+
+    assert "NaN" in caplog.text
 
 
 async def test_detect_skill_returns_name(skills_root):
@@ -492,7 +622,12 @@ async def test_skills_disabled_never_triggers(db, skills_root, monkeypatch):
 
 
 async def test_missing_skills_dir_degrades_silently(db, tmp_path, monkeypatch):
-    """目录不存在（没配 skill 的部署）：正常回答，不报错。"""
+    """目录不存在（没配 skill 的部署）：正常回答，不报错。
+
+    显式打开开关：conftest 默认钉 False，照着它跑的话这条用例在「实现退化」时也会绿
+    ——它要验的正是打开状态下目录不存在时的降级。
+    """
+    monkeypatch.setattr(settings, "skills_enabled", True)
     monkeypatch.setattr(settings, "skills_dir", str(tmp_path / "no-such-dir"))
     llm = FakeLLM([answer()])
     monkeypatch.setattr(runtime, "get_llm", lambda: llm)
@@ -501,6 +636,66 @@ async def test_missing_skills_dir_degrades_silently(db, tmp_path, monkeypatch):
 
     assert [e.type for e in events] == ["text_delta", "done"]
     assert [m.role for m in llm.calls[0]] == ["system", "user"]
+
+
+async def test_non_utf8_skill_md_does_not_break_the_turn(db, skills_root, monkeypatch):
+    """C1 端到端：skills/ 里躺着一个 GBK 的 SKILL.md，这一轮仍要正常回答。
+
+    修复前的现象：POST /api/chat 回 error 事件，**用户提问都没落库**，而且坏文件一直
+    在盘上，之后每一轮都失败。这里把「不影响对话」的每一环都钉住：事件序列、落库、
+    好 skill 照常触发、坏 skill 不触发。
+    """
+    write_skill(
+        skills_root,
+        "good-skill",
+        triggers="  - 样例\n",
+        body="# 正文\n\n好的指导。\n",
+    )
+    skill_dir = skills_root / "bad-skill"
+    skill_dir.mkdir()
+    (skill_dir / "SKILL.md").write_bytes(
+        "---\nname: bad\ntriggers:\n  - 演示\n---\n中文正文\n".encode("gbk")
+    )
+    llm = FakeLLM([answer()])
+    monkeypatch.setattr(runtime, "get_llm", lambda: llm)
+
+    # 「来个演示」只该命中坏 skill（GBK 读不出来 → 不触发），好 skill 的关键词是「样例」
+    events = [e async for e in runtime.run_agent(SESSION, "来个演示", db)]
+
+    assert [e.type for e in events] == ["text_delta", "done"]
+    assert events[-1].data["text"] == "好"
+    # 提问与回答都落了库（修复前提问就丢了）
+    assert [m["role"] for m in await messages_of(SESSION, db)] == ["user", "assistant"]
+    # 坏 skill 不触发：prompt 里只有 system + user，没有注入任何正文
+    assert [m.role for m in llm.calls[0]] == ["system", "user"]
+    assert [t.name for t in llm.tools[0]] == ["search_knowledge"]
+
+    # 好 skill 不受连累：换个词仍能正常触发
+    [e async for e in runtime.run_agent(SESSION, "来个样例", db)]
+    assert any(
+        m.content.startswith("[已启用技能 good-skill]") for m in llm.calls[1]
+    )
+
+
+async def test_skill_probe_exception_degrades_to_no_skill(db, monkeypatch, caplog):
+    """_apply_skill 的兜底：探测环节抛任何异常都退化为「本轮无 skill」。
+
+    直接让 load_skills 抛（模拟不可预料的失败），验证 docstring 承诺的那条口径。
+    """
+    def boom(skills_dir):
+        raise RuntimeError("目录炸了")
+
+    monkeypatch.setattr(runtime, "load_skills", boom)
+    monkeypatch.setattr(settings, "skills_enabled", True)
+    llm = FakeLLM([answer()])
+    monkeypatch.setattr(runtime, "get_llm", lambda: llm)
+
+    with caplog.at_level(logging.WARNING, logger="app.agent.runtime"):
+        events = [e async for e in runtime.run_agent(SESSION, "来个演示", db)]
+
+    assert [e.type for e in events] == ["text_delta", "done"]
+    assert [m.role for m in llm.calls[0]] == ["system", "user"]
+    assert "skill 探测失败" in caplog.text and "目录炸了" in caplog.text
 
 
 async def test_trigger_recorded_as_skill_trace(db, skills_root, monkeypatch):
@@ -678,6 +873,7 @@ async def test_chat_end_to_end_triggers_resume_writing(db, monkeypatch, tmp_path
     from app.main import app
 
     monkeypatch.setattr(settings, "skills_dir", "skills")
+    monkeypatch.setattr(settings, "skills_enabled", True)  # conftest 默认钉 False
     monkeypatch.setattr(settings, "tracing_enabled", True)
     llm = FakeLLM([answer("我来分析你的简历。")])
     monkeypatch.setattr(runtime, "get_llm", lambda: llm)
@@ -770,6 +966,37 @@ async def test_builtin_analyze_resume_flags_weak_bullets():
     assert "analyze_resume" in label
 
 
+async def test_builtin_analyze_resume_keeps_leading_numbers():
+    """M3 回归：行首数字不能被当成列表符号吃掉。
+
+    修复前用 `lstrip("0123456789.、) ")` 剥符号，把 bullet 正文开头的数字一起剥了：
+    「3 年 Go 后端开发经验」→「年 Go 后端开发经验」。后果有两个，都要钉住——回显给
+    用户看的正文被篡改，以及这条本来含量化的经历被判成「无量化」。
+    """
+    metas = load_skills("skills")
+    fn = get_skill("resume-writing", metas).tool_fns["analyze_resume"]
+
+    result, _ = await fn(
+        {
+            "resume_text": (
+                "3 年 Go 后端开发经验\n"
+                "2020-2023 在 X 公司负责订单系统\n"
+                "2. 负责日志收集工作\n"
+            )
+        },
+        None,
+    )
+
+    # 前两条的行首数字是正文的一部分，不能被剥掉（剥掉后就变成「无量化」并以被篡改的
+    # 形式出现在例子里）。只有第三条去掉列表符号后确实没有数字，才算无量化
+    assert "无任何量化：1 条" in result
+    assert "年 Go 后端开发经验" not in result
+    assert "2020 在 X 公司负责订单系统" not in result
+    # 真正的列表符号要剥掉（「2. 」不进回显），正文照常出现在弱动词例子里
+    assert "2. 负责日志收集工作" not in result
+    assert "负责日志收集工作" in result
+
+
 async def test_builtin_analyze_resume_without_text_asks_for_input():
     metas = load_skills("skills")
     fn = get_skill("resume-writing", metas).tool_fns["analyze_resume"]
@@ -793,3 +1020,33 @@ async def test_builtin_jd_keyword_gap_reports_missing():
     assert "Kubernetes" in missing_line and "高并发" in missing_line
     assert "Python" not in missing_line  # 已覆盖的词不进缺口
     assert label == "jd_keyword_gap：1/3 覆盖，缺 2 个词"
+
+
+async def test_builtin_jd_keyword_gap_strips_punctuation_and_jd_boilerplate():
+    """M2 回归：JD 里句末带标点的技术词与结构用语不能污染覆盖统计。
+
+    修复前的两个毛病：(1) 关键词带着词尾标点（`Kubernetes.`）去和简历做子串比较，
+    明明写过也判未覆盖；(2) 停用词表太小，requirements/experience/backend 这些
+    **永远不可能覆盖**的招聘套话计入分母，覆盖率被系统性压低。
+    """
+    metas = load_skills("skills")
+    fn = get_skill("resume-writing", metas).tool_fns["jd_keyword_gap"]
+
+    jd = (
+        "Requirements: 3+ years of backend experience. "
+        "Familiar with Kubernetes. Python preferred. "
+        "Responsibilities include building reliable services."
+    )
+    resume = "3 年 Go 后端开发经验，用 Kubernetes 部署过服务，熟悉 Python"
+
+    result, label = await fn({"jd": jd, "resume_text": resume}, None)
+
+    hit_line = next(l for l in result.splitlines() if l.startswith("- 已覆盖"))
+    missing_line = next(l for l in result.splitlines() if l.startswith("- 未覆盖"))
+    # 两个真技能词都该算已覆盖（带标点也必须匹配上）
+    assert "Kubernetes" in hit_line and "Python" in hit_line
+    assert "Kubernetes" not in missing_line and "Python" not in missing_line
+    # 招聘套话不进分母（否则 requirements/experience/backend 等会稳定算作缺口）
+    assert label == "jd_keyword_gap：2/2 覆盖，缺 0 个词"
+    for boilerplate in ("Requirements", "experience", "backend", "Responsibilities"):
+        assert boilerplate not in hit_line + missing_line

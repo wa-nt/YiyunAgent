@@ -265,15 +265,26 @@ def _apply_skill(
     执行工具必须来自**同一次**加载——分两次加载的话正文与实际工具可能对不上。
 
     skills_enabled 关掉时直接返回空三件套：连目录都不扫，省掉每轮一次 stat 遍历。
+
+    整个探测包在宽 except 里，兑现上面那条承诺：skills/ 是用户可写的目录，
+    「一个坏文件不该让这一轮对话报错」。少兜这一层的话，异常会穿透 run_agent 的
+    try（那个 try 在 `path = db_path or ...` 之后才开始，且用户提问此时还没落库），
+    用户看到的是 error 事件、提问也丢了；坏文件还留在盘上，之后每一轮都失败。
     """
     if not settings.skills_enabled:
         return None, [], {}
-    metas = load_skills(settings.skills_dir)
-    matched = match_skill(user_message, metas)
-    if matched is None:
-        return None, [], {}
-    skill: Skill | None = get_skill(matched.name, metas)
-    if skill is None:
+    try:
+        metas = load_skills(settings.skills_dir)
+        matched = match_skill(user_message, metas)
+        if matched is None:
+            return None, [], {}
+        skill: Skill | None = get_skill(matched.name, metas)
+        if skill is None:
+            return None, [], {}
+    except Exception as exc:
+        logger.warning(
+            "skill 探测失败，本轮按无 skill 处理：%s: %s", type(exc).__name__, exc
+        )
         return None, [], {}
     detail = "触发词：" + "、".join(matched.triggers)
     record_skill(skill.meta.name, detail, db_path)

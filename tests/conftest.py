@@ -11,6 +11,12 @@ T9 的埋点开关走同一个夹具，但钉的是 **False**（与 app/config.p
 tests/test_llm.py 用真客户端 + 假传输调 chat/chat_stream，埋点开着就会 fire-and-forget
 往默认库（data/app.db）写 trace——既污染开发库的成本数据，又留下没人 drain 的后台任务。
 断言埋点的用例自己显式打开（见 tests/test_tracing.py）。
+
+T11 的 skill 开关也钉 False，理由同 T9：run_agent 会按用户消息触发 skill，命中时给
+prompt view 多加一条 system 消息（正文）与专用工具。skills_dir 默认是仓库里的
+`skills/`，于是**整套测试都隐式耦合了内置 skill 的内容**——改一个触发词就可能打红
+test_memory.py 里那些「断言注入了几条消息」的无关用例。钉死 False 后，需要真触发的
+用例自己打开开关（见 tests/test_skills.py 的 skills_root 夹具）。
 """
 
 import pytest
@@ -29,9 +35,13 @@ CONTEXT_DEFAULTS = {
 # T9 埋点总开关：测试里默认关，理由见模块 docstring
 TRACING_DEFAULT = False
 
+# T11 skill 总开关：测试里默认关，理由见模块 docstring
+SKILLS_DEFAULT = False
+
 
 @pytest.fixture(autouse=True)
 def pinned_settings(monkeypatch):
     for name, value in CONTEXT_DEFAULTS.items():
         monkeypatch.setattr(settings, name, value)
     monkeypatch.setattr(settings, "tracing_enabled", TRACING_DEFAULT)
+    monkeypatch.setattr(settings, "skills_enabled", SKILLS_DEFAULT)
