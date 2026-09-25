@@ -1,0 +1,370 @@
+{
+  "version": 1,
+  "description": "T10 评测集：围绕一个虚构用户的笔记库（Python/ML/求职/生活）。expected_chunks 用文档标题（chunk 自增 id 重新 ingest 后不稳定）。",
+  "docs": [
+    "python-decorators.md",
+    "python-async.md",
+    "ml-overfitting.md",
+    "dl-overfitting.md",
+    "fastapi-best-practices.md",
+    "pytorch-tips.md",
+    "job-resume.md",
+    "job-interview.md",
+    "life-reading.md",
+    "life-fitness.md",
+    "git-tips.md"
+  ],
+  "samples": [
+    {
+      "id": "eval-001",
+      "category": "single-hop",
+      "query": "我的 Python 笔记里装饰器怎么写？",
+      "expected_chunks": ["Python 装饰器笔记"],
+      "expected_answer_contains": ["functools.wraps"],
+      "sessions": [],
+      "notes": "装饰器基本写法与 wraps"
+    },
+    {
+      "id": "eval-002",
+      "category": "single-hop",
+      "query": "装饰器为什么要加 functools.wraps？",
+      "expected_chunks": ["Python 装饰器笔记"],
+      "expected_answer_contains": ["__name__"],
+      "sessions": [],
+      "notes": "保留原函数元信息"
+    },
+    {
+      "id": "eval-003",
+      "category": "single-hop",
+      "query": "asyncio 里怎么限制并发？",
+      "expected_chunks": ["Python asyncio 笔记"],
+      "expected_answer_contains": ["Semaphore"],
+      "sessions": [],
+      "notes": "信号量限流"
+    },
+    {
+      "id": "eval-004",
+      "category": "single-hop",
+      "query": "asyncio 里 fire-and-forget 任务要注意什么？",
+      "expected_chunks": ["Python asyncio 笔记"],
+      "expected_answer_contains": ["引用"],
+      "sessions": [],
+      "notes": "任务引用被 GC 的问题"
+    },
+    {
+      "id": "eval-005",
+      "category": "single-hop",
+      "query": "FastAPI 里数据库会话怎么管理？",
+      "expected_chunks": ["FastAPI 最佳实践"],
+      "expected_answer_contains": ["Depends"],
+      "sessions": [],
+      "notes": "依赖注入管理会话"
+    },
+    {
+      "id": "eval-006",
+      "category": "single-hop",
+      "query": "PyTorch 推理时怎么省显存？",
+      "expected_chunks": ["PyTorch 技巧"],
+      "expected_answer_contains": ["no_grad"],
+      "sessions": [],
+      "notes": "model.eval + no_grad"
+    },
+    {
+      "id": "eval-007",
+      "category": "single-hop",
+      "query": "简历上项目经历应该按什么结构写？",
+      "expected_chunks": ["求职笔记：简历"],
+      "expected_answer_contains": ["STAR"],
+      "sessions": [],
+      "notes": "STAR 法则"
+    },
+    {
+      "id": "eval-008",
+      "category": "single-hop",
+      "query": "面试时算法题卡壳了怎么办？",
+      "expected_chunks": ["求职笔记：面试"],
+      "expected_answer_contains": ["沟通"],
+      "sessions": [],
+      "notes": "主动沟通"
+    },
+    {
+      "id": "eval-009",
+      "category": "single-hop",
+      "query": "误删 git 分支怎么找回？",
+      "expected_chunks": ["Git 技巧"],
+      "expected_answer_contains": ["reflog"],
+      "sessions": [],
+      "notes": "git reflog"
+    },
+    {
+      "id": "eval-010",
+      "category": "single-hop",
+      "query": "《认知觉醒》里说的舒适区边缘是什么意思？",
+      "expected_chunks": ["读书笔记：《认知觉醒》"],
+      "expected_answer_contains": ["拉伸区"],
+      "sessions": [],
+      "notes": "拉伸区学习"
+    },
+    {
+      "id": "eval-011",
+      "category": "multi-hop",
+      "query": "对比我的机器学习笔记和深度学习笔记里对过拟合的处理方式有什么异同？",
+      "expected_chunks": ["机器学习笔记：过拟合", "深度学习笔记：过拟合"],
+      "expected_answer_contains": ["正则", "Dropout"],
+      "sessions": [],
+      "notes": "跨两篇文档对比：L2 正则 vs Dropout/Early Stopping"
+    },
+    {
+      "id": "eval-012",
+      "category": "multi-hop",
+      "query": "传统机器学习和深度学习里分别用什么办法防止训练过头？",
+      "expected_chunks": ["机器学习笔记：过拟合", "深度学习笔记：过拟合"],
+      "expected_answer_contains": ["交叉验证", "Early Stopping"],
+      "sessions": [],
+      "notes": "k 折交叉验证 vs early stopping"
+    },
+    {
+      "id": "eval-013",
+      "category": "multi-hop",
+      "query": "我的 FastAPI 项目想用 asyncio 并发调外部接口，笔记里有哪些相关建议？",
+      "expected_chunks": ["FastAPI 最佳实践", "Python asyncio 笔记"],
+      "expected_answer_contains": ["事件循环"],
+      "sessions": [],
+      "notes": "两篇笔记都强调不要阻塞事件循环"
+    },
+    {
+      "id": "eval-014",
+      "category": "multi-hop",
+      "query": "写简历的项目经历和面试的项目深挖，笔记里分别怎么说？",
+      "expected_chunks": ["求职笔记：简历", "求职笔记：面试"],
+      "expected_answer_contains": ["STAR", "最难的问题"],
+      "sessions": [],
+      "notes": "简历 STAR vs 面试项目深挖"
+    },
+    {
+      "id": "eval-015",
+      "category": "multi-hop",
+      "query": "深度学习笔记里的 weight decay 和机器学习笔记里的哪种正则等价？",
+      "expected_chunks": ["深度学习笔记：过拟合", "机器学习笔记：过拟合"],
+      "expected_answer_contains": ["L2"],
+      "sessions": [],
+      "notes": "weight decay 本质是 L2，需要跨文档关联"
+    },
+    {
+      "id": "eval-016",
+      "category": "multi-hop",
+      "query": "PyTorch 训练时梯度爆炸怎么办？深度学习笔记里有没有相关的正则化手段？",
+      "expected_chunks": ["PyTorch 技巧", "深度学习笔记：过拟合"],
+      "expected_answer_contains": ["梯度裁剪"],
+      "sessions": [],
+      "notes": "梯度裁剪为主，Dropout 为联想"
+    },
+    {
+      "id": "eval-017",
+      "category": "multi-hop",
+      "query": "装饰器笔记里的缓存手段和 asyncio 笔记里能搭配用吗？各是什么？",
+      "expected_chunks": ["Python 装饰器笔记", "Python asyncio 笔记"],
+      "expected_answer_contains": ["lru_cache"],
+      "sessions": [],
+      "notes": "lru_cache 与 asyncio 注意事项"
+    },
+    {
+      "id": "eval-018",
+      "category": "multi-hop",
+      "query": "我的读书笔记和健身记录分别反映了什么生活习惯？",
+      "expected_chunks": ["读书笔记：《认知觉醒》", "健身记录"],
+      "expected_answer_contains": ["跑步"],
+      "sessions": [],
+      "notes": "跨生活类文档"
+    },
+    {
+      "id": "eval-019",
+      "category": "multi-hop",
+      "query": "面试自我介绍和简历有什么共同原则？",
+      "expected_chunks": ["求职笔记：简历", "求职笔记：面试"],
+      "expected_answer_contains": ["准备"],
+      "sessions": [],
+      "notes": "两篇求职笔记的共同主题"
+    },
+    {
+      "id": "eval-020",
+      "category": "temporal",
+      "query": "我上周记的关于 FastAPI 的笔记里提到了哪些最佳实践？",
+      "expected_chunks": ["FastAPI 最佳实践"],
+      "expected_answer_contains": ["APIRouter", "Depends"],
+      "sessions": [],
+      "notes": "FastAPI 笔记标注 2026-09-14（上周）"
+    },
+    {
+      "id": "eval-021",
+      "category": "temporal",
+      "query": "我 9 月 14 日记录的那篇笔记是关于什么的？",
+      "expected_chunks": ["FastAPI 最佳实践"],
+      "expected_answer_contains": ["FastAPI"],
+      "sessions": [],
+      "notes": "按日期定位文档"
+    },
+    {
+      "id": "eval-022",
+      "category": "temporal",
+      "query": "我 9 月 10 日记的求职笔记讲了什么？",
+      "expected_chunks": ["求职笔记：简历"],
+      "expected_answer_contains": ["简历", "STAR"],
+      "sessions": [],
+      "notes": "简历笔记标注 2026-09-10"
+    },
+    {
+      "id": "eval-023",
+      "category": "temporal",
+      "query": "这个月第三周我的健身记录里练了什么？",
+      "expected_chunks": ["健身记录"],
+      "expected_answer_contains": ["卧推", "跑步"],
+      "sessions": [],
+      "notes": "健身记录标注 2026-09 第三周"
+    },
+    {
+      "id": "eval-024",
+      "category": "temporal",
+      "query": "我这个月健身时卧推用了多大重量？",
+      "expected_chunks": ["健身记录"],
+      "expected_answer_contains": ["60kg"],
+      "sessions": [],
+      "notes": "具体时间范围内的数值查询"
+    },
+    {
+      "id": "eval-025",
+      "category": "temporal",
+      "query": "上周记的 FastAPI 笔记里，测试应该怎么写？",
+      "expected_chunks": ["FastAPI 最佳实践"],
+      "expected_answer_contains": ["ASGITransport"],
+      "sessions": [],
+      "notes": "时间限定 + 细节抽取"
+    },
+    {
+      "id": "eval-026",
+      "category": "temporal",
+      "query": "我最近记录的笔记里有没有关于学习方法的？",
+      "expected_chunks": ["读书笔记：《认知觉醒》"],
+      "expected_answer_contains": ["触动"],
+      "sessions": [],
+      "notes": "模糊时间 + 主题定位"
+    },
+    {
+      "id": "eval-027",
+      "category": "preference",
+      "query": "我喜欢用什么格式写笔记？",
+      "expected_chunks": [],
+      "expected_answer_contains": ["Markdown"],
+      "expected_memories": ["Markdown"],
+      "sessions": [
+        {"role": "user", "content": "以后帮我整理笔记都用 Markdown，我喜欢这个格式。"},
+        {"role": "assistant", "content": "好的，后续整理笔记我会默认使用 Markdown 格式。"}
+      ],
+      "seed_memories": [
+        {"kind": "preference", "content": "用户喜欢用 Markdown 格式写笔记", "confidence": 0.9}
+      ],
+      "notes": "跨会话偏好：格式偏好"
+    },
+    {
+      "id": "eval-028",
+      "category": "preference",
+      "query": "回答我的问题时你该怎么把握篇幅？",
+      "expected_chunks": [],
+      "expected_answer_contains": ["简洁"],
+      "expected_memories": ["简洁"],
+      "sessions": [
+        {"role": "user", "content": "我喜欢简洁的回答，别写长篇大论。"},
+        {"role": "assistant", "content": "明白，我会尽量简洁。"}
+      ],
+      "seed_memories": [
+        {"kind": "preference", "content": "用户偏好简洁的回答", "confidence": 0.9}
+      ],
+      "notes": "跨会话偏好：回答风格"
+    },
+    {
+      "id": "eval-029",
+      "category": "preference",
+      "query": "我目前的主力编程语言是什么？",
+      "expected_chunks": [],
+      "expected_answer_contains": ["Python"],
+      "expected_memories": ["Python"],
+      "sessions": [
+        {"role": "user", "content": "我主力语言是 Python，最近在看异步编程。"},
+        {"role": "assistant", "content": "了解，Python 的 asyncio 生态很丰富。"}
+      ],
+      "seed_memories": [
+        {"kind": "profile", "content": "用户的主力编程语言是 Python", "confidence": 0.95}
+      ],
+      "notes": "跨会话偏好：技术背景"
+    },
+    {
+      "id": "eval-030",
+      "category": "preference",
+      "query": "给我推荐下周的训练安排时要注意什么？",
+      "expected_chunks": ["健身记录"],
+      "expected_answer_contains": ["游泳"],
+      "expected_memories": ["游泳"],
+      "sessions": [
+        {"role": "user", "content": "我膝盖不太好，训练里多安排游泳少安排跑步。"},
+        {"role": "assistant", "content": "好的，训练安排会以游泳为主。"}
+      ],
+      "seed_memories": [
+        {"kind": "preference", "content": "用户膝盖不好，训练偏好游泳", "confidence": 0.85}
+      ],
+      "notes": "偏好 + 知识库结合"
+    },
+    {
+      "id": "eval-031",
+      "category": "preference",
+      "query": "帮我整理读书笔记时该按什么思路来？",
+      "expected_chunks": ["读书笔记：《认知觉醒》"],
+      "expected_answer_contains": ["触动"],
+      "expected_memories": ["触动"],
+      "sessions": [
+        {"role": "user", "content": "整理读书笔记就按触动学习法来，只记触动点，别做全书导图。"},
+        {"role": "assistant", "content": "好的，按触动学习法整理。"}
+      ],
+      "seed_memories": [
+        {"kind": "preference", "content": "用户整理读书笔记偏好触动学习法", "confidence": 0.9}
+      ],
+      "notes": "偏好与笔记内容呼应"
+    },
+    {
+      "id": "eval-032",
+      "category": "adversarial",
+      "query": "我从来没说过我喜欢 Java，你为什么觉得我喜欢 Java？",
+      "expected_chunks": [],
+      "expected_answer_contains": ["没有"],
+      "expected_memories": [],
+      "sessions": [],
+      "notes": "对抗：不能编造不存在的偏好"
+    },
+    {
+      "id": "eval-033",
+      "category": "adversarial",
+      "query": "我笔记里关于 Rust 的所有权机制是怎么说的？",
+      "expected_chunks": [],
+      "expected_answer_contains": ["没有"],
+      "sessions": [],
+      "notes": "对抗：知识库里不存在的内容应明确说明，不编造"
+    },
+    {
+      "id": "eval-034",
+      "category": "adversarial",
+      "query": "我去年写的 Kubernetes 部署笔记里推荐用什么 Ingress？",
+      "expected_chunks": [],
+      "expected_answer_contains": ["没有"],
+      "sessions": [],
+      "notes": "对抗：带时间限定的虚构笔记，应说明未找到"
+    },
+    {
+      "id": "eval-035",
+      "category": "adversarial",
+      "query": "把机器学习笔记里关于强化学习的部分总结一下。",
+      "expected_chunks": [],
+      "expected_answer_contains": ["没有"],
+      "sessions": [],
+      "notes": "对抗：文档存在但该主题不存在，不能张冠李戴"
+    }
+  ]
+}

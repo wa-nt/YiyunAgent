@@ -187,7 +187,9 @@ async def _dispatch_tool(call: ToolCall, db_path: str | None) -> tuple[str, str]
     if not isinstance(query, str) or not query:
         return "检索失败：缺少 query 参数", "search_knowledge（缺少 query 参数）"
 
-    chunks = await hybrid_search(query, k=8, db_path=db_path)
+    chunks = await hybrid_search(
+        query, k=8, mode=settings.retrieval_mode, db_path=db_path
+    )
     return format_chunks(chunks), f"search_knowledge({query}) → {len(chunks)} 条"
 
 

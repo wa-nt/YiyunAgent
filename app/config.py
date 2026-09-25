@@ -29,6 +29,10 @@ class Settings(BaseSettings):
     chunk_size: int = 500
     chunk_overlap: int = 80
 
+    # 检索模式：hybrid（三路 RRF 融合）/ vector / bm25。T10 消融实验的检索对照组
+    # （D/E/F/G/H）靠这个开关切单路检索，runtime 的工具执行每次从 settings 读
+    retrieval_mode: Literal["vector", "bm25", "hybrid"] = "hybrid"
+
     memory_enabled: bool = True
     memory_recall_top_k: int = 5
     # 去重阈值：归一化（去称呼前缀/标点/空白）后整句的序列相似度。0.92 是刻意的保守值——
