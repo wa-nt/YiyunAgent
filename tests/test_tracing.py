@@ -7,6 +7,7 @@ SDK 的 create/stream），不发真实请求。
 
 import asyncio
 import logging
+import re
 import sqlite3
 import time
 from types import SimpleNamespace
@@ -231,6 +232,22 @@ def history(n: int) -> list[Message]:
         else Message(role="assistant", content=f"回答{i}")
         for i in range(n)
     ]
+
+
+# ---------- 时间戳格式 ----------
+
+
+def test_now_is_utc_millisecond_precision():
+    """_now() 必须是 UTC + 毫秒精度。
+
+    退回秒级有两个后果，这里两个都锁住：同秒内的多条 trace 失去先后（列表排序靠 id
+    兜住了，但时间窗过滤的粒度会变粗），且与过滤基准 _normalize_ts 的输出格式不再一致
+    ——两边格式不同时字典序就不等于时间序。
+    """
+    stamp = tracing._now()
+
+    assert re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}\+00:00", stamp), stamp
+    assert tracing._normalize_ts(stamp) == stamp  # 与过滤基准同格式，可直接字典序比较
 
 
 # ---------- 成本计算 ----------
@@ -734,6 +751,32 @@ async def test_traces_endpoint_rejects_bad_timestamps(client, db):
     # 合法值不受影响
     ok = await client.get("/api/traces", params={"start": "2026-09-25T00:00:00Z"})
     assert ok.status_code == 200
+
+
+async def test_traces_endpoint_rejects_extreme_timestamps(client, db):
+    """极值时间戳（能解析、但换算到 UTC 越界）也是 422，不是 500。
+
+    0001-01-01T00:00:00+08:00 减去 8 小时就掉出 datetime 的年份下界，astimezone 抛
+    OverflowError——这一步若不在守卫里，接口会以 500 暴露内部异常。
+    """
+    await seed(db, SEED)
+
+    for params in (
+        {"start": "0001-01-01T00:00:00+08:00"},
+        {"end": "9999-12-31T23:59:59-08:00"},
+    ):
+        resp = await client.get("/api/traces", params=params)
+        assert resp.status_code == 422, f"{params} 应回 422，实际 {resp.status_code}"
+        assert "超出可比较范围" in resp.json()["detail"]
+
+    summary = await client.get(
+        "/api/traces/summary", params={"start": "0001-01-01T00:00:00+08:00"}
+    )
+    assert summary.status_code == 422
+
+    # 同一天但不越界的写法照旧可用（UTC 侧的 0001-01-01 不需要换算）
+    ok = await client.get("/api/traces", params={"start": "0001-01-01T00:00:00Z"})
+    assert ok.status_code == 200 and ok.json()["total"] == 3
 
 
 async def test_traces_endpoint_rejects_out_of_range_paging(client, db):

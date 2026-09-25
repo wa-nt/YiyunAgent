@@ -47,7 +47,7 @@ DRAIN_TIMEOUT = 5.0
 # 8 位既留得住精度，又能盖掉浮点求和末尾的噪声（如 0.00012300000000000001）
 COST_DECIMALS = 8
 
-# 每 1K tokens 的单价所在的配置字段，按 provider 分档。表里没有的 provider（如通义）
+# 每 1M tokens 的单价所在的配置字段，按 provider 分档。表里没有的 provider（如通义）
 # 回落到 openai 档：定价本身就是估算，多一档等于多编一组数字
 _PRICE_FIELDS = {
     "openai": ("price_openai_input", "price_openai_output"),
@@ -77,7 +77,8 @@ def _normalize_ts(value: str) -> str:
     `…T10:00:00Z` 会既不大于也不小于 `…T10:00:00.000+00:00`，静默给出错误结果。
 
     必须带时区：不带时区的时间点本身有歧义，与其替调用方猜，不如报错让人说清楚。
-    解析不了或缺时区都抛 InvalidTimestamp，由 HTTP 层转 422。
+    解析不了、缺时区、或（能解析但）换算到 UTC 越界都抛 InvalidTimestamp，
+    由 HTTP 层转 422——这三种都是「调用方给的值不可用」，不该变成 500。
     """
     try:
         parsed = datetime.fromisoformat(value)
@@ -90,7 +91,14 @@ def _normalize_ts(value: str) -> str:
             f"时间戳缺少时区：{value!r}，需要带时区的 ISO 8601"
             "（如 2026-09-25T10:00:00Z 或 2026-09-25T18:00:00+08:00）"
         )
-    return parsed.astimezone(timezone.utc).isoformat(timespec="milliseconds")
+    try:
+        return parsed.astimezone(timezone.utc).isoformat(timespec="milliseconds")
+    except OverflowError as exc:
+        # datetime 能表示的范围挡不住偏移换算：0001-01-01T00:00:00+08:00 减 8 小时就出界。
+        # 换算这一步必须也在守卫里，否则极值时间戳会以 OverflowError 冒到 HTTP 层变 500
+        raise InvalidTimestamp(
+            f"时间戳超出可比较范围：{value!r}（换算到 UTC 越界），请改用更接近当下的时间"
+        ) from exc
 
 
 def estimate_cost(provider: str, tokens_in: int, tokens_out: int) -> float:
