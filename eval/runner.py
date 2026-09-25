@@ -45,6 +45,7 @@ from app.agent import runtime
 from app.config import Settings, settings
 from app.db import get_db, init_db
 from app.ingest.pipeline import ingest
+from app.retrieval.bm25_search import invalidate
 from app.tracing import drain_traces
 from eval.metrics import (
     aggregate_metrics,
@@ -131,6 +132,16 @@ def load_dataset(dataset_path: str | Path) -> dict[str, Any]:
     return dataset
 
 
+def _same_file(a: str | Path, b: str | Path) -> bool:
+    """两个路径是否指向同一个库文件（解析成绝对路径后比较）。
+
+    resolve() 会展开 `..`、相对路径与符号链接，`data/app.db` 与
+    `./data/../data/app.db` 因此能判定为同一个文件。文件不存在时 resolve
+    仍能算出规范路径（strict=False），所以守卫在库还没建起来时也有效。
+    """
+    return Path(a).resolve() == Path(b).resolve()
+
+
 async def _reset_db(db_path: str | Path) -> None:
     """删掉评测库及其 WAL 旁路文件，让本次运行的 ingest 从空库开始。
 
@@ -138,34 +149,68 @@ async def _reset_db(db_path: str | Path) -> None:
     hit@k 随运行次数单调下滑）。删文件比「按 source 幂等」干净：chunk 自增 id 也
     跟着回到初始值，两次运行的 trace 可以直接逐字节对比。
 
-    删之前必须等在途的 trace 写入结束（T9 的埋点是 fire-and-forget）：工具 trace 落
-    的正是这个评测库，任务没跑完就删文件在 Windows 上会直接 PermissionError
-    （「另一个程序正在使用此文件」），Linux 上则是把 trace 悄悄写进已删除的 inode。
+    本函数会**不可逆地删掉一个 SQLite 库**，所以入口先拒绝在用的应用库：调用方
+    显式传了 settings.db_path（用户的知识库）时 raise，而不是把笔记删完再说。
+    不能靠「默认参数已经是 data/eval.db」兜住——那只挡住了不传参的路径。
+
+    删之前必须等在途的后台写入结束，否则 Windows 上直接 PermissionError
+    （「另一个程序正在使用此文件」），Linux 上则是这些写入悄悄落进已删除的 inode：
+    - 记忆写入（runtime 的 fire-and-forget 抽取）会往这个库写，且它**会产生 llm
+      trace**，所以先等它、再等 trace（顺序反过来会漏掉它新产生的 trace 任务）
+    - trace 写入（T9 埋点）：工具 trace 落的正是这个评测库
+
+    删完顺手失效进程级的 BM25 索引：_indexes 按绝对路径缓存，删库后若本次 ingest
+    没有产出任何 chunk（早退不调 invalidate），旧索引会原样留着，检索静默返回已删文档。
     """
+    if _same_file(db_path, settings.db_path):
+        raise ValueError(
+            f"评测不允许清应用库：{db_path} 就是 settings.db_path（在用知识库）。"
+            "评测用一次性 scratch 库，如 data/eval.db"
+        )
+    await runtime.drain_memory_writes()
     await drain_traces()
     path = Path(db_path)
     for suffix in ("", *DB_SIDECARS):
         Path(f"{path}{suffix}").unlink(missing_ok=True)
+    invalidate(path)
 
 
-def _error_result(sample: dict[str, Any], exc: BaseException) -> SampleResult:
-    """gather 兜住的漏网异常 → 一条失败样本记录（与逐样本记错的口径一致）。
+def _error_result(
+    sample: dict[str, Any],
+    exc: BaseException,
+    rounds: list[list[str]] | None = None,
+    k: int = 8,
+) -> SampleResult:
+    """样本级异常 → 一条失败样本记录（与逐样本记错的口径一致）。
 
-    指标直接给「空回答」的形状与分值：error 非空时聚合里的 errors 已经把它标出来了，
-    但分类明细也得有可读的值。这里不走 answer_metrics——没有回答就是 0 分，不能因为
-    样本恰好没标 expected_contains 而被算成「无约束 → 满分」。
+    检索指标按**崩溃前已观测到的检索轮次**算，而不是一律给 None：样本崩在
+    检索之后（例如 LLM 第二轮挂掉）时，已经发生的检索是真实证据，丢掉它会让
+    「崩溃样本」在 retrieval 维度被整体跳过，只统计活下来的样本（生存者偏差）。
+    一轮检索都没发生（崩在准备阶段）才给 None，与「该样本不考核检索」区分开。
+
+    回答维度反过来：没有完成回答就是 0 分，不管样本标没标 expected_contains——
+    不能因为「无标注约束」的默认值（1.0）把崩溃样本算成满分。这两条口径不冲突：
+    retrieval 记的是「已发生的检索事实」，answer 记的是「回答的完成度」，前者
+    有证据就采信，后者没有产出就该罚。
 
     各字段用 .get 读：走到这里的原因可能就是样本字段缺失（构造错误的评测集），
     兜底函数自己再抛一次 KeyError 会把「记下来继续跑」变成「整轮炸掉」。
     """
+    observed = list(rounds or [])
+    expected_chunks = sample.get("expected_chunks", [])
     return SampleResult(
         id=sample.get("id", "<unknown>"),
         category=sample.get("category", "unknown"),
         query=sample.get("query", ""),
         answer="",
+        retrieved=[title for rnd in observed for title in rnd],
         error=f"{type(exc).__name__}: {exc}",
         metrics={
-            "retrieval": None,
+            "retrieval": (
+                retrieval_metrics_rounds(observed, expected_chunks, k)
+                if expected_chunks and observed
+                else None
+            ),
             "answer": {
                 "keyword_coverage": 0.0,
                 "matched": [],
@@ -178,13 +223,19 @@ def _error_result(sample: dict[str, Any], exc: BaseException) -> SampleResult:
 
 
 def git_commit() -> str:
-    """当前仓库的 commit hash（可复现性快照）；不在 git 仓库里时返回 unknown。"""
+    """当前仓库的 commit hash（可复现性快照）；不在 git 仓库里时返回 unknown。
+
+    cwd 显式指向本文件所在的仓库根：git 默认按**进程当前目录**找仓库，从仓库外
+    跑 pytest（或从别处调用本函数）会拿不到 hash，快照静默退化成 unknown。
+    """
+    root = Path(__file__).resolve().parent.parent
     try:
         out = subprocess.run(
             ["git", "rev-parse", "--short", "HEAD"],
             capture_output=True,
             text=True,
             timeout=5,
+            cwd=root,
         )
         return out.stdout.strip() or "unknown"
     except Exception:
@@ -200,21 +251,38 @@ def _literal_values(name: str) -> tuple[Any, ...] | None:
 
     校验范围只看 Literal：这类字段的取值是**闭集**（retrieval_mode 的
     vector/bm25/hybrid），拼错一个字母没有「退化为默认」的合理语义，只会在下游
-    炸成 500。bool/数值字段不在守卫范围内——它们的非法值（字符串 "false"）语义
-    模糊，交给 pydantic 的默认行为即可。
+    炸成 500。
     """
     annotation = Settings.model_fields[name].annotation
     return get_args(annotation) if get_origin(annotation) is Literal else None
 
 
+def _primitive_kind(name: str) -> str | None:
+    """settings 字段的期望原始类型：'bool' / 'number' / None（不校验）。
+
+    str 与 Optional[...] 字段不设守卫：它们的非法值要么当场被下游拒绝，要么本就
+    宽松（如 db_path 接受任意路径字符串）。bool 与数值要管，是因为裸 setattr 绕过
+    pydantic、而 Settings 没开 validate_assignment：`memory_enabled="false"` 会被
+    当成非空字符串（真值！）静默打开开关，整组消融的结论跟着错，且不会报任何错。
+    """
+    annotation = Settings.model_fields[name].annotation
+    if annotation is bool:
+        return "bool"
+    if annotation in (int, float):
+        return "number"
+    return None
+
+
 class _settings_override:
     """评测期间临时改写 settings，退出时恢复原值（消融开关的载体）。
 
-    入口做两道校验，都是**评测开始前**报错：
+    入口做三道校验，都是**评测开始前**报错：
     - 字段必须存在（裸 setattr 绕过 pydantic，拼错字段名会被 pydantic 当场拒绝，
       不校验的话报错点会漂到 __enter__ 的半途，已改的字段留在原地）
     - Literal 字段的取值必须在允许集合里（否则 hybrid_search 抛 ValueError，
       经 asyncio.gather 冒成整轮评测异常）
+    - bool / 数值字段的类型必须对（`"false"` 是真值字符串，会把「关掉某开关」的
+      消融组静默变成「打开」，且全程不报错——最难从结果反推的错法）
     """
 
     def __init__(self, overrides: dict[str, Any] | None) -> None:
@@ -230,6 +298,18 @@ class _settings_override:
             if allowed is not None and value not in allowed:
                 raise ValueError(
                     f"配置 {name} 的取值非法：{value!r}，允许：{list(allowed)}"
+                )
+            kind = _primitive_kind(name)
+            # bool 是 int 的子类，判断顺序不能反：先排除 bool 再看数值
+            if kind == "bool" and not isinstance(value, bool):
+                raise ValueError(
+                    f"配置 {name} 需要 bool，得到 {type(value).__name__}：{value!r}"
+                )
+            if kind == "number" and (
+                isinstance(value, bool) or not isinstance(value, (int, float))
+            ):
+                raise ValueError(
+                    f"配置 {name} 需要数值，得到 {type(value).__name__}：{value!r}"
                 )
 
     def __enter__(self) -> None:
@@ -307,17 +387,23 @@ async def _seed_sample(sample: dict[str, Any], session_id: str, db_path: str) ->
 
 
 async def _run_sample(
-    sample: dict[str, Any], db_path: str, k: int
+    sample: dict[str, Any],
+    db_path: str,
+    k: int,
+    rounds: list[list[str]],
+    recalled: list[str],
 ) -> SampleResult:
     """执行阶段 + 评分阶段：消费 run_agent 事件流直到终态，然后算指标。
 
     run_agent 内部的故障（LLM 异常、工具失败）会以 error 事件的形式到达这里，记进
     SampleResult.error；本函数自己不捕获异常，样本级的任何故障由调用方 guarded 兜住
     （见 run_eval），保证「一个样本炸掉不影响整轮」的口径只有一处实现。
+
+    rounds / recalled 是**调用方持有的观测收集器**，本函数把 contextvar 指向它们后
+    才开跑：崩溃时 guarded 仍能读到崩溃前已记录的检索轮次与召回文本，用于
+    _error_result 的评分（自建列表的话，异常一抛出就再也拿不到那些观测了）。
     """
     session_id = f"eval-{sample['id']}-{uuid.uuid4().hex[:6]}"
-    rounds: list[list[str]] = []
-    recalled: list[str] = []
     answer = ""
     error: str | None = None
     token_r = _current_retrieved.set(rounds)
@@ -378,15 +464,22 @@ async def run_eval(
     """跑一遍评测集，返回聚合结果。
 
     - config_overrides：评测期间生效的 settings 改写（消融矩阵用），结束恢复；
-      取值非法（未知字段 / Literal 字段给了集合外的值）在这里就报错，不等到检索时报
-    - db_path：评测用的**一次性 scratch 库**，默认 data/eval.db。每次运行开始时
-      连同 -wal/-shm 一起删掉重建：ingest 是纯追加，不清库的话第二次运行会把同一批
-      文档再灌一遍，语料翻倍、首跑数字不可复现（实测三次运行 hit@k 0.82→0.54→0.36）。
-      注意 llm trace 的落库口径是进程级的（只认 settings.db_path，见 app/tracing.py），
-      要收集 trace 就把 settings.db_path 指到同一个库
-    - llm：注入的模型桩；None 时走 app.llm.get_llm 的真实配置
+      取值非法（未知字段 / Literal 集合外的值 / bool 与数值字段类型不对）在这里就
+      报错，不等到检索或读了配置之后才发现
+    - db_path：评测用的**一次性 scratch 库**，默认 data/eval.db（CLI 同默认）。每次运行
+      开始时连同 -wal/-shm 一起删掉重建：ingest 是纯追加，不清库的话第二次运行会把同一
+      批文档再灌一遍，语料翻倍、首跑数字不可复现（实测三次运行 hit@k 0.82→0.54→0.36）。
+      **传在用的应用库（settings.db_path）会抛 ValueError**，不会把用户笔记删掉
+    - llm：注入的模型桩；None 时走 app.llm.get_llm 的真实配置。桩**只覆盖
+      runtime.get_llm**（对话主循环），记忆抽取走 app.memory.writer 自己的 get_llm，
+      不在这里的替换范围内——要桩掉它得另行 patch（测试里见 conftest 的
+      `memory_writer.get_llm`），否则评测仍会打真实 API
     - sample_ids：只跑指定子集（小规模冒烟用）
     - concurrency：asyncio.gather 的并发上限，避免打满 rate limit
+    - k：Hit@k / Recall@k 的 k
+
+    注意 llm trace 的落库口径是进程级的（只认 settings.db_path，见 app/tracing.py），
+    要收集 trace 就把 settings.db_path 指到同一个库。
     """
     dataset = load_dataset(dataset_path)
     samples = dataset["samples"]
@@ -417,10 +510,15 @@ async def run_eval(
             处立刻向上抛，但其余任务不被取消、继续在后台跑，而下面的 finally 随即撤掉
             观测器与 LLM 桩、with 块退出还会把 settings 恢复默认——在飞的样本于是拿到
             「默认配置 + 真实客户端」，直接打真实 API 烧配额（见下方 gather 的说明）。
+
+            观测收集器建在这里而不是 _run_sample 内部：崩溃时本函数还要拿它算检索
+            指标（崩溃前的检索是真实证据，丢掉会造成生存者偏差）。
             """
+            rounds: list[list[str]] = []
+            recalled: list[str] = []
             async with semaphore:
                 try:
-                    return await _run_sample(sample, path, k)
+                    return await _run_sample(sample, path, k, rounds, recalled)
                 except Exception as exc:
                     logger.warning(
                         "样本 %s 失败：%s: %s",
@@ -428,7 +526,7 @@ async def run_eval(
                         type(exc).__name__,
                         exc,
                     )
-                    return _error_result(sample, exc)
+                    return _error_result(sample, exc, rounds, k)
 
         try:
             # return_exceptions=True 是**必需**的，不是顺手加的：默认行为在第一个异常时
@@ -445,6 +543,13 @@ async def run_eval(
 
         # 快照要在 override 生效期内拍：出了 with 块 settings 已恢复成默认值
         snapshot = config_snapshot()
+
+    # 收尾把自己触发的后台写入等干净，再交给调用方。埋点与记忆抽取都是
+    # fire-and-forget：不等的话这些任务会带着已打开的库连接活过 run_eval 返回，
+    # 调用方随后删库/删目录（run_ablation 的 tempfile 清理、下一次 _reset_db）在
+    # Windows 上直接 PermissionError。每轮运行收干净自己的副作用，边界才在 run_eval。
+    await runtime.drain_memory_writes()
+    await drain_traces()
 
     results: list[SampleResult] = []
     for sample, outcome in zip(samples, outcomes, strict=True):

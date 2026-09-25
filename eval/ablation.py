@@ -62,11 +62,16 @@ async def run_ablation(
     work_dir 指定时把各组库放在该目录下（便于复査）；默认用临时目录，
     跑完即弃——每组的持久产物是 EvalResult.save() 落盘的 result.json。
 
+    groups 缺省（None）跑全部 8 组；**显式传空列表则一组都不跑**并返回 {}——
+    用 `groups or list(ABLATION_GROUPS)` 的话空列表会被当成 None，静默跑满 8 组，
+    调用方想用空列表表达「什么都不做」时会得到一堆意外产物。
+    对 sample_ids 筛完为空的情况，每组仍产出一条 n=0 的结果（组本身跑了，只是无样本）。
+
     库的清理由 run_eval 自己在开头做（删库文件后重新 ingest），所以 work_dir 模式
     下重跑同一组不会把文档再灌一遍——这也意味着 work_dir 是**评测专用**目录，
     别把要留的东西放进去。
     """
-    names = groups or list(ABLATION_GROUPS)
+    names = list(ABLATION_GROUPS) if groups is None else list(groups)
     unknown = [n for n in names if n not in ABLATION_GROUPS]
     if unknown:
         raise ValueError(f"未知消融组：{unknown}，可选：{list(ABLATION_GROUPS)}")

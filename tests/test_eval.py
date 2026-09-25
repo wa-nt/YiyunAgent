@@ -11,6 +11,7 @@ from app.config import settings
 from app.db import get_db, init_db
 from app.llm.types import ChatResult, StreamChunk, ToolCall
 from app.memory import writer as memory_writer
+from app.retrieval import bm25_search
 from app.retrieval.bm25_search import invalidate
 from app.retrieval.types import RetrievedChunk
 from app.tracing import drain_traces
@@ -98,23 +99,86 @@ def test_answer_metrics_coverage():
     assert eval_metrics.answer_metrics("随便", [])["keyword_coverage"] == 1.0
 
 
-def test_answer_metrics_excludes_zero_out_coverage():
-    """禁词（对抗样本判据）出现即 0 分，覆盖全部 has/missed 两种组合。"""
+def test_answer_metrics_excludes_only_fires_on_assertion():
+    """禁词判据是「断言了禁词」，不是「提到了禁词」——胡编罚、诚实拒答不罚。"""
     excluded = ["Q-learning", "策略梯度"]
-    # 胡编内容 + 补一句「没有」：contains 全中，但出现禁词 → 0 分
+    # 胡编：出现禁词且所在句子没有任何否认表述 → 0 分
     fabricated = eval_metrics.answer_metrics(
-        "没有直接提到 Q-learning，不过可以这样理解……", ["没有"], excluded
+        "Q-learning 的核心是时序差分学习，策略梯度则直接优化策略。", ["没有"], excluded
     )
     assert fabricated["keyword_coverage"] == 0.0
-    assert fabricated["violated"] == ["Q-learning"]
-    # 正确拒答：不出现禁词 → 正常给满分
-    correct = eval_metrics.answer_metrics("笔记里没有关于强化学习的内容。", ["没有"], excluded)
+    assert fabricated["violated"] == ["Q-learning", "策略梯度"]
+    # 正确拒答：点名了被问的术语，但整句都在否认 → 正常给满分
+    correct = eval_metrics.answer_metrics(
+        "笔记里没有关于 Q-learning 或策略梯度的内容。", ["没有"], excluded
+    )
     assert correct["keyword_coverage"] == 1.0
     assert correct["violated"] == []
-    # 未标注 contains 但出现禁词：同样 0 分（不能因「无约束」而免罚）
+    # 未标注 contains 但断言了禁词：同样 0 分（不能因「无约束」而免罚）
     assert eval_metrics.answer_metrics("参考 Q-learning 的做法", [], excluded)[
         "keyword_coverage"
     ] == 0.0
+    # 先说「没有」再展开禁词：展开句没有否认表述 → 仍然 0 分
+    sneaky = eval_metrics.answer_metrics(
+        "笔记里没有强化学习的内容。Q-learning 大致是这样工作的：……", ["没有"], excluded
+    )
+    assert sneaky["keyword_coverage"] == 0.0
+
+
+def test_excludes_negation_is_sentence_scoped_not_document_scoped():
+    """否认只看禁词所在**句子**：整篇找否定词会放过「挂着否认词的胡编」。
+
+    这条是判据的边界：句子切分必须精确到句末标点，既不能整篇判定（放过胡编），
+    也不能连逗号都切（把「没有关于 A、B 的记录」的诚实拒答误杀）。
+    """
+    excluded = ["nginx"]
+    # 否认句 + 另一个句子里的断言：断言句无否定词 → 违规
+    mixed = eval_metrics.answer_metrics(
+        "笔记里没有 Kubernetes 的内容。nginx 是最常见的 Ingress 控制器。",
+        [],
+        excluded,
+    )
+    assert mixed["violated"] == ["nginx"]
+    # 顿号连接的并列术语仍属同一句 → 不违规（不能把顿号当句子边界）
+    listing = eval_metrics.answer_metrics(
+        "笔记里没有关于 nginx、Traefik 的记录。", [], excluded
+    )
+    assert listing["violated"] == []
+
+
+def test_excludes_known_hole_is_pinned():
+    """已知漏洞要有用例钉住，避免 README 与实际行为脱节（见 dataset/README）。
+
+    否认判定是句级的，不看否认的对象：一句里既有否认又有断言时整句豁免。
+    「没有用 nginx，改用 Traefik」里 Traefik 被断言却是禁词，判为不违规。
+    这是有意的取舍（对象级绑定对自动指标不划算），不是待修的 bug——若哪天
+    改成对象级判定，这条用例会红，提醒同步改 README。
+    """
+    result = eval_metrics.answer_metrics(
+        "笔记里没有用 nginx，改用 Traefik。", ["没有"], ["nginx", "Traefik"]
+    )
+    assert result["violated"] == [], "行为变了：请同步更新 dataset/README 的漏洞说明"
+    assert result["keyword_coverage"] == 1.0
+    # 对照：无否认词时两个禁词都算违规（这才是 0 分可信的那一侧）
+    plain = eval_metrics.answer_metrics(
+        "推荐用 nginx 或 Traefik。", ["没有"], ["nginx", "Traefik"]
+    )
+    assert plain["violated"] == ["nginx", "Traefik"]
+    assert plain["keyword_coverage"] == 0.0
+
+
+def test_keyword_matching_is_case_insensitive():
+    """标注大小写与回答大小写不一致时不能被绕过（同词不同拼写风格）。"""
+    # contains：标注 Semaphore，回答写 semaphore，仍算命中
+    answered = eval_metrics.answer_metrics("用 asyncio.semaphore 限流", ["Semaphore"])
+    assert answered["keyword_coverage"] == 1.0 and answered["missed"] == []
+    # excludes：禁词 nginx，回答写 Nginx / NGINX，都要判违规
+    for spelling in ("Nginx", "NGINX", "nGiNx"):
+        result = eval_metrics.answer_metrics(
+            f"推荐用 {spelling} 做 Ingress。", [], ["nginx"]
+        )
+        assert result["keyword_coverage"] == 0.0, spelling
+        assert result["violated"] == ["nginx"]
 
 
 def test_memory_metrics_skips_unlabeled():
@@ -232,6 +296,23 @@ class _SilentWriterLLM:
 
 async def _fake_embed(texts):
     return [[float((hash((t, i)) % 1000) / 1000.0) for i in range(DIM)] for t in texts]
+
+
+async def ingest_bare_doc(db_path, title="阿尔法笔记", text="苹果是一种水果。"):
+    """往库里塞一篇最小文档（走真实 ingest，embedding 由 stub_embeddings 桩掉）。
+
+    用于构造「库里确实有内容」的场景（守卫不能删掉有数据的库）。
+    """
+    from pathlib import Path
+
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmp:
+        doc = Path(tmp) / "doc.md"
+        doc.write_text(f"# {title}\n{text}", encoding="utf-8")
+        from app.ingest.pipeline import ingest as _ingest
+
+        return await _ingest(doc, db_path)
 
 
 @pytest.fixture
@@ -428,6 +509,156 @@ async def test_reset_db_waits_for_inflight_traces(tmp_path, monkeypatch):
     assert not path.exists()
 
 
+async def test_run_eval_leaves_no_inflight_writes_behind(
+    tiny_dataset, tmp_path, monkeypatch
+):
+    """run_eval 返回时必须已收干净自己触发的后台写入。
+
+    埋点与记忆抽取都是 fire-and-forget。不等它们跑完，任务会带着已打开的库连接活过
+    run_eval 返回，调用方随后删库/删目录在 Windows 上直接 PermissionError——实测
+    `--ablation`（CLI 默认开埋点）在 tempfile 清理阶段炸掉，整轮产物全丢。
+
+    这里不依赖「文件是否恰好被占用」的时序运气，直接断言返回前两个 drain 都被调用。
+    """
+    import app.agent.runtime as app_runtime
+
+    calls: list[str] = []
+    orig_memory = app_runtime.drain_memory_writes
+    orig_traces = eval_runner.drain_traces
+
+    async def spy_memory(timeout: float = 5.0):
+        calls.append("memory")
+        await orig_memory(timeout)
+
+    async def spy_traces(timeout: float = 5.0):
+        calls.append("traces")
+        await orig_traces(timeout)
+
+    monkeypatch.setattr(app_runtime, "drain_memory_writes", spy_memory)
+    monkeypatch.setattr(eval_runner, "drain_traces", spy_traces)
+    monkeypatch.setattr(settings, "tracing_enabled", True)  # 覆盖 CLI 默认路径
+
+    await run_eval(str(tiny_dataset), db_path=str(tmp_path / "eval.db"), llm=FakeLLM())
+    # 清库也 drain 一次（memory 在前），所以两个词各出现两次
+    assert calls.count("memory") >= 1 and calls.count("traces") >= 1, calls
+    assert calls[0] == "memory", f"第一次 drain 必须是记忆写入（它会新产生 trace）：{calls}"
+
+
+async def test_ablation_temp_dir_cleanup_succeeds(tiny_dataset, tmp_path, monkeypatch):
+    """--ablation 的临时目录清理不能因在途写入占用文件而失败（文档化的主路径）。
+
+    这条覆盖 CLI 的真实形态：work_dir 缺省 → run_ablation 建临时目录、跑完清理。
+    """
+    monkeypatch.setattr(settings, "tracing_enabled", True)  # CLI 默认
+    results = await run_ablation(
+        str(tiny_dataset), groups=["A", "B"], llm=FakeLLM()
+    )
+    assert set(results) == {"A", "B"}
+
+
+async def test_reset_db_waits_for_memory_writes_before_traces(tmp_path, monkeypatch):
+    """清库要等**记忆写入**结束，且顺序在等 trace 之前。
+
+    记忆抽取是 runtime 的 fire-and-forget 任务，它也往这个库写，而且**自己会产生
+    llm trace**：先等 trace 再等记忆的话，记忆任务在等待期间新落的 trace 会漏网。
+    这里断言两个 drain 都被调用且记忆在前。
+    """
+    import app.agent.runtime as app_runtime
+    from eval.runner import _reset_db
+
+    path = tmp_path / "eval.db"
+    await init_db(path)
+
+    calls: list[str] = []
+    orig_memory = app_runtime.drain_memory_writes
+    orig_traces = eval_runner.drain_traces
+
+    async def spy_memory(timeout: float = 5.0):
+        calls.append("memory")
+        await orig_memory(timeout)
+
+    async def spy_traces(timeout: float = 5.0):
+        calls.append("traces")
+        await orig_traces(timeout)
+
+    monkeypatch.setattr(app_runtime, "drain_memory_writes", spy_memory)
+    monkeypatch.setattr(eval_runner, "drain_traces", spy_traces)
+
+    await _reset_db(path)
+    assert calls == ["memory", "traces"], f"drain 的调用次数或顺序不对：{calls}"
+
+
+async def test_reset_db_refuses_to_delete_the_app_database(
+    tmp_path, monkeypatch, stub_embeddings
+):
+    """显式把应用库路径传给评测时必须在删库前 raise（MAJ-1）。
+
+    默认值 data/eval.db 只挡住了不传参的路径；显式传 settings.db_path（用户的知识库）
+    时 _reset_db 会连 -wal/-shm 一起删掉，笔记永久丢失且没有任何提示。
+    """
+    from eval.runner import _reset_db
+
+    app_db = tmp_path / "app.db"
+    await init_db(app_db)
+    await ingest_bare_doc(app_db)  # 放点内容进去，确认真的没被删
+    monkeypatch.setattr(settings, "db_path", str(app_db))
+
+    with pytest.raises(ValueError, match="不允许清应用库"):
+        await _reset_db(app_db)
+    # 守卫发生在删除之前：库与内容都还在
+    assert app_db.exists()
+    async with get_db(app_db) as conn:
+        docs = (await conn.execute_fetchall("SELECT COUNT(*) AS n FROM documents"))[0]["n"]
+    assert docs == 1
+
+    # 相对路径 / 带 .. 的等价写法同样要挡住（比较的是解析后的绝对路径）
+    with pytest.raises(ValueError, match="不允许清应用库"):
+        await _reset_db(tmp_path / "." / "app.db")
+
+    # 与 settings.db_path 无关的库不受影响
+    other = tmp_path / "other.db"
+    await init_db(other)
+    await _reset_db(other)
+    assert not other.exists()
+
+
+async def test_run_eval_rejects_app_db_path(tiny_dataset, tmp_path, monkeypatch):
+    """run_eval 传应用库路径同样被拒（守卫在 run_eval 的调用链上生效）。"""
+    app_db = tmp_path / "app.db"
+    await init_db(app_db)
+    monkeypatch.setattr(settings, "db_path", str(app_db))
+    with pytest.raises(ValueError, match="不允许清应用库"):
+        await run_eval(str(tiny_dataset), db_path=str(app_db), llm=FakeLLM())
+    assert app_db.exists()
+
+
+async def test_reset_db_invalidates_bm25_index(tmp_path, stub_embeddings):
+    """删库要顺手失效进程级 BM25 索引，否则空语料场景静默返回已删文档（MIN-2）。
+
+    _indexes 按绝对路径缓存；删库后若本次 ingest 没产出任何 chunk（早退不调
+    invalidate），旧索引原样留着，检索会拿已删文档作答。
+    """
+    from eval.runner import _reset_db
+
+    path = tmp_path / "kb.db"
+    await init_db(path)
+    await ingest_bare_doc(path, title="阿尔法笔记")
+
+    index_before = await bm25_search._get_index(path)
+    await index_before.load()
+    assert index_before.search("阿尔法", 5), "索引没建起来，这个用例没在测东西"
+    assert bm25_search._cache_key(path) in bm25_search._indexes
+
+    await _reset_db(path)
+
+    assert bm25_search._cache_key(path) not in bm25_search._indexes, (
+        "清库后旧索引仍在缓存里，检索会返回已删文档"
+    )
+    # 重建空库后检索必须返回空（而不是旧索引里的文档）
+    await init_db(path)
+    assert await bm25_search.bm25_search("阿尔法", 5, path) == []
+
+
 async def test_run_eval_twice_with_tracing_enabled(tiny_dataset, tmp_path, monkeypatch):
     """开埋点时连续跑两遍同一库：第二遍的删库不能因文件被占用而失败。
 
@@ -578,8 +809,8 @@ async def test_sample_failure_does_not_unplug_stubs_for_inflight_samples(
     # 样本跑完的确定性标记（boom 在 _run_sample 内部就抛，永远不会被记上）
     orig_run_sample = eval_runner._run_sample
 
-    async def spy_run_sample(sample, db_path, k):
-        result = await orig_run_sample(sample, db_path, k)
+    async def spy_run_sample(sample, db_path, k, rounds, recalled):
+        result = await orig_run_sample(sample, db_path, k, rounds, recalled)
         completed.add(sample.get("id"))
         return result
 
@@ -653,6 +884,134 @@ async def test_config_override_rejects_illegal_literal_value(tiny_dataset, tmp_p
     assert settings.memory_enabled is True
 
 
+async def test_error_result_keeps_retrieval_observed_before_crash():
+    """崩溃样本若在崩溃前已经检索过，检索指标要照算而不是给 None（MIN-5）。
+
+    retrieval=None 会被聚合跳过，而 answer 的 0 分照常计入分母——两条口径不一致，
+    等于把「崩在检索之后的样本」从检索维度摘掉，只统计活下来的样本（生存者偏差）。
+
+    这里直接构造：先往观测收集器里塞一轮检索命中，再调 _error_result。
+    """
+    from eval.runner import _error_result
+
+    sample = {
+        "id": "x-001",
+        "category": "multi-hop",
+        "query": "跨文档对比",
+        "expected_chunks": ["目标文档"],
+        "expected_answer_contains": ["结论"],
+    }
+    # 崩溃前观测到一轮检索，命中第 1 位
+    result = _error_result(sample, RuntimeError("第二轮 LLM 挂了"), [["目标文档"]], k=8)
+    assert result.error and "RuntimeError" in result.error
+    assert result.retrieved == ["目标文档"]  # 观测到的检索结果留在产物里
+    assert result.metrics["retrieval"] is not None, "崩溃前的检索证据被丢掉了"
+    assert result.metrics["retrieval"]["hit_at_k"] == 1.0
+    assert result.metrics["retrieval"]["mrr"] == 1.0
+    # 回答维度仍按「没有完成回答」记 0 分，不因无标注约束给满分
+    assert result.metrics["answer"]["keyword_coverage"] == 0.0
+    assert result.metrics["answer"]["missed"] == ["结论"]
+
+    # 崩在准备阶段（一轮检索都没发生）才给 None——与「不考核检索」区分开
+    no_rounds = _error_result(sample, RuntimeError("准备阶段挂了"), [], k=8)
+    assert no_rounds.metrics["retrieval"] is None
+    assert no_rounds.retrieved == []
+
+    # 没有检索标注的样本即使观测到东西也不给检索分（口径与 _run_sample 一致）
+    unlabeled = _error_result(
+        {**sample, "expected_chunks": []}, RuntimeError("x"), [["随便"]], k=8
+    )
+    assert unlabeled.metrics["retrieval"] is None
+
+
+async def test_crash_after_retrieval_is_scored_not_skipped(
+    tiny_dataset, tmp_path, monkeypatch
+):
+    """端到端：样本崩在检索之后时，aggregate 的 hit@k 仍把它算进去（MIN-5）。
+
+    修复前 _error_result 的 retrieval 一律 None，聚合直接跳过——崩溃样本在检索维度
+    凭空消失。这里让 boom 样本先完成一次真实检索再崩（patch _run_sample 的产物），
+    断言聚合分母是 2 而不是 1。
+    """
+    orig_run_sample = eval_runner._run_sample
+    crashed = {"done": False}
+
+    async def crash_after_retrieval(sample, db_path, k, rounds, recalled):
+        if sample["id"] == "t-001" and not crashed["done"]:
+            crashed["done"] = True
+            # 模拟「检索已经跑完、answer 还没生成」时崩掉：收集器里有真实结果
+            rounds.append(["阿尔法笔记"])
+            raise RuntimeError("检索之后崩了")
+        return await orig_run_sample(sample, db_path, k, rounds, recalled)
+
+    monkeypatch.setattr(eval_runner, "_run_sample", crash_after_retrieval)
+    result = await run_eval(
+        str(tiny_dataset), db_path=str(tmp_path / "eval.db"), llm=FakeLLM()
+    )
+
+    by_id = {s.id: s for s in result.samples}
+    assert "检索之后崩了" in by_id["t-001"].error
+    assert by_id["t-001"].metrics["retrieval"]["hit_at_k"] == 1.0
+    assert result.metrics["overall"]["errors"] == 1
+    # 有检索标注的样本是 t-001（崩溃但有观测）与 t-002？t-002 无标注 → 分母仍为 1，
+    # 但关键是崩溃的 t-001 **在** 分母里（修复前它被跳过，此处为 0 个样本）
+    single = result.metrics["by_category"]["single-hop"]
+    assert single["n"] == 1 and single["hit_at_k"] == 1.0
+
+
+async def test_config_override_rejects_wrong_bool_type(tiny_dataset, tmp_path):
+    """bool 字段只接受真 bool：`"false"` 是真值字符串（MIN-6）。
+
+    Settings 没开 validate_assignment，裸 setattr 会原样接受字符串；下游
+    `if settings.memory_enabled` 判真，于是「关掉记忆」的消融组实际是打开的，
+    整组结论反过来，且全程不报错。数值字段同理（`context_max_tokens="8000"` 一旦
+    参与算术就 TypeError）。
+    """
+    with pytest.raises(ValueError, match="bool"):
+        await run_eval(
+            str(tiny_dataset),
+            config_overrides={"memory_enabled": "false"},
+            db_path=str(tmp_path / "eval.db"),
+            llm=FakeLLM(),
+        )
+    # 数值字段不接受字符串（bool 是 int 子类，也要挡住）
+    with pytest.raises(ValueError, match="数值"):
+        await run_eval(
+            str(tiny_dataset),
+            config_overrides={"context_max_tokens": "8000"},
+            db_path=str(tmp_path / "eval.db"),
+            llm=FakeLLM(),
+        )
+    with pytest.raises(ValueError, match="数值"):
+        await run_eval(
+            str(tiny_dataset),
+            config_overrides={"context_max_tokens": True},
+            db_path=str(tmp_path / "eval.db"),
+            llm=FakeLLM(),
+        )
+    # 合法取值照常通过（int 给 float 也认）
+    result = await run_eval(
+        str(tiny_dataset),
+        config_overrides={"memory_enabled": False, "context_max_tokens": 4000.0},
+        db_path=str(tmp_path / "eval.db"),
+        llm=FakeLLM(),
+    )
+    assert result.config["memory_enabled"] is False
+    assert settings.memory_enabled is True  # 出了 with 块已恢复
+
+
+async def test_settings_override_validation_is_unit_testable():
+    """校验只看类型，不依赖跑一遍评测；直接构造也算用例的入口契约。"""
+    from eval.runner import _settings_override
+
+    _settings_override({"memory_enabled": True, "context_max_tokens": 100})  # 不抛
+    _settings_override(None)  # 缺省不抛
+    with pytest.raises(ValueError):
+        _settings_override({"context_max_tokens": "100"})
+    with pytest.raises(ValueError):
+        _settings_override({"memory_enabled": 1})  # int 冒充 bool 也不行
+
+
 # ---------- 消融矩阵 ----------
 
 
@@ -709,6 +1068,42 @@ def test_ablation_groups_full_table():
 async def test_ablation_rejects_unknown_group():
     with pytest.raises(ValueError, match="未知消融组"):
         await run_ablation("x", groups=["Z"])
+
+
+async def test_ablation_with_empty_group_list_runs_nothing(tiny_dataset, tmp_path):
+    """显式传空列表 = 一组都不跑（S2）。
+
+    `groups or list(ABLATION_GROUPS)` 会把空列表当成 None，静默跑满 8 组——
+    调用方想用空列表表达「什么都不做」时会拿到一堆意外产物。
+    """
+    results = await run_ablation(
+        str(tiny_dataset), groups=[], llm=FakeLLM(), work_dir=tmp_path
+    )
+    assert results == {}
+    # 一组都没跑：没有建任何组库
+    assert not list(tmp_path.glob("group-*.db"))
+
+
+async def test_ablation_with_unknown_sample_ids_still_returns_groups(
+    tiny_dataset, tmp_path
+):
+    """筛完没样本时每组仍产出一条 n=0 的结果（S1：报告渲染不走到空分支）。
+
+    这是 render_ablation_report 空分支注释里说的口径：CLI 的
+    `--ablation --samples 不存在的id` 拿到的是 {"A": EvalResult(n=0)} 而非 {}，
+    报告照常渲染（不是「没有可渲染的结果」）。
+    """
+    results = await run_ablation(
+        str(tiny_dataset),
+        groups=["A"],
+        llm=FakeLLM(),
+        work_dir=tmp_path,
+        sample_ids=["no-such-sample"],
+    )
+    assert set(results) == {"A"}
+    assert results["A"].metrics["total"] == 0
+    assert "没有可渲染" not in render_ablation_report(results)
+    assert "| A |" in render_ablation_report(results)
 
 
 async def test_run_ablation_memory_differential(tiny_dataset, tmp_path):
@@ -917,17 +1312,22 @@ async def test_save_records_dataset_version(tiny_dataset, tmp_path):
     assert saved["dataset_version"] == 7
 
 
-async def test_git_commit_is_real_hash():
-    """可复现性快照里的 commit 必须是真 hash，不是 unknown 占位。
+async def test_git_commit_is_real_hash(tmp_path, monkeypatch):
+    """可复现性快照里的 commit 必须是真 hash，不是 unknown 占位（MIN-7）。
 
-    在 git 仓库里跑测试时拿不到真 hash，说明 git 调用坏了（如 path 被改、
-    stdout 没接对），结果快照会静默失去可复现性。
+    git 默认按**进程当前目录**找仓库，从仓库外跑 pytest 会拿不到 hash、快照静默退化成
+    unknown。所以这里把 cwd 切到仓库外再调用——修复前必然返回 unknown（测试在仓库里
+    跑也会红）。
     """
     from eval.runner import git_commit
 
+    monkeypatch.chdir(tmp_path)  # 仓库外的目录
     commit = git_commit()
-    assert commit != "unknown", "git_commit() 返回了 unknown：可复现性快照失效"
+    assert commit != "unknown", "从仓库外调用就退化：git 没按仓库根找（MIN-7）"
     assert len(commit) >= 7 and all(c in "0123456789abcdef" for c in commit)
+
+    # 仓库内调用结果一致（cwd 不影响结果）
+    assert git_commit() == commit
 
 
 # ---------- retrieval_mode 配置接入 ----------

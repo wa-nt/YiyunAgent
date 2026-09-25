@@ -96,8 +96,9 @@ def render_report(result: EvalResult, title: str = "评测报告") -> str:
 def render_ablation_report(results: dict[str, EvalResult]) -> str:
     """消融矩阵对比报告：每组一行，外加各组的失败案例。
 
-    results 为空时返回一段提示文本而不是抛异常：CLI 的 `--ablation --samples 不存在的id`
-    等路径会走到这里，报错比「空报告」更没用。
+    results 为空时返回一段提示文本而不是抛异常：这是给**直接调用方**兜底的
+    （如 `render_ablation_report({})`）。CLI 的 `--ablation --samples 不存在的id`
+    走不到这里——run_ablation 仍会为每组产出 `EvalResult(n=0)`，字典非空，报告照常渲染。
     """
     if not results:
         return "# 消融实验对比报告\n\n没有可渲染的消融结果（results 为空）。\n"

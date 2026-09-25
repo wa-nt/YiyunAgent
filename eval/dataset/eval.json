@@ -338,7 +338,7 @@
       "expected_answer_excludes": ["Spring", "JVM"],
       "expected_memories": [],
       "sessions": [],
-      "notes": "对抗：不能编造不存在的偏好。excludes 挡住「顺着话题编出一段 Java 技术栈」的胡答"
+      "notes": "对抗：不能编造不存在的偏好。excludes 挡住「顺着话题展开一段 Java 技术栈」的胡答；点名并否认（如「没有 Spring/JVM 相关记录」）不算违规"
     },
     {
       "id": "eval-033",
@@ -348,7 +348,7 @@
       "expected_answer_contains": ["没有"],
       "expected_answer_excludes": ["借用检查器", "生命周期标注"],
       "sessions": [],
-      "notes": "对抗：知识库里不存在的内容应明确说明，不编造（编造必然要提借用检查器/生命周期标注）"
+      "notes": "对抗：知识库里不存在的内容应明确说明，不编造（编造必然要展开借用检查器/生命周期标注）；点名并否认不算违规"
     },
     {
       "id": "eval-034",
@@ -358,7 +358,7 @@
       "expected_answer_contains": ["没有"],
       "expected_answer_excludes": ["nginx", "Traefik"],
       "sessions": [],
-      "notes": "对抗：带时间限定的虚构笔记，应说明未找到；excludes 挡住「报一个控制器名字」"
+      "notes": "对抗：带时间限定的虚构笔记，应说明未找到；excludes 挡住「报一个控制器名字并介绍它」"
     },
     {
       "id": "eval-035",
@@ -368,7 +368,7 @@
       "expected_answer_contains": ["没有"],
       "expected_answer_excludes": ["Q-learning", "DQN", "策略梯度"],
       "sessions": [],
-      "notes": "对抗：文档存在但该主题不存在，不能张冠李戴；excludes 挡住「硬造一段强化学习内容」"
+      "notes": "对抗：文档存在但该主题不存在，不能张冠李戴；excludes 挡住「硬造一段强化学习内容」；点名并否认不算违规"
     },
     {
       "id": "eval-036",
