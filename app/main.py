@@ -15,7 +15,12 @@ from app.agent.runtime import (
 )
 from app.db import init_db
 from app.ingest.pipeline import delete_document, ingest, list_documents
-from app.tracing import drain_traces, list_traces, summarize_traces
+from app.tracing import (
+    InvalidTimestamp,
+    drain_traces,
+    list_traces,
+    summarize_traces,
+)
 
 WEB_DIR = Path(__file__).resolve().parent.parent / "web"
 
@@ -25,7 +30,8 @@ async def lifespan(app: FastAPI):
     await init_db()
     yield
     # 记忆写入与 trace 写入都是 fire-and-forget（进程内后台任务），退出前给它们一个收尾
-    # 窗口，否则最后几轮对话的记忆与埋点会随进程一起消失。drain 自带超时，不会卡住关闭。
+    # 窗口，否则最后几轮对话的记忆与埋点会随进程一起消失。drain 的超时是软上限
+    # （每轮 DRAIN_TIMEOUT，最坏还要加上 sqlite busy timeout），不会无限卡住关闭。
     # 顺序不能反：记忆抽取自己也会调 LLM（因此产生 llm trace），先收记忆再收 trace
     await drain_memory_writes()
     await drain_traces()
@@ -111,12 +117,16 @@ async def api_traces(
 ) -> dict:
     """trace 列表（最新在前），可按 kind / name / 时间范围过滤并分页。
 
-    name 精确匹配；start / end 与 ts 做字典序比较，要传带偏移量的完整时间戳
-    （例：2026-09-25T10:00:00.000+00:00），只传日期时 end 会漏掉当天。
+    name 精确匹配；start / end 必须是带时区的 ISO 8601 时间戳（任意偏移或 Z 均可，
+    如 2026-09-25T10:00:00Z、2026-09-25T18:00:00+08:00），闭区间 [start, end]，
+    不规范的值回 422。
     """
-    return await list_traces(
-        kind=kind, name=name, start=start, end=end, limit=limit, offset=offset
-    )
+    try:
+        return await list_traces(
+            kind=kind, name=name, start=start, end=end, limit=limit, offset=offset
+        )
+    except InvalidTimestamp as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
 @app.get("/api/traces/summary")
@@ -128,9 +138,12 @@ async def api_traces_summary(
 ) -> dict:
     """成本看板：总调用次数 / 总 tokens / 总成本，外加按 kind、按 name 分组。
 
-    过滤器与 /api/traces 同义，用于按模块或时间窗口归因成本。
+    过滤器与 /api/traces 同义（含时间戳格式要求），用于按模块或时间窗口归因成本。
     """
-    return await summarize_traces(kind=kind, name=name, start=start, end=end)
+    try:
+        return await summarize_traces(kind=kind, name=name, start=start, end=end)
+    except InvalidTimestamp as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
 # T6 的前端目录；不存在时跳过挂载（挂到 / 会吞掉未匹配的 API 路径，所以放最后）

@@ -172,7 +172,7 @@ async def execute_tool(call: ToolCall, db_path: str | None = None) -> tuple[str,
 
     返回前记一条 kind='tool' 的 trace（detail 即展示用摘要）：失败路径（未知工具、
     缺 query）同样计入，工具层的失败在成本看板上要看得见。工具**抛异常**（检索本身
-    出错）的路径不记——那次调用没有完成，run_agent 会把失败降级成一段说明。
+    出错）时不在这里记——那次调用没走完，run_agent 在降级分支里补记一条。
     """
     result, label = await _dispatch_tool(call, db_path)
     record_tool(call.name, label, db_path)
@@ -287,6 +287,9 @@ async def run_agent(
                     except Exception as exc:  # 工具失败降级为一段说明，让模型自行收尾
                         result = f"检索失败：{exc}"
                         label = f"{call.name} 失败：{exc}"
+                        # 这条路径 execute_tool 内部没机会记 trace（异常穿透），在这里补：
+                        # 检索故障正是看板上最该看见的东西，不能只留在 SSE 事件里
+                        record_tool(call.name, label, path)
                     yield AgentEvent(
                         "tool_end", {"id": call.id, "name": call.name, "summary": label}
                     )

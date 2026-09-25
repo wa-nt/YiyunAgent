@@ -52,16 +52,18 @@ class Settings(BaseSettings):
     # traces 表本身不动——开关只管写，历史数据仍在
     tracing_enabled: bool = True
 
-    # LLM 定价表：每 1K tokens 的单价（美元），traces 的成本按 provider 选档估算。
+    # LLM 定价表：每 1M tokens 的单价（美元），traces 的成本按 provider 选档估算。
+    # 数字就是各家公开的按百万 tokens 牌价（gpt-4o-mini、claude-sonnet、deepseek-chat），
+    # 直接抄下来，不换算成别的单位，避免与官方报价对不上。
     # provider 由客户端类型与 base_url 判定（见 app/llm/openai_compat.py 的
     # detect_provider），表里没有的（如通义）回落到 openai 档。
-    # 数字是各家公开牌价的量级，只用于看板上的量级归因，不追求与账单一致
-    price_openai_input: float = 0.15  # gpt-4o-mini input
-    price_openai_output: float = 0.60  # gpt-4o-mini output
-    price_anthropic_input: float = 3.0  # claude-sonnet input
-    price_anthropic_output: float = 15.0  # claude-sonnet output
-    price_deepseek_input: float = 0.14  # deepseek-chat input
-    price_deepseek_output: float = 0.28  # deepseek-chat output
+    # 只用于看板上的量级归因，不追求与账单一致
+    price_openai_input: float = 0.15  # gpt-4o-mini input，美元 / 1M tokens
+    price_openai_output: float = 0.60  # gpt-4o-mini output，美元 / 1M tokens
+    price_anthropic_input: float = 3.0  # claude-sonnet input，美元 / 1M tokens
+    price_anthropic_output: float = 15.0  # claude-sonnet output，美元 / 1M tokens
+    price_deepseek_input: float = 0.14  # deepseek-chat input，美元 / 1M tokens
+    price_deepseek_output: float = 0.28  # deepseek-chat output，美元 / 1M tokens
 
 
 settings = Settings()

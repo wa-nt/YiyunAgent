@@ -6,10 +6,20 @@
   失败只记 warning（与 app/memory/writer.py 同一口径）——观测不能拖慢或拖垮对话。
 - 落在 T1 建好的 traces 表（SQLite），不做 OpenTelemetry：单进程项目，SQLite 足够，
   brief 明确划掉了 OTEL 与分布式追踪。
-- 成本是**估算**：按 provider 定价表（app/config.py）乘 provider 返回的 usage，只做
-  量级归因，不追求与账单一致。
+- 成本是**估算**：按 provider 定价表（app/config.py，每 1M tokens 的美元单价）乘
+  provider 返回的 usage，只做量级归因，不追求与账单一致。
 - 流式调用只有收尾 chunk 才带 usage，所以 chat_stream 在产完最后一个 chunk 之后才记；
   消费者中途弃用生成器（客户端断开）时这条调用不计——拿不到 usage 就不编造 token 数。
+
+已知取舍（个人量级可接受，量级上来了再动）：
+
+- 每条 trace 单开一个连接写一行：本机实测中位 ~7ms、最大 ~9ms（含加载 sqlite-vec 扩展）。
+  比攒批写慢，但省掉了写队列/重试/背压这一整套机制；_pending 也没有背压上限，极端
+  情况下（一次几百个并发调用）任务集会短暂膨胀。真要压开销就改成单写者队列。
+- traces 表没有索引：kind/name/ts 过滤是全表扫描。个人使用量级（万行内）无感，
+  数据量大了再补 (kind, name, ts) 索引——schema 属 T1 的产物，本任务不改。
+- 看板的总计与分组是两条独立查询、没有显式事务，并发写入时两者可能短暂不一致
+  （差一条极新的记录）。看板是人工看的量级视图，这种瞬时偏差可接受。
 """
 
 from __future__ import annotations
@@ -25,9 +35,17 @@ from app.llm.types import Usage
 
 logger = logging.getLogger(__name__)
 
+
+class InvalidTimestamp(ValueError):
+    """start / end 不是「带时区的 ISO 8601 时间戳」。HTTP 层据此回 422。"""
+
+
 DEFAULT_LIMIT = 100
 # 收尾等待在途写入的上限：写库卡住时不能拖住进程退出与测试收尾（同 runtime.DRAIN_TIMEOUT）
 DRAIN_TIMEOUT = 5.0
+# 成本保留的小数位。定价是 per-Mtok，单次调用常在 1e-4~1e-6 量级，6 位会把小额抹平；
+# 8 位既留得住精度，又能盖掉浮点求和末尾的噪声（如 0.00012300000000000001）
+COST_DECIMALS = 8
 
 # 每 1K tokens 的单价所在的配置字段，按 provider 分档。表里没有的 provider（如通义）
 # 回落到 openai 档：定价本身就是估算，多一档等于多编一组数字
@@ -43,15 +61,48 @@ _pending: set[asyncio.Task] = set()
 
 
 def _now() -> str:
-    """毫秒精度：一轮对话会产生多条 trace，秒级时间戳不足以稳定排序。"""
+    """trace 时间戳：UTC、毫秒精度。
+
+    格式即时间窗过滤的比较基准（见 _normalize_ts），毫秒精度决定时间窗粒度；
+    列表排序用 id 而不是 ts（同毫秒的多条记录靠 id 保持稳定顺序）。
+    """
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
 
 
+def _normalize_ts(value: str) -> str:
+    """把过滤用的时间戳归一化成与 _now() 同格式的 UTC 字符串，供字典序比较。
+
+    解析用 datetime.fromisoformat：3.11+ 接受 Z 后缀与任意偏移（+08:00 等），
+    归一化到 UTC 后「同一瞬时」才比较得出同一个结果——直接拿原串比字典序的话，
+    `…T10:00:00Z` 会既不大于也不小于 `…T10:00:00.000+00:00`，静默给出错误结果。
+
+    必须带时区：不带时区的时间点本身有歧义，与其替调用方猜，不如报错让人说清楚。
+    解析不了或缺时区都抛 InvalidTimestamp，由 HTTP 层转 422。
+    """
+    try:
+        parsed = datetime.fromisoformat(value)
+    except (TypeError, ValueError) as exc:
+        raise InvalidTimestamp(
+            f"时间戳无法解析：{value!r}，需要带时区的 ISO 8601（如 2026-09-25T10:00:00Z）"
+        ) from exc
+    if parsed.tzinfo is None:
+        raise InvalidTimestamp(
+            f"时间戳缺少时区：{value!r}，需要带时区的 ISO 8601"
+            "（如 2026-09-25T10:00:00Z 或 2026-09-25T18:00:00+08:00）"
+        )
+    return parsed.astimezone(timezone.utc).isoformat(timespec="milliseconds")
+
+
 def estimate_cost(provider: str, tokens_in: int, tokens_out: int) -> float:
-    """按 provider 定价表估算成本（美元）。单价每次从 settings 读，改配置立即生效。"""
+    """按 provider 定价表估算成本（美元）。单价每次从 settings 读，改配置立即生效。
+
+    定价是**每 1M tokens** 的单价（与各家官方报价一致），所以这里除以 1e6。
+    """
     fields = _PRICE_FIELDS.get(provider, _PRICE_FIELDS["openai"])
     price_in, price_out = (getattr(settings, field) for field in fields)
-    return round(tokens_in / 1000 * price_in + tokens_out / 1000 * price_out, 6)
+    return round(
+        (tokens_in * price_in + tokens_out * price_out) / 1_000_000, COST_DECIMALS
+    )
 
 
 def record_trace(
@@ -65,11 +116,20 @@ def record_trace(
 ) -> None:
     """埋点入口：把一次调用记进 traces 表，fire-and-forget。
 
-    调度后台任务后立刻返回；tracing_enabled 关掉时连任务都不建（T10 的观测开销对照）。
+    调度后台任务后立刻返回（不 await、不碰数据库，所以主流程的延迟不受影响）；
+    tracing_enabled 关掉时连任务都不建（T10 的观测开销对照）。任何失败都只记 warning。
     """
     if not settings.tracing_enabled:
         return
-    task = asyncio.create_task(
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError as exc:  # 没有运行中的事件循环：从同步上下文误调时走这里
+        logger.warning(
+            "trace 未记录（无运行中的事件循环）：%s（%s %s）", exc, kind, name
+        )
+        return
+    # 先拿到 loop 再造协程：create_task 直接抛的话会留下一个没人 await 的协程对象
+    task = loop.create_task(
         _insert(kind, name, detail, tokens_in, tokens_out, cost, db_path),
         name=f"trace:{kind}:{name}",
     )
@@ -84,6 +144,10 @@ def record_llm(
 
     usage 为 None（部分兼容端点的流式响应不带 usage）时 token 与成本记 0：调用次数
     仍然计入，只是这一次没有 token 归因。
+
+    落库口径是**进程级**的：这里只认 settings.db_path，收不到调用方的 db_path。
+    HTTP 层跑的就是默认库，两边一致；CLI / 评测（T10）若用自定义库，那一轮的 llm trace
+    会落在默认库里——批量评测时把 DB_PATH 指到同一个库即可。
     """
     tokens_in = usage.tokens_in if usage else 0
     tokens_out = usage.tokens_out if usage else 0
@@ -133,10 +197,23 @@ async def _insert(
 async def drain_traces(timeout: float = DRAIN_TIMEOUT) -> None:
     """等在途的 trace 写入结束（测试收尾、服务退出时用，不影响 HTTP 流程）。
 
-    有超时上限：写库卡住时不能让进程退出或测试收尾无限等下去，超时后放弃并告警——
-    丢的只是观测数据，不影响业务结果。
+    timeout 是**软上限**：每轮最多等这么久，超时就放弃剩余任务并告警（最坏情况还要加上
+    sqlite 的 busy timeout，因为取消一个卡在写库上的任务也要等它退出）。丢的只是观测
+    数据，不影响业务结果。
     """
+    loop = asyncio.get_running_loop()
     while _pending:
+        # 上一个事件循环留下的任务（如 asyncio.run 收尾时的残项）在当前循环里
+        # wait/cancel/gather 都会抛 RuntimeError("attached to a different loop")，
+        # 而它的循环已经没了、永远等不到结果——直接丢弃并告警，否则 _pending 会永久
+        # 留着这些死任务，之后每次 drain 都崩
+        aliens = [task for task in _pending if task.get_loop() is not loop]
+        for task in aliens:
+            _pending.discard(task)
+        if aliens:
+            logger.warning("丢弃 %d 个来自其他事件循环的 trace 任务", len(aliens))
+        if not _pending:
+            return
         done, pending = await asyncio.wait(list(_pending), timeout=timeout)
         # 显式摘掉本轮看到的任务，不依赖 done_callback 的调度时机，保证循环必然收敛
         for task in done:
@@ -159,8 +236,9 @@ def _where(
 ) -> tuple[str, list[Any]]:
     """过滤条件拼装（SQL 片段 + 参数）。
 
-    时间是 ISO 字符串的字典序比较，所以 start/end 要传带偏移量的完整时间戳：
-    只传日期（"2026-09-25"）时 end 会漏掉当天的记录。
+    start / end 必须是带时区的 ISO 8601 时间戳（任意偏移或 Z 均可），归一化到 UTC
+    后与 ts 做字典序比较（两边格式一致，所以字典序等于时间序）；闭区间 [start, end]。
+    不规范的值抛 InvalidTimestamp，不会静默当成「无结果」。
     """
     clauses: list[str] = []
     params: list[Any] = []
@@ -172,10 +250,10 @@ def _where(
         params.append(name)
     if start:
         clauses.append("ts >= ?")
-        params.append(start)
+        params.append(_normalize_ts(start))
     if end:
         clauses.append("ts <= ?")
-        params.append(end)
+        params.append(_normalize_ts(end))
     where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
     return where, params
 
@@ -187,7 +265,7 @@ def _group_row(field: str, row: Any) -> dict[str, Any]:
         "calls": row["calls"],
         "tokens_in": row["tokens_in"],
         "tokens_out": row["tokens_out"],
-        "cost": round(row["cost"], 6),
+        "cost": round(row["cost"], COST_DECIMALS),
     }
 
 
@@ -259,7 +337,7 @@ async def summarize_traces(
         "tokens_in": totals["tokens_in"],
         "tokens_out": totals["tokens_out"],
         "tokens_total": totals["tokens_in"] + totals["tokens_out"],
-        "cost": round(totals["cost"], 6),
+        "cost": round(totals["cost"], COST_DECIMALS),
         "by_kind": grouped["kind"],
         "by_name": grouped["name"],
     }
