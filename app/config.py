@@ -48,5 +48,20 @@ class Settings(BaseSettings):
     # 历史超过 N 条时触发压缩；保留最近 N/2 条完整对话，更早的由 LLM 生成摘要
     context_compaction_threshold: int = 10
 
+    # 可观测（T9）。总开关：关掉后 LLM / 工具调用都不记 trace（T10 的观测开销对照用）。
+    # traces 表本身不动——开关只管写，历史数据仍在
+    tracing_enabled: bool = True
+
+    # LLM 定价表：每 1K tokens 的单价（美元），traces 的成本按 provider 选档估算。
+    # provider 由客户端类型与 base_url 判定（见 app/llm/openai_compat.py 的
+    # detect_provider），表里没有的（如通义）回落到 openai 档。
+    # 数字是各家公开牌价的量级，只用于看板上的量级归因，不追求与账单一致
+    price_openai_input: float = 0.15  # gpt-4o-mini input
+    price_openai_output: float = 0.60  # gpt-4o-mini output
+    price_anthropic_input: float = 3.0  # claude-sonnet input
+    price_anthropic_output: float = 15.0  # claude-sonnet output
+    price_deepseek_input: float = 0.14  # deepseek-chat input
+    price_deepseek_output: float = 0.28  # deepseek-chat output
+
 
 settings = Settings()

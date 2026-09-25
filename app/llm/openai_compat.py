@@ -11,6 +11,16 @@ from app.llm.types import (
     ToolDef,
     Usage,
 )
+from app.tracing import record_llm
+
+
+def detect_provider(base_url: str | None) -> str:
+    """按 base_url 认出后端，用于 traces 的定价档（DeepSeek 与 OpenAI 单价不同）。
+
+    认不出的兼容端点（通义 / Moonshot / 自建）按 openai 档估算：定价表只备了
+    OpenAI / DeepSeek / Claude 三档，多认一档就得凭空多编一组数字。
+    """
+    return "deepseek" if "deepseek" in (base_url or "").lower() else "openai"
 
 
 def to_openai_messages(messages: list[Message]) -> list[dict[str, Any]]:
@@ -82,6 +92,7 @@ class OpenAICompatClient:
     def __init__(self, api_key: str, model: str, base_url: str | None = None):
         self.client = AsyncOpenAI(api_key=api_key, base_url=base_url)
         self.model = model
+        self.provider = detect_provider(base_url)
 
     async def chat(
         self, messages: list[Message], tools: list[ToolDef] | None = None
@@ -97,6 +108,7 @@ class OpenAICompatClient:
             tokens_in=resp.usage.prompt_tokens if resp.usage else 0,
             tokens_out=resp.usage.completion_tokens if resp.usage else 0,
         )
+        record_llm(self.provider, self.model, usage)
         return ChatResult(
             text=msg.content or "",
             tool_calls=_parse_tool_calls(msg.tool_calls or []),
@@ -152,3 +164,7 @@ class OpenAICompatClient:
             )
         ]
         yield StreamChunk(finish=True, tool_calls=calls, usage=usage)
+        # 埋点放在最后一个 chunk 之后：usage 只在收尾 chunk 出现，这里才是「调用完成」。
+        # 消费者中途弃用生成器（客户端断开）时这段不会执行，该次调用不计入——拿不到
+        # usage 就不编造 token 数
+        record_llm(self.provider, self.model, usage)

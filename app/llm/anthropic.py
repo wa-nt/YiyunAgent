@@ -10,6 +10,7 @@ from app.llm.types import (
     ToolDef,
     Usage,
 )
+from app.tracing import record_llm
 
 DEFAULT_MAX_TOKENS = 4096
 
@@ -94,6 +95,7 @@ class AnthropicClient:
         self.client = AsyncAnthropic(api_key=api_key)
         self.model = model
         self.max_tokens = max_tokens
+        self.provider = "anthropic"
 
     async def chat(
         self, messages: list[Message], tools: list[ToolDef] | None = None
@@ -106,14 +108,12 @@ class AnthropicClient:
             kwargs["tools"] = to_anthropic_tools(tools)
         resp = await self.client.messages.create(model=self.model, messages=msgs, **kwargs)
         text, calls = _parse_content(resp.content)
-        return ChatResult(
-            text=text,
-            tool_calls=calls,
-            usage=Usage(
-                tokens_in=resp.usage.input_tokens,
-                tokens_out=resp.usage.output_tokens,
-            ),
+        usage = Usage(
+            tokens_in=resp.usage.input_tokens,
+            tokens_out=resp.usage.output_tokens,
         )
+        record_llm(self.provider, self.model, usage)
+        return ChatResult(text=text, tool_calls=calls, usage=usage)
 
     async def chat_stream(
         self, messages: list[Message], tools: list[ToolDef] | None = None
@@ -131,11 +131,11 @@ class AnthropicClient:
                 yield StreamChunk(text_delta=text)
             final = await stream.get_final_message()
         text, calls = _parse_content(final.content)
-        yield StreamChunk(
-            finish=True,
-            tool_calls=calls,
-            usage=Usage(
-                tokens_in=final.usage.input_tokens,
-                tokens_out=final.usage.output_tokens,
-            ),
+        usage = Usage(
+            tokens_in=final.usage.input_tokens,
+            tokens_out=final.usage.output_tokens,
         )
+        yield StreamChunk(finish=True, tool_calls=calls, usage=usage)
+        # 埋点在最后一个 chunk 之后：到这里调用才算完成，中途弃用生成器时不计
+        # （同 openai_compat.chat_stream）
+        record_llm(self.provider, self.model, usage)

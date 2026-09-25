@@ -17,6 +17,7 @@ from app.memory.recall import recall_memories
 from app.memory.writer import extract_and_store
 from app.retrieval.hybrid import hybrid_search
 from app.retrieval.types import RetrievedChunk
+from app.tracing import record_tool
 
 logger = logging.getLogger(__name__)
 
@@ -167,7 +168,18 @@ def format_chunks(chunks: list[RetrievedChunk]) -> str:
 
 
 async def execute_tool(call: ToolCall, db_path: str | None = None) -> tuple[str, str]:
-    """执行一次工具调用，返回 (结果文本, 展示用摘要)。"""
+    """执行一次工具调用，返回 (结果文本, 展示用摘要)。
+
+    返回前记一条 kind='tool' 的 trace（detail 即展示用摘要）：失败路径（未知工具、
+    缺 query）同样计入，工具层的失败在成本看板上要看得见。工具**抛异常**（检索本身
+    出错）的路径不记——那次调用没有完成，run_agent 会把失败降级成一段说明。
+    """
+    result, label = await _dispatch_tool(call, db_path)
+    record_tool(call.name, label, db_path)
+    return result, label
+
+
+async def _dispatch_tool(call: ToolCall, db_path: str | None) -> tuple[str, str]:
     if call.name != SEARCH_TOOL.name:
         return f"未知工具：{call.name}", f"未知工具 {call.name}"
 
