@@ -178,6 +178,15 @@ def record_tool(name: str, detail: str = "", db_path: str | None = None) -> None
     record_trace("tool", name, detail=detail, db_path=db_path)
 
 
+def record_skill(name: str, detail: str = "", db_path: str | None = None) -> None:
+    """skill 触发埋点（kind='skill'）：token 与成本都是 0。
+
+    detail 放本轮命中的触发词，形如 `触发词：简历、求职`。触发命中率是 T11 的
+    核心指标，落在 traces 表就能按 kind='skill' 直接统计，不用另建表。
+    """
+    record_trace("skill", name, detail=detail, db_path=db_path)
+
+
 async def _insert(
     kind: str,
     name: str,

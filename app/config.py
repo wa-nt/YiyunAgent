@@ -69,5 +69,15 @@ class Settings(BaseSettings):
     price_deepseek_input: float = 0.14  # deepseek-chat input，美元 / 1M tokens
     price_deepseek_output: float = 0.28  # deepseek-chat output，美元 / 1M tokens
 
+    # Skill 系统（T11）。总开关关掉后完全不触发：不扫 skills 目录、不注入正文、
+    # 不注册专用工具（「这个部署不带 skill」与将来的消融对照都用它）
+    skills_enabled: bool = True
+    # skill 根目录，相对路径按当前工作目录解析（与 db_path 同一口径）
+    skills_dir: str = "skills"
+    # 触发阈值：命中多个 skill 时，赢家的命中数占全部命中的比例低于此值就视为
+    # 意图不明，本轮不加载 skill。0.7 让「帮我优化简历」（1/1）触发、
+    # 「简历和面试分别要准备什么」（1/2）不触发
+    skills_trigger_threshold: float = 0.7
+
 
 settings = Settings()

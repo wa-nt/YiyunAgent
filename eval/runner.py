@@ -70,6 +70,10 @@ CONFIG_SNAPSHOT_FIELDS = (
     "context_token_budget_enabled",
     "retrieval_mode",
     "tracing_enabled",
+    # T11 起 run_agent 会按用户消息触发 skill：命中时会给 prompt view 多加一条
+    # system 消息（正文）与专用工具，直接影响压缩轴与 token 预算的对照。评测结果
+    # 要能反查「那一次跑的时候 skill 开着还是关着」，所以进快照
+    "skills_enabled",
 )
 
 # 当前样本的观测收集器：按**每次检索调用**分段记录到的标识符 / 召回的记忆文本。

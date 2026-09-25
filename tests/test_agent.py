@@ -263,12 +263,14 @@ async def test_unknown_session_is_created(db, monkeypatch):
 
 
 async def test_assemble_messages_is_the_assembly_hook(db, monkeypatch):
-    # T7/T8 的治理接入点：替换 assemble_messages 应当影响发给模型的消息
+    # T7/T8/T11 的治理接入点：替换 assemble_messages 应当影响发给模型的消息
     seen: list[list] = []
 
-    def spy(history, user_message, memory=None):
-        # 该用例的 memories 表是空的，召回无结果；记忆注入在 tests/test_memory.py 覆盖
-        assert memory is None
+    def spy(history, user_message, memory=None, skill_prompt=None):
+        # 该用例的 memories 表是空的，召回无结果；记忆注入在 tests/test_memory.py 覆盖。
+        # 这条提问不含任何 skill 触发词，所以 skill_prompt 也是 None（触发注入见
+        # tests/test_skills.py）
+        assert memory is None and skill_prompt is None
         msgs = runtime.Message(
             role="system", content="被治理过的 system"
         )
