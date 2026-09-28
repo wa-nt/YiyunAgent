@@ -8,7 +8,6 @@ dependencies = [
     "uvicorn",
     "openai",
     "anthropic",
-    "langgraph",
     "pydantic>=2",
     "pydantic-settings",
     "aiosqlite",
