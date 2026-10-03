@@ -57,7 +57,7 @@ class AgentEvent:
 
 
 # 未完成的记忆写入任务。fire-and-forget 不能裸 create_task：任务只被事件循环弱引用，
-# 随时可能被 GC 掉；同时测试与 CLI 需要在同一事件循环里 await 到写入结束。
+# 随时可能被 GC 掉；同时测试需要在同一事件循环里 await 到写入结束。
 _pending_writes: set[asyncio.Task] = set()
 # 收尾等待记忆写入的上限：写库卡住时不让进程退出被无限拖住
 DRAIN_TIMEOUT = 5.0
@@ -77,7 +77,7 @@ def spawn_memory_write(
 
 
 async def drain_memory_writes(timeout: float = DRAIN_TIMEOUT) -> None:
-    """等所有在途的记忆写入结束（测试、CLI 与服务退出时用，不影响 HTTP 流）。
+    """等所有在途的记忆写入结束（测试与服务退出时用，不影响 HTTP 流）。
 
     有超时上限：写入卡住时不能让进程退出或测试收尾无限等下去，超时后放弃并告警。
     """
@@ -194,7 +194,7 @@ async def execute_tool(
     出错）时不在这里记——那次调用没走完，run_agent 在降级分支里补记一条。
 
     skill_tools 是本轮触发的 skill 带来的专用工具（{工具名: 实现}）。默认空：HTTP 层
-    与 CLI 不会直接调用它，只有 run_agent 在触发了 skill 的那一轮传进来——skill 工具
+    与测试不会直接调用它，只有 run_agent 在触发了 skill 的那一轮传进来——skill 工具
     的可用范围严格限定在触发它的那一轮（brief 的「动态工具集」）。
     """
     result, label = await _dispatch_tool(call, db_path, skill_tools or {})
@@ -301,8 +301,8 @@ async def run_agent(
 ) -> AsyncIterator[AgentEvent]:
     """ReAct 主循环：加载历史 → 流式生成 → 有工具调用则执行并回到生成。
 
-    不建表：HTTP 层由 main.py 的 lifespan 调 init_db，CLI 与测试自行初始化。
-    db_path 仅测试与 CLI 用；HTTP 层走默认路径（app.config.settings.db_path）。
+    不建表：HTTP 层由 main.py 的 lifespan 调 init_db，测试自行初始化。
+    db_path 仅测试用；HTTP 层走默认路径（app.config.settings.db_path）。
 
     本轮触发的 skill（T11）在开跑前一次性探测：正文进 system 消息，专用工具进本轮
     工具集与执行判据（见 _apply_skill）。探测只做一次，工具集在整轮里不变。

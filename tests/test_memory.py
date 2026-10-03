@@ -666,6 +666,36 @@ async def test_recall_formats_top_k_by_confidence(db):
     )
 
 
+async def test_recall_prefers_query_relevant_over_higher_confidence(db, monkeypatch):
+    """query 感知召回：与问题相关但置信度更低的记忆要能挤掉无关的中置信记忆。"""
+    monkeypatch.setattr(settings, "memory_recall_top_k", 2)
+    await insert_memory(db, "fact", "用户养了一只猫叫咪咪", 0.9)
+    await insert_memory(db, "fact", "用户在北京上学", 0.6)
+    await insert_memory(db, "preference", "用户偏好用 Markdown 记笔记", 0.5)
+
+    text = await recall_memories("我该怎么用 Markdown 记笔记？", db)
+
+    assert "用户偏好用 Markdown 记笔记" in text  # 0.5 的相关记忆挤进 top_k
+    assert "用户在北京上学" not in text  # 0.6 的无关记忆被挤掉
+    assert text.index("猫") < text.index("Markdown")  # confidence 仍是主序
+
+
+async def test_recall_without_token_overlap_keeps_confidence_order(db, monkeypatch):
+    """向后兼容：query 与所有记忆都无 token 重叠时，结果与纯 confidence 排序一致。"""
+    monkeypatch.setattr(settings, "memory_recall_top_k", 2)
+    await insert_memory(db, "fact", "用户养了一只猫叫咪咪", 0.9)
+    await insert_memory(db, "fact", "用户在北京上学", 0.6)
+    await insert_memory(db, "preference", "用户偏好用 Markdown 记笔记", 0.5)
+
+    text = await recall_memories("今天天气不错", db)
+
+    assert text == (
+        "以下是关于用户的一些长期记忆，供参考：\n"
+        "- [fact] 用户养了一只猫叫咪咪\n"
+        "- [fact] 用户在北京上学"
+    )
+
+
 async def test_recall_respects_top_k(db, monkeypatch):
     monkeypatch.setattr(settings, "memory_recall_top_k", 2)
     await insert_memory(db, "fact", "用户在准备面试", 0.9)

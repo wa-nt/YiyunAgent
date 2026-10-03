@@ -162,7 +162,14 @@ def test_estimate_tokens_is_char_based():
     assert ctx.estimate_tokens("") == 0
     assert ctx.estimate_tokens("abcd") == 1
     assert ctx.estimate_tokens("a" * 9) == 3  # 向上取整，不低估预算
-    assert ctx.estimate_tokens("中文" * 2) == 1
+    assert ctx.estimate_tokens("中文" * 2) == 4  # CJK 按字符计，见下一条用例
+
+
+def test_estimate_tokens_counts_cjk_per_character():
+    """len/4 会把中文低估 3~4 倍：CJK 区间按 1 字符 ≈ 1 token。"""
+    assert ctx.estimate_tokens("a" * 8 + "中文") == 4  # 非 CJK 部分仍按 4 字符/token
+    assert ctx.estimate_tokens("中文abcd") == 3
+    assert ctx.estimate_tokens("中文，。！") == 5  # CJK 标点同样按字符计
 
 
 def test_prompt_tokens_counts_tool_calls():
@@ -577,22 +584,26 @@ async def test_token_budget_truncates_within_budget(monkeypatch):
 async def test_token_budget_never_exceeds_limit_including_note(monkeypatch):
     """M1：截断提示本身也占预算，最终结果（含提示）不得超 max_tokens。
 
-    构造每轮约 20 token 的历史：旧实现按 max_tokens 判定、提示最后才追加，会卡在
-    「刚好不超预算」的档位上再被提示顶出去（如 budget=28 时留下 26 + 5 = 31）。
-    预留提示的预算后，判定目标降到 23，会多删一轮。
+    构造每轮约 81 token 的历史（CJK 按 1 字符 ≈ 1 token）：旧实现按 max_tokens 判定、
+    提示最后才追加，会卡在「刚好不超预算」的档位上再被提示顶出去。预留提示的预算后，
+    判定目标低一截，会多删一轮。下界取「system prompt + 提示 + 当前提问」的估算值，
+    比它更小的档位本来就放不下必需消息（另有不可再压下限的专门用例）。
     """
     _governance_off(monkeypatch, budget=True, compaction=False)
     view = [Message(role="system", content="SYS")]
     for i in range(5):
-        view.append(user(f"问题{i}：" + "长" * 77))  # 每轮 20 token
+        view.append(user(f"问题{i}：" + "长" * 77))  # 每轮 81 token
     view.append(user("新问题"))
 
-    for budget in range(11, 50):
+    floor = ctx.prompt_tokens(
+        [view[0], Message(role="system", content=ctx.TRUNCATION_NOTE), view[-1]]
+    )
+    for budget in range(floor + 1, floor + 80):
         governed = await ctx.govern_context(list(view), max_tokens=budget)
         assert ctx.prompt_tokens(governed) <= budget, f"budget={budget} 超预算"
 
     # 提示仍在：这条路径上确实删过内容，不能因为预留预算就把提示弄丢
-    tight = await ctx.govern_context(list(view), max_tokens=28)
+    tight = await ctx.govern_context(list(view), max_tokens=floor + 66)
     assert any(m.content == ctx.TRUNCATION_NOTE for m in tight)
 
 

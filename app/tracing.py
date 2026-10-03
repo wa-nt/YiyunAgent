@@ -16,8 +16,8 @@
 - 每条 trace 单开一个连接写一行：本机实测中位 ~7ms、最大 ~9ms（含加载 sqlite-vec 扩展）。
   比攒批写慢，但省掉了写队列/重试/背压这一整套机制；_pending 也没有背压上限，极端
   情况下（一次几百个并发调用）任务集会短暂膨胀。真要压开销就改成单写者队列。
-- traces 表没有索引：kind/name/ts 过滤是全表扫描。个人使用量级（万行内）无感，
-  数据量大了再补 (kind, name, ts) 索引——schema 属 T1 的产物，本任务不改。
+- traces 表已按 (kind, name, ts) 建索引（schema.sql 的 idx_traces_kind_name_ts）：
+  看板的 kind/name 过滤与时间窗查询都走索引，不再全表扫描。
 - 看板的总计与分组是两条独立查询、没有显式事务，并发写入时两者可能短暂不一致
   （差一条极新的记录）。看板是人工看的量级视图，这种瞬时偏差可接受。
 """
@@ -153,9 +153,10 @@ def record_llm(
     usage 为 None（部分兼容端点的流式响应不带 usage）时 token 与成本记 0：调用次数
     仍然计入，只是这一次没有 token 归因。
 
-    落库口径是**进程级**的：这里只认 settings.db_path，收不到调用方的 db_path。
-    HTTP 层跑的就是默认库，两边一致；CLI / 评测（T10）若用自定义库，那一轮的 llm trace
-    会落在默认库里——批量评测时把 DB_PATH 指到同一个库即可。
+    db_path 由**调用方的 client** 带来：LLM 客户端在构造时存下它（见 app/llm 的
+    get_llm），record_llm 原样透传给 record_trace。用自定义库创建 client 的地方
+    （评测 / CLI）因此能把 llm trace 落进那个库；client 没传 db_path 时落 None，
+    由 get_db 兜到默认库 settings.db_path——HTTP 主流程走的正是这条。
     """
     tokens_in = usage.tokens_in if usage else 0
     tokens_out = usage.tokens_out if usage else 0

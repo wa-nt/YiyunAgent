@@ -91,11 +91,19 @@ def _parse_content(blocks: list[Any]) -> tuple[str, list[ToolCall]]:
 class AnthropicClient:
     """Anthropic Messages 协议适配。"""
 
-    def __init__(self, api_key: str, model: str, max_tokens: int = DEFAULT_MAX_TOKENS):
+    def __init__(
+        self,
+        api_key: str,
+        model: str,
+        max_tokens: int = DEFAULT_MAX_TOKENS,
+        db_path: str | None = None,
+    ):
         self.client = AsyncAnthropic(api_key=api_key)
         self.model = model
         self.max_tokens = max_tokens
         self.provider = "anthropic"
+        # 同 openai_compat：埋点落哪个库由创建者决定，None 时 record_llm 兜到默认库
+        self.db_path = db_path
 
     async def chat(
         self, messages: list[Message], tools: list[ToolDef] | None = None
@@ -112,7 +120,7 @@ class AnthropicClient:
             tokens_in=resp.usage.input_tokens,
             tokens_out=resp.usage.output_tokens,
         )
-        record_llm(self.provider, self.model, usage)
+        record_llm(self.provider, self.model, usage, self.db_path)
         return ChatResult(text=text, tool_calls=calls, usage=usage)
 
     async def chat_stream(
@@ -138,4 +146,4 @@ class AnthropicClient:
         yield StreamChunk(finish=True, tool_calls=calls, usage=usage)
         # 埋点在最后一个 chunk 之后：到这里调用才算完成，中途弃用生成器时不计
         # （同 openai_compat.chat_stream）
-        record_llm(self.provider, self.model, usage)
+        record_llm(self.provider, self.model, usage, self.db_path)

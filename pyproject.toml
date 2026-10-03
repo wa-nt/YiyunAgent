@@ -16,12 +16,10 @@ dependencies = [
     "httpx",
     "pymupdf",
     "python-frontmatter",
+    "python-multipart",
     "pytest",
     "pytest-asyncio",
 ]
-
-[project.optional-dependencies]
-pg = ["asyncpg", "pgvector"]
 
 [build-system]
 requires = ["setuptools>=68"]

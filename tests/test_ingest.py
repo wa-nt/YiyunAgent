@@ -1,3 +1,6 @@
+from contextlib import nullcontext
+
+import httpx
 import pymupdf
 import pytest
 
@@ -94,10 +97,20 @@ def test_load_markdown_and_dispatch(tmp_path):
     assert title == "标题"
     assert "第二段" in text
 
-    other = tmp_path / "note.txt"
+    other = tmp_path / "note.docx"
     other.write_text("hi", encoding="utf-8")
     with pytest.raises(ValueError):
         load(str(other))
+
+
+def test_load_txt(tmp_path):
+    """.txt 与 markdown 同一读取口径：UTF-8 纯文本，标题取文件名。"""
+    note = tmp_path / "读书笔记.txt"
+    note.write_text("第一段\n\n第二段\n", encoding="utf-8")
+
+    title, text = load(str(note))
+    assert title == "读书笔记"
+    assert text == "第一段\n\n第二段\n"
 
 
 def test_load_pdf(tmp_path):
@@ -114,25 +127,151 @@ def test_load_pdf(tmp_path):
     assert "PDF body text" in text
 
 
+class _FakeResponse:
+    """httpx.Response 的最小替身：只实现 load_url 用到的那几个成员。"""
+
+    def __init__(self, body: bytes = b"", *, next_url: str | None = None, encoding=None):
+        self._body = body
+        self.encoding = encoding
+        self.next_request = httpx.Request("GET", next_url) if next_url else None
+
+    def raise_for_status(self) -> None:
+        pass
+
+    def iter_bytes(self, chunk_size=None):
+        # 分片吐出，模拟真实流式读取（大小上限正是在这里拦下的）
+        for i in range(0, len(self._body), 8):
+            yield self._body[i : i + 8]
+
+
+class _FakeClient:
+    """httpx.Client 的替身：按 URL 给脚本化响应，并记录实际请求过的 URL。"""
+
+    def __init__(self, routes: dict[str, _FakeResponse]):
+        self.routes = routes
+        self.seen: list[str] = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def stream(self, method: str, url: str):
+        self.seen.append(url)
+        return nullcontext(self.routes[url])
+
+
+def _fake_client(monkeypatch, routes: dict[str, _FakeResponse]) -> _FakeClient:
+    """换掉 load_url 内部新建的 httpx.Client，并把域名固定解析成公网地址（不查真 DNS）。"""
+    fake = _FakeClient(routes)
+    monkeypatch.setattr(loaders.httpx, "Client", lambda **kwargs: fake)
+    monkeypatch.setattr(
+        loaders.socket,
+        "getaddrinfo",
+        lambda host, port: [(2, 1, 6, "", ("93.184.216.34", 0))],
+    )
+    return fake
+
+
 def test_load_url_strips_tags_without_network(monkeypatch):
     html = (
         "<html><head><title> 网页标题 </title><style>b{}</style>"
         "<script>var x=1;</script></head>"
         "<body><h1>头部</h1><p>第一段</p><p>第二段</p></body></html>"
     )
-
-    class _Response:
-        text = html
-
-        def raise_for_status(self):
-            pass
-
-    monkeypatch.setattr(loaders.httpx, "get", lambda *a, **k: _Response())
+    fake = _fake_client(
+        monkeypatch, {"https://example.com/article": _FakeResponse(html.encode())}
+    )
 
     title, text = loaders.load_url("https://example.com/article")
+
+    assert fake.seen == ["https://example.com/article"]
     assert title == "网页标题"
     assert "第一段" in text and "第二段" in text
     assert "var x=1" not in text and "b{}" not in text and "<p>" not in text
+
+
+def test_load_url_follows_public_redirect(monkeypatch):
+    fake = _fake_client(
+        monkeypatch,
+        {
+            "https://example.com/a": _FakeResponse(next_url="https://example.com/b"),
+            "https://example.com/b": _FakeResponse("<title>B</title><p>正文</p>".encode()),
+        },
+    )
+
+    title, text = loaders.load_url("https://example.com/a")
+
+    assert fake.seen == ["https://example.com/a", "https://example.com/b"]
+    assert title == "B" and "正文" in text
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://127.0.0.1/a",
+        "http://10.0.0.5/a",
+        "http://192.168.1.1/a",
+        "http://169.254.169.254/latest/meta-data/",  # 云元数据
+        "http://[::1]/a",
+    ],
+)
+def test_load_url_rejects_non_public_ip_literal(url, monkeypatch):
+    fake = _fake_client(monkeypatch, {})
+
+    with pytest.raises(ValueError, match="公网"):
+        loaders.load_url(url)
+
+    assert fake.seen == []  # 校验发生在建连之前
+
+
+def test_load_url_rejects_domain_resolving_to_private_ip(monkeypatch):
+    fake = _fake_client(monkeypatch, {})
+    monkeypatch.setattr(
+        loaders.socket,
+        "getaddrinfo",
+        lambda host, port: [(2, 1, 6, "", ("127.0.0.1", 0))],
+    )
+
+    with pytest.raises(ValueError, match="公网"):
+        loaders.load_url("https://evil.example/a")
+
+    assert fake.seen == []
+
+
+def test_load_url_rejects_oversized_page(monkeypatch):
+    _fake_client(monkeypatch, {"https://example.com/big": _FakeResponse(b"x" * 64)})
+    monkeypatch.setattr(loaders, "MAX_URL_BYTES", 16)
+
+    with pytest.raises(ValueError, match="上限"):
+        loaders.load_url("https://example.com/big")
+
+
+def test_load_url_rejects_redirect_to_private_host(monkeypatch):
+    fake = _fake_client(
+        monkeypatch,
+        {
+            "https://example.com/a": _FakeResponse(
+                next_url="http://169.254.169.254/secret"
+            )
+        },
+    )
+
+    with pytest.raises(ValueError, match="公网"):
+        loaders.load_url("https://example.com/a")
+
+    assert fake.seen == ["https://example.com/a"]  # 内网那一跳没发出去
+
+
+def test_load_url_rejects_redirect_loop(monkeypatch):
+    _fake_client(
+        monkeypatch,
+        {"https://example.com/a": _FakeResponse(next_url="https://example.com/a")},
+    )
+
+    with pytest.raises(ValueError, match="重定向"):
+        loaders.load_url("https://example.com/a")
 
 
 def test_extract_html_without_head_close_tag():

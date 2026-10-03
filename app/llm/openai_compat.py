@@ -89,10 +89,19 @@ def _parse_tool_calls(raw: list[Any]) -> list[ToolCall]:
 class OpenAICompatClient:
     """OpenAI Chat Completions 协议；改 base_url 即可接入 DeepSeek/通义等。"""
 
-    def __init__(self, api_key: str, model: str, base_url: str | None = None):
+    def __init__(
+        self,
+        api_key: str,
+        model: str,
+        base_url: str | None = None,
+        db_path: str | None = None,
+    ):
         self.client = AsyncOpenAI(api_key=api_key, base_url=base_url)
         self.model = model
         self.provider = detect_provider(base_url)
+        # 埋点落哪个库由**创建者**决定：用自定义库时传进来，HTTP 主流程不传，
+        # record_llm 拿到 None 后由 get_db 兜到默认库（见 app/tracing.record_llm）
+        self.db_path = db_path
 
     async def chat(
         self, messages: list[Message], tools: list[ToolDef] | None = None
@@ -108,7 +117,7 @@ class OpenAICompatClient:
             tokens_in=resp.usage.prompt_tokens if resp.usage else 0,
             tokens_out=resp.usage.completion_tokens if resp.usage else 0,
         )
-        record_llm(self.provider, self.model, usage)
+        record_llm(self.provider, self.model, usage, self.db_path)
         return ChatResult(
             text=msg.content or "",
             tool_calls=_parse_tool_calls(msg.tool_calls or []),
@@ -167,4 +176,4 @@ class OpenAICompatClient:
         # 埋点放在最后一个 chunk 之后：usage 只在收尾 chunk 出现，这里才是「调用完成」。
         # 消费者中途弃用生成器（客户端断开）时这段不会执行，该次调用不计入——拿不到
         # usage 就不编造 token 数
-        record_llm(self.provider, self.model, usage)
+        record_llm(self.provider, self.model, usage, self.db_path)

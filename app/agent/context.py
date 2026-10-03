@@ -27,10 +27,12 @@ SUMMARY_PREFIX = "[历史摘要]"
 TOOL_OMITTED = "[之前的工具结果已省略]"
 TRUNCATION_NOTE = "[上下文已截断，部分历史可能丢失]"
 
-# 简单字符估算：1 token ≈ 4 字符。这是偏乐观的口径，会**低估**实际占用：中文约 1~1.5
-# 字符/token，也就是同样一段中文的真实 token 数约为本估算的 3~4 倍。用它把关够挡住上下文
-# 爆炸，但不等于真实计费口径；不引 tiktoken 是为了不新增依赖，见 T8 brief 的边界说明
+# 简单字符估算：CJK 字符按 1 字符 ≈ 1 token，其余按 4 字符/token。这是偏乐观的口径，
+# 会**低估**实际占用（中文真实 token 数通常还多于字符数），用它把关够挡住上下文爆炸，
+# 但不等于真实计费口径；不引 tiktoken 是为了不新增依赖，见 T8 brief 的边界说明
 CHARS_PER_TOKEN = 4
+# 按 1 字符 ≈ 1 token 估算的常见 CJK 区间：汉字、扩展 A、CJK 标点、全角字符
+CJK_RANGES = ((0x4E00, 0x9FFF), (0x3400, 0x4DBF), (0x3000, 0x303F), (0xFF00, 0xFFEF))
 KEEP_TOOL_ROUNDS = 2  # 保留最近 2 轮的工具结果，更早的换成占位符
 SUMMARY_INPUT_LIMIT = 4000  # 送进摘要 prompt 的历史文本上限（字符）
 # 占位符内联 query 时的上限：query 是模型自由生成的、没有长度上限，原样塞进占位符会让
@@ -50,10 +52,11 @@ SUMMARY_PROMPT = (
 
 
 def estimate_tokens(text: str) -> int:
-    """粗略 token 估算：1 token ≈ 4 字符（中文按字符数近似，够用于预算把关）。"""
+    """粗略 token 估算：CJK 字符按 1 字符 ≈ 1 token，其余按 4 字符/token。"""
     if not text:
         return 0
-    return (len(text) + CHARS_PER_TOKEN - 1) // CHARS_PER_TOKEN
+    cjk = sum(1 for ch in text if any(lo <= ord(ch) <= hi for lo, hi in CJK_RANGES))
+    return cjk + (len(text) - cjk + CHARS_PER_TOKEN - 1) // CHARS_PER_TOKEN
 
 
 def prompt_tokens(messages: list[Message]) -> int:

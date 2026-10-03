@@ -1,3 +1,4 @@
+import asyncio
 import json
 from datetime import datetime, timezone
 from pathlib import Path
@@ -15,7 +16,9 @@ def _now() -> str:
 
 
 async def ingest(source: str | Path, db_path: str | Path | None = None) -> int:
-    title, text = load(source)
+    # 读取是同步阻塞 I/O（读盘、pymupdf 解析、HTTP 抓取，最长 30s+），
+    # 丢进线程池，别把事件循环连同其他请求一起卡住
+    title, text = await asyncio.to_thread(load, source)
     chunks = chunk_text(text)
     if not chunks:
         return 0

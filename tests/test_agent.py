@@ -1,10 +1,12 @@
 import asyncio
 import json
+from pathlib import Path
 
 import httpx
 import pytest
 
 from app.agent import runtime
+from app.config import settings
 from app.db import get_db, init_db
 from app.llm.types import StreamChunk, ToolCall
 from app.main import app
@@ -531,7 +533,8 @@ async def test_chat_survives_run_agent_exception(client, monkeypatch):
 
     assert resp.status_code == 200
     assert [e["type"] for e in events] == ["text_delta", "error"]
-    assert "装配阶段崩了" in events[-1]["data"]["message"]
+    # 逃出 _sse 的异常按友好文案发事件，原始异常只进日志（见 app/main.py 的 logger.exception）
+    assert events[-1]["data"]["message"] == "生成出错，请重试"
 
 
 async def test_chat_session_event_survives_ensure_session_failure(client, monkeypatch):
@@ -547,7 +550,7 @@ async def test_chat_session_event_survives_ensure_session_failure(client, monkey
 
     assert resp.status_code == 200
     assert [e["type"] for e in events] == ["error"]
-    assert "建会话失败" in events[-1]["data"]["message"]
+    assert events[-1]["data"]["message"] == "生成出错，请重试"
 
 
 async def test_ingest_and_documents_endpoints(client, monkeypatch):
@@ -575,7 +578,9 @@ async def test_ingest_and_documents_endpoints(client, monkeypatch):
 
     deleted = await client.delete("/api/documents/1")
     assert deleted.json() == {"deleted": 1}
-    assert calls == ["notes/a.md", "delete:1"]
+    # 白名单校验后进管线的是解析后的绝对路径（查的和读的必须是同一个文件）
+    expected = Path(settings.db_path).resolve().parent / "notes/a.md"
+    assert calls == [expected, "delete:1"]
 
 
 async def test_ingest_surfaces_loader_error(client, monkeypatch):
@@ -586,4 +591,4 @@ async def test_ingest_surfaces_loader_error(client, monkeypatch):
 
     resp = await client.post("/api/ingest", json={"source": "nope.md"})
     assert resp.status_code == 400
-    assert "FileNotFoundError" in resp.json()["detail"]
+    assert resp.json()["detail"] == "no such file"

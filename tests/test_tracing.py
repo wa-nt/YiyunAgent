@@ -91,8 +91,10 @@ async def client(db):
         yield c
 
 
-def openai_client(model: str = MODEL, base_url: str | None = None) -> OpenAICompatClient:
-    return OpenAICompatClient(api_key="k", model=model, base_url=base_url)
+def openai_client(
+    model: str = MODEL, base_url: str | None = None, db_path: str | None = None
+) -> OpenAICompatClient:
+    return OpenAICompatClient(api_key="k", model=model, base_url=base_url, db_path=db_path)
 
 
 def stub_openai_chat(client, text: str = "好的", tokens_in: int = 10, tokens_out: int = 5):
@@ -380,6 +382,76 @@ async def test_deepseek_base_url_uses_deepseek_prices(db):
     rows = await read(db)
     assert rows[0]["name"] == "deepseek/deepseek-chat"
     assert rows[0]["cost"] == pytest.approx(0.00042)  # (1000×0.14 + 1000×0.28) / 1M
+
+
+# ---------- 自定义库的落点（评测 / CLI 口径） ----------
+
+
+def test_get_llm_forwards_db_path(monkeypatch, tmp_path):
+    """统一工厂要把 db_path 透给客户端：漏传则评测里的 llm trace 仍落默认库。"""
+    from app.llm import get_llm
+
+    seen: dict = {}
+
+    class StubClient:
+        def __init__(self, **kwargs):
+            seen.update(kwargs)
+
+    monkeypatch.setattr(settings, "llm_provider", "openai_compat")
+    monkeypatch.setattr("app.llm.openai_compat.OpenAICompatClient", StubClient)
+
+    get_llm(str(tmp_path / "eval.db"))
+
+    assert seen["db_path"] == str(tmp_path / "eval.db")
+
+
+async def test_llm_trace_follows_client_db_path(db, tmp_path):
+    """自定义库创建的 client：llm trace 落该库，默认库一条都不多。
+
+    落点由**创建者**决定（client 存下 db_path 再透传给 record_llm），所以评测用
+    scratch 库建客户端时，那轮 llm trace 不会再写进用户的知识库。
+    """
+    other = tmp_path / "eval.db"
+    await init_db(other, DIM)
+    client = openai_client(db_path=str(other))
+    stub_openai_chat(client, tokens_in=10, tokens_out=5)
+
+    await client.chat([Message(role="user", content="hi")])
+    await tracing.drain_traces()
+
+    rows = await read(other)
+    assert len(rows) == 1 and rows[0]["kind"] == "llm"
+    assert await read(db) == []  # 默认库（db 夹具）不受影响
+
+
+async def test_stream_trace_follows_client_db_path(db, tmp_path):
+    """流式路径（收尾 chunk 之后才埋点）同样认 client 的 db_path。"""
+    other = tmp_path / "eval.db"
+    await init_db(other, DIM)
+    client = openai_client(db_path=str(other))
+    stub_openai_stream(client, tokens_in=3, tokens_out=2)
+
+    [c async for c in client.chat_stream([])]
+    await tracing.drain_traces()
+
+    rows = await read(other)
+    assert len(rows) == 1 and rows[0]["kind"] == "llm"
+    assert await read(db) == []
+
+
+async def test_anthropic_trace_follows_client_db_path(db, tmp_path):
+    """Anthropic 适配器同样透传：两个 client 的埋点口径不能只修一个。"""
+    other = tmp_path / "eval.db"
+    await init_db(other, DIM)
+    client = AnthropicClient(api_key="k", model="claude-sonnet-4-5", db_path=str(other))
+    stub_anthropic_chat(client)
+
+    await client.chat([Message(role="user", content="hi")])
+    await tracing.drain_traces()
+
+    rows = await read(other)
+    assert len(rows) == 1 and rows[0]["kind"] == "llm"
+    assert await read(db) == []
 
 
 async def test_summary_llm_call_is_traced(db):

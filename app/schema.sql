@@ -55,3 +55,10 @@ CREATE TABLE IF NOT EXISTS traces (
     tokens_out INTEGER,
     cost REAL
 );
+
+-- 三张热表的过滤列都缺索引，实际查询退化成全表扫描：按 session_id 取会话历史与
+-- 消息列表、按 status 筛有效记忆、看板按 (kind, name, ts) 过滤 trace。
+-- 全部 IF NOT EXISTS，init_db 每次启动重放本文件时给存量库补上，无需迁移脚本。
+CREATE INDEX IF NOT EXISTS idx_messages_session_id ON messages(session_id);
+CREATE INDEX IF NOT EXISTS idx_memories_status ON memories(status);
+CREATE INDEX IF NOT EXISTS idx_traces_kind_name_ts ON traces(kind, name, ts);

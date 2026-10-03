@@ -38,6 +38,7 @@ import subprocess
 import time
 import uuid
 from dataclasses import asdict, dataclass, field
+from functools import partial
 from pathlib import Path
 from typing import Any, Literal, get_args, get_origin
 
@@ -45,6 +46,7 @@ from app.agent import runtime
 from app.config import Settings, settings
 from app.db import get_db, init_db
 from app.ingest.pipeline import ingest
+from app.llm import get_llm
 from app.retrieval.bm25_search import invalidate
 from app.tracing import drain_traces
 from eval.metrics import (
@@ -482,8 +484,9 @@ async def run_eval(
     - concurrency：asyncio.gather 的并发上限，避免打满 rate limit
     - k：Hit@k / Recall@k 的 k
 
-    注意 llm trace 的落库口径是进程级的（只认 settings.db_path，见 app/tracing.py），
-    要收集 trace 就把 settings.db_path 指到同一个库。
+    注意 llm 桩只在 llm 非 None 时生效；llm 为 None（真实配置）时 run_eval 会把本轮
+    评测库绑给客户端（见下），llm trace 因此与 tool trace 一样落这个一次性库，不用再把
+    DB_PATH 指来指去。
     """
     dataset = load_dataset(dataset_path)
     samples = dataset["samples"]
@@ -505,6 +508,12 @@ async def run_eval(
         original_get_llm = runtime.get_llm
         if llm is not None:
             runtime.get_llm = lambda: llm
+        else:
+            # 真实配置路径同样要绑本轮评测库：客户端不带 db_path 的话 llm trace 会落
+            # 默认库（settings.db_path，用户的知识库），与 tool trace 的落点分裂——
+            # 这个评测库跑完就被删，那批 llm trace 等于写进了别人的库。
+            # partial 保持 0 参调用，runtime 那边 `get_llm()` 的调用点不用动。
+            runtime.get_llm = partial(get_llm, db_path=path)
         semaphore = asyncio.Semaphore(concurrency)
 
         async def guarded(sample: dict[str, Any]) -> SampleResult:

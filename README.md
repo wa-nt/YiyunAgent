@@ -42,7 +42,7 @@ python -m eval.runner
 python -m eval.runner --ablation
 ```
 
-LLM 后端通过 `LLM_PROVIDER=openai_compat|anthropic` 切换；OpenAI 兼容端点（DeepSeek/通义/Moonshot 等）改 `OPENAI_BASE_URL` 即可。embedding 走独立的 `EMBED_*` 配置。可选的 PostgreSQL + pgvector 部署见 `docker-compose.yml`。
+LLM 后端通过 `LLM_PROVIDER=openai_compat|anthropic` 切换；OpenAI 兼容端点（DeepSeek/通义/Moonshot 等）改 `OPENAI_BASE_URL` 即可。embedding 走独立的 `EMBED_*` 配置。存储为本地 SQLite + sqlite-vec，零外部服务。
 
 ## API
 
