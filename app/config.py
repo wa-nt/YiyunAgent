@@ -1,3 +1,4 @@
+from pathlib import Path
 from typing import Literal, Optional
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -81,3 +82,51 @@ class Settings(BaseSettings):
 
 
 settings = Settings()
+
+
+# ---- 设置面板（/api/settings）的运行时读写 ----
+# 只有这些字段能在界面上改；记忆/上下文/定价等其余配置仍只走 .env 与环境变量
+EDITABLE_FIELDS = (
+    "llm_provider",
+    "openai_base_url",
+    "openai_api_key",
+    "openai_model",
+    "anthropic_api_key",
+    "anthropic_model",
+    "embed_base_url",
+    "embed_api_key",
+    "embed_model",
+    "embed_dim",
+)
+
+
+def mask_secret(value: Optional[str]) -> str:
+    """密钥脱敏回显：只露末 4 位，全量密钥永远不出进程。"""
+    if not value:
+        return ""
+    return f"…{value[-4:]}" if len(value) > 4 else "…"
+
+
+def env_path() -> Path:
+    """.env 的位置：与 pydantic-settings 的读取口径一致（相对 CWD）。单独成函数
+    是让测试能把它 monkeypatch 到临时目录，不动真实 .env。"""
+    return Path(".env")
+
+
+def update_env_file(path: Path, updates: dict[str, str]) -> None:
+    """就地更新 .env：已存在的键替换原行，新键追加到末尾；注释与无关行原样保留。
+    键名按 .env 惯例写大写（pydantic-settings 读取时大小写不敏感）。"""
+    lines = path.read_text(encoding="utf-8").splitlines() if path.exists() else []
+    pending = dict(updates)
+    out: list[str] = []
+    for line in lines:
+        stripped = line.strip()
+        if stripped and not stripped.startswith("#") and "=" in line:
+            key = line.split("=", 1)[0].strip().upper()
+            hit = next((k for k in pending if k.upper() == key), None)
+            if hit is not None:
+                out.append(f"{key}={pending.pop(hit)}")
+                continue
+        out.append(line)
+    out.extend(f"{k.upper()}={v}" for k, v in pending.items())
+    path.write_text("\n".join(out) + "\n", encoding="utf-8")

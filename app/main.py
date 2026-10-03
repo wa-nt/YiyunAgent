@@ -2,11 +2,13 @@ import json
 import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import Literal
 
 from fastapi import FastAPI, HTTPException, Query, UploadFile
 from fastapi.responses import StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from openai import APIConnectionError, AsyncOpenAI, AuthenticationError, OpenAIError
+from pydantic import BaseModel, Field
 
 from app.agent.runtime import (
     drain_memory_writes,
@@ -14,7 +16,7 @@ from app.agent.runtime import (
     list_messages,
     run_agent,
 )
-from app.config import settings
+from app.config import EDITABLE_FIELDS, env_path, mask_secret, settings, update_env_file
 from app.db import get_db, init_db
 from app.ingest.pipeline import delete_document, ingest, list_documents
 from app.tracing import (
@@ -234,6 +236,119 @@ async def api_traces_summary(
         return await summarize_traces(kind=kind, name=name, start=start, end=end)
     except InvalidTimestamp as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+class SettingsUpdate(BaseModel):
+    """设置面板的可编辑字段（全集见 config.EDITABLE_FIELDS）。api_key 留空 = 保持现状。"""
+
+    llm_provider: Literal["openai_compat", "anthropic"] | None = None
+    openai_base_url: str | None = None
+    openai_api_key: str | None = None
+    openai_model: str | None = None
+    anthropic_api_key: str | None = None
+    anthropic_model: str | None = None
+    embed_base_url: str | None = None
+    embed_api_key: str | None = None
+    embed_model: str | None = None
+    embed_dim: int | None = Field(default=None, gt=0)
+
+
+# 密钥字段不接受空串覆盖：清空密钥属于破坏性操作，让它只能去改 .env 完成
+_SECRET_FIELDS = {"openai_api_key", "anthropic_api_key", "embed_api_key"}
+
+
+@app.get("/api/settings")
+async def api_settings_get() -> dict:
+    """当前模型 / embedding 配置，密钥脱敏回显（只露末 4 位）。"""
+    return {
+        "llm_provider": settings.llm_provider,
+        "openai_base_url": settings.openai_base_url or "",
+        "openai_api_key": mask_secret(settings.openai_api_key),
+        "openai_model": settings.openai_model or "",
+        "anthropic_api_key": mask_secret(settings.anthropic_api_key),
+        "anthropic_model": settings.anthropic_model,
+        "embed_base_url": settings.embed_base_url or "",
+        "embed_api_key": mask_secret(settings.embed_api_key),
+        "embed_model": settings.embed_model or "",
+        "embed_dim": settings.embed_dim,
+    }
+
+
+@app.post("/api/settings")
+async def api_settings_update(req: SettingsUpdate) -> dict:
+    """保存设置：写 .env（重启不丢）并同步 settings 单例。
+
+    LLM / embedding 客户端都是每次调用时新建（llm/__init__.py、llm/embed.py），
+    所以保存立即生效，无需重启。注意 embed_dim 只影响之后写入的向量：与现有
+    vec0 表维度不一致时检索会报错，前端已提示需重新导入文档。
+    """
+    updates: dict = {}
+    for name in EDITABLE_FIELDS:
+        value = getattr(req, name)
+        if value is None or (name in _SECRET_FIELDS and value == ""):
+            continue
+        updates[name] = value
+
+    # 校验「保存后的完整配置」而不是这次增量：切了供应商但没配齐密钥/模型就拒绝，
+    # 否则写出来的是一用就 401 的半残配置。openai_base_url 允许为空（SDK 默认官方端点）
+    merged = {name: getattr(settings, name) for name in EDITABLE_FIELDS} | updates
+    if merged["llm_provider"] == "anthropic":
+        missing = [n for n in ("anthropic_api_key", "anthropic_model") if not merged[n]]
+    else:
+        missing = [n for n in ("openai_api_key", "openai_model") if not merged[n]]
+    if missing:
+        raise HTTPException(status_code=422, detail=f"当前供应商缺少必填项：{', '.join(missing)}")
+
+    if updates:
+        update_env_file(env_path(), {n: str(v) for n, v in updates.items()})
+        for name, value in updates.items():
+            setattr(settings, name, value)
+    return {"updated": sorted(updates)}
+
+
+class ModelListRequest(BaseModel):
+    """拉取模型列表。base_url / api_key 用面板里**当前填的**值，留空则回落已保存配置
+    （密钥输入框平时是空的，只有用户新填时才带上）。"""
+
+    kind: Literal["llm", "embed"]
+    base_url: str | None = None
+    api_key: str | None = None
+
+
+@app.post("/api/models")
+async def api_models(req: ModelListRequest) -> dict:
+    """转发 GET {base_url}/models，把供应商的模型清单给前端做输入建议。
+
+    必须走后端：浏览器直连供应商会跨域失败，而且密钥只该存在服务端。只读、不落库，
+    拉取失败就是一次普通的 HTTP 错误，不影响任何已保存配置。
+    """
+    if req.kind == "llm":
+        if settings.llm_provider == "anthropic":
+            raise HTTPException(status_code=400, detail="Anthropic 暂不支持拉取，请手动填写模型名")
+        base_url = req.base_url or settings.openai_base_url
+        api_key = req.api_key or settings.openai_api_key
+    else:
+        base_url = req.base_url or settings.embed_base_url
+        api_key = req.api_key or settings.embed_api_key
+
+    try:
+        client = AsyncOpenAI(api_key=api_key, base_url=base_url or None, timeout=20.0)
+    except OpenAIError as exc:  # 没有 key 时构造函数就抛
+        raise HTTPException(status_code=422, detail=f"缺少 API Key：{exc}") from exc
+
+    try:
+        page = await client.models.list()
+        models = sorted({m.id for m in page.data})
+    except AuthenticationError as exc:
+        raise HTTPException(status_code=401, detail="API Key 无效或无权访问该端点") from exc
+    except APIConnectionError as exc:
+        raise HTTPException(status_code=502, detail=f"连不上 {base_url or 'OpenAI 官方端点'}") from exc
+    except OpenAIError as exc:
+        raise HTTPException(status_code=502, detail=f"拉取失败：{exc}") from exc
+    finally:
+        await client.close()
+
+    return {"models": models}
 
 
 # T6 的前端目录；不存在时跳过挂载（挂到 / 会吞掉未匹配的 API 路径，所以放最后）

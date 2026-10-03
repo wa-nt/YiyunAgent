@@ -5,6 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>第二大脑 · 个人知识库</title>
 <style>
+/* Claude 设计规范（DESIGN.claude.md）：奶油画布 + 珊瑚橙 + 深暖墨，阴影克制 */
 :root {
   --primary: #cc785c;
   --primary-pressed: #a9583e;
@@ -30,9 +31,10 @@
   /* 展示标题用衬线（Claude 的 Copernicus 无公开字体，Georgia 是最接近的本地回退） */
   --font-display: Georgia, "Times New Roman", "SimSun", serif;
   --r-sm: 6px; --r-md: 8px; --r-lg: 12px;
-  --shadow-1: rgba(15,15,15,.04) 0 1px 2px 0;
-  --shadow-2: rgba(15,15,15,.08) 0 4px 12px 0;
+  --shadow-1: rgba(20,20,19,.05) 0 1px 2px 0;
+  --shadow-2: rgba(20,20,19,.08) 0 4px 12px 0;
 }
+::selection { background: var(--tint-coral); }
 * { margin: 0; padding: 0; box-sizing: border-box; }
 html, body { height: 100%; }
 body {
@@ -50,7 +52,7 @@ body {
 .sidebar-head {
   padding: 20px 20px 16px; border-bottom: 1px solid var(--hairline);
 }
-.logo { font-size: 18px; font-weight: 600; letter-spacing: -0.3px; }
+.logo { font-family: var(--font-display); font-size: 21px; font-weight: 400; letter-spacing: -0.3px; }
 .logo span { color: var(--primary); }
 .logo-sub { font-size: 13px; color: var(--steel); margin-top: 2px; }
 .panel-head {
@@ -87,7 +89,7 @@ body {
 .ingest-row { display: flex; gap: 8px; }
 .ingest-row input {
   flex: 1; height: 36px; padding: 6px 12px; font-size: 14px;
-  border: 1px solid var(--hairline-strong); border-radius: var(--r-md);
+  border: 1px solid var(--hairline); border-radius: var(--r-md);
   background: var(--canvas); color: var(--ink); outline: none;
   transition: border-color .15s ease;
 }
@@ -114,7 +116,7 @@ body {
 .doc-item .doc-title { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .doc-item .doc-chunks {
   font-size: 12px; color: var(--stone); background: var(--canvas);
-  border: 1px solid var(--hairline); border-radius: var(--r-sm); padding: 0 6px;
+  border: 1px solid var(--hairline); border-radius: 9999px; padding: 0 8px;
 }
 .doc-item .doc-del {
   border: none; background: none; color: var(--muted); cursor: pointer;
@@ -141,7 +143,8 @@ body {
 .chat-inner { max-width: 760px; margin: 0 auto; padding: 32px 32px 16px; }
 .hero-empty { text-align: center; padding-top: 15vh; }
 .hero-empty h1 {
-  font-size: 36px; font-weight: 600; letter-spacing: -0.5px;
+  font-family: var(--font-display);
+  font-size: 36px; font-weight: 400; letter-spacing: -0.5px;
   line-height: 1.2; margin-bottom: 12px;
 }
 .hero-empty p { color: var(--steel); font-size: 16px; max-width: 460px; margin: 0 auto; }
@@ -207,7 +210,7 @@ cite.chunk-ref:hover { background: var(--primary); color: #fff; }
 .composer-inner { max-width: 760px; margin: 0 auto; padding: 16px 32px 20px; }
 .composer-box {
   display: flex; align-items: flex-end; gap: 8px;
-  border: 1px solid var(--hairline-strong); border-radius: var(--r-lg);
+  border: 1px solid var(--hairline); border-radius: var(--r-lg);
   background: var(--canvas); padding: 10px 12px;
   box-shadow: var(--shadow-1); transition: border-color .15s ease;
 }
@@ -252,6 +255,83 @@ cite.chunk-ref:hover { background: var(--primary); color: #fff; }
   .sidebar.open { transform: none; }
   .chat-inner, .composer-inner { padding-left: 20px; padding-right: 20px; }
 }
+/* ---------- 设置面板 ---------- */
+.sidebar-head { position: relative; }
+#settings-btn {
+  position: absolute; top: 16px; right: 16px;
+  width: 32px; height: 32px; border: 1px solid var(--hairline);
+  border-radius: var(--r-md); background: var(--canvas); color: var(--slate);
+  font-size: 15px; cursor: pointer;
+}
+#settings-btn:hover { color: var(--ink); border-color: var(--hairline-strong); }
+#settings-mask {
+  position: fixed; inset: 0; z-index: 60; display: none;
+  background: rgba(20,20,19,.4); align-items: flex-start; justify-content: center;
+}
+#settings-panel {
+  width: 420px; max-width: calc(100vw - 48px); max-height: 85vh; overflow-y: auto;
+  margin-top: 8vh; background: var(--canvas); border: 1px solid var(--hairline);
+  border-radius: var(--r-lg); padding: 24px 28px 28px; box-shadow: var(--shadow-2);
+}
+.set-head {
+  display: flex; align-items: center; justify-content: space-between;
+  font-family: var(--font-display); font-size: 22px; margin-bottom: 4px;
+}
+.set-head button { border: none; background: none; font-size: 14px; color: var(--stone); cursor: pointer; }
+.set-head button:hover { color: var(--ink); }
+.set-sec {
+  font-size: 12px; font-weight: 600; letter-spacing: 1px; text-transform: uppercase;
+  color: var(--stone); margin: 16px 0 8px; padding-top: 16px;
+  border-top: 1px solid var(--hairline);
+}
+.set-sec:first-of-type { border-top: none; padding-top: 0; }
+.set-note {
+  display: block; font-size: 12px; font-weight: 400; letter-spacing: 0;
+  text-transform: none; color: var(--muted); margin-top: 2px;
+}
+.set-label { display: block; font-size: 13px; font-weight: 500; color: var(--charcoal); margin: 10px 0 4px; }
+#settings-panel input, #settings-panel select {
+  width: 100%; height: 40px; padding: 10px 14px; font-size: 14px;
+  border: 1px solid var(--hairline); border-radius: var(--r-md);
+  background: var(--canvas); color: var(--ink); outline: none;
+}
+#settings-panel input:focus, #settings-panel select:focus { border-color: var(--primary); }
+.set-actions { margin-top: 20px; display: flex; justify-content: flex-end; }
+.set-actions .btn { height: 40px; padding: 0 24px; }
+/* 模型字段的标签行：右侧挂「拉取模型」。次级动作用 button-secondary 的紧凑版
+   （奶油底 + 发丝描边），不用珊瑚色文字链——它在安静的表单里太扎眼 */
+.set-label-row {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 8px; margin: 10px 0 4px;
+}
+.set-label-row .set-label { margin: 0; }
+.set-fetch {
+  height: 26px; padding: 0 10px; flex-shrink: 0;
+  font-size: 12px; font-weight: 500; cursor: pointer;
+  border: 1px solid var(--hairline); border-radius: var(--r-sm);
+  background: var(--canvas); color: var(--slate);
+}
+.set-fetch:hover { border-color: var(--hairline-strong); color: var(--ink); }
+.set-fetch:disabled { color: var(--muted); cursor: default; }
+/* 拉取结果就地反馈：showError 的错误条在遮罩底下看不见，面板内得有自己的状态行 */
+.set-status { display: block; font-size: 12px; color: var(--stone); margin-top: 4px; }
+.set-status.err { color: var(--error); }
+/* 模型建议下拉。原生 datalist 由系统渲染、样式完全改不动，跟奶油底/珊瑚色对不上，
+   所以自建浮层，样式与 #popover 同源。挂 body + fixed 定位是为了不被
+   #settings-panel 的 overflow:auto 裁掉 */
+#set-suggest {
+  position: fixed; display: none; z-index: 70;
+  max-height: 240px; overflow-y: auto; padding: 4px;
+  background: var(--canvas); border: 1px solid var(--hairline);
+  border-radius: var(--r-md); box-shadow: var(--shadow-2);
+}
+.set-suggest-item {
+  padding: 7px 10px; border-radius: var(--r-sm); font-size: 13px;
+  color: var(--charcoal); cursor: pointer;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.set-suggest-item:hover, .set-suggest-item.active { background: var(--tint-coral); color: var(--ink); }
+.set-suggest-empty { padding: 7px 10px; font-size: 13px; color: var(--muted); }
 </style>
 </head>
 <body>
@@ -260,6 +340,7 @@ cite.chunk-ref:hover { background: var(--primary); color: #fff; }
   <div class="sidebar-head">
     <div class="logo">第二<span>大脑</span></div>
     <div class="logo-sub">个人知识库 Agent</div>
+    <button id="settings-btn" title="模型设置">⚙</button>
   </div>
   <div class="sessions-box">
     <div class="panel-head">
@@ -309,6 +390,48 @@ cite.chunk-ref:hover { background: var(--primary); color: #fff; }
   </div>
 </main>
 <div id="popover"></div>
+<div id="set-suggest"></div>
+<div id="settings-mask">
+  <div id="settings-panel">
+    <div class="set-head"><span>模型设置</span><button id="settings-close" title="关闭">✕</button></div>
+    <div class="set-sec">对话模型（LLM）<span class="set-note">保存后立即生效，无需重启</span></div>
+    <label class="set-label">供应商</label>
+    <select id="set-provider">
+      <option value="openai_compat">OpenAI 兼容</option>
+      <option value="anthropic">Anthropic</option>
+    </select>
+    <div id="set-openai">
+      <label class="set-label">Base URL</label>
+      <input id="set-openai-base-url" placeholder="留空 = OpenAI 官方端点">
+      <label class="set-label">API Key</label>
+      <input id="set-openai-key" type="password">
+      <div class="set-label-row">
+        <label class="set-label" for="set-openai-model">模型</label>
+        <button class="set-fetch" id="set-openai-fetch" type="button">拉取模型</button>
+      </div>
+      <input id="set-openai-model" autocomplete="off" placeholder="如 deepseek-chat / gpt-4o-mini">
+      <span class="set-status" id="set-openai-fetch-status"></span>
+    </div>
+    <div id="set-anthropic" hidden>
+      <label class="set-label">API Key</label>
+      <input id="set-anthropic-key" type="password">
+      <label class="set-label">模型</label>
+      <input id="set-anthropic-model">
+    </div>
+    <div class="set-sec">Embedding<span class="set-note">换模型后向量维度必须与原来一致，否则需删除并重新导入文档</span></div>
+    <label class="set-label">Base URL</label>
+    <input id="set-embed-base-url">
+    <label class="set-label">API Key</label>
+    <input id="set-embed-key" type="password">
+    <div class="set-label-row">
+      <label class="set-label" for="set-embed-model">模型</label>
+      <button class="set-fetch" id="set-embed-fetch" type="button">拉取模型</button>
+    </div>
+    <input id="set-embed-model" autocomplete="off">
+    <span class="set-status" id="set-embed-fetch-status"></span>
+    <div class="set-actions"><button class="btn btn-primary" id="settings-save">保存</button></div>
+  </div>
+</div>
 <script src="/vendor/marked.min.js"></script>
 <script>
 const $ = (id) => document.getElementById(id);
@@ -629,6 +752,173 @@ inputEl.oninput = () => {
   inputEl.style.height = Math.min(inputEl.scrollHeight, 160) + "px";
 };
 $("ingest-input").onkeydown = (e) => { if (e.key === "Enter") $("ingest-btn").click(); };
+
+/* ---------- 设置面板 ---------- */
+const settingsMask = $("settings-mask");
+const KEY_INPUTS = [["set-openai-key", "openai_api_key"], ["set-anthropic-key", "anthropic_api_key"], ["set-embed-key", "embed_api_key"]];
+function toggleProviderFields() {
+  const isOpenai = $("set-provider").value === "openai_compat";
+  $("set-openai").hidden = !isOpenai;
+  $("set-anthropic").hidden = isOpenai;
+}
+$("set-provider").onchange = toggleProviderFields;
+$("settings-btn").onclick = async () => {
+  try {
+    const r = await fetch("/api/settings");
+    if (!r.ok) throw new Error(await errText(r));
+    const s = await r.json();
+    $("set-provider").value = s.llm_provider;
+    $("set-openai-base-url").value = s.openai_base_url;
+    $("set-openai-model").value = s.openai_model;
+    $("set-anthropic-model").value = s.anthropic_model;
+    $("set-embed-base-url").value = s.embed_base_url;
+    $("set-embed-model").value = s.embed_model;
+    // 密钥不回填全量：placeholder 显示脱敏现状，留空 = 保持不变
+    for (const [id, field] of KEY_INPUTS) {
+      $(id).value = "";
+      $(id).placeholder = s[field] ? `当前 ${s[field]}，留空保持不变` : "未设置";
+    }
+    toggleProviderFields();
+    settingsMask.style.display = "flex";
+  } catch (e) { showError(e.message); }
+};
+$("settings-close").onclick = () => { settingsMask.style.display = "none"; hideSuggest(); };
+settingsMask.onclick = (e) => { if (e.target === settingsMask) { settingsMask.style.display = "none"; hideSuggest(); } };
+/* 面板能滚：浮层是 fixed 定位，不跟着走就会飘在错的位置 */
+$("settings-panel").addEventListener("scroll", hideSuggest);
+/* 拉取模型：只认面板里当前填的值（base_url/key 留空则由后端回落已保存配置）。
+   拉回来的清单只做输入建议，不替用户改字段——端点返回的清单里混着对话与
+   embedding 模型，猜错还不如不猜 */
+const FETCH_BUTTONS = [
+  { btn: "set-openai-fetch", status: "set-openai-fetch-status", input: "set-openai-model", kind: "llm", baseUrl: "set-openai-base-url", key: "set-openai-key" },
+  { btn: "set-embed-fetch", status: "set-embed-fetch-status", input: "set-embed-model", kind: "embed", baseUrl: "set-embed-base-url", key: "set-embed-key" },
+];
+function setStatus(id, text, isErr) {
+  const el = $(id);
+  el.textContent = text;
+  el.classList.toggle("err", !!isErr);
+}
+
+/* 模型建议下拉：自建浮层替代原生 datalist（后者样式改不动，跟设计体系对不上）。
+   挂 body + fixed，免得被 #settings-panel 的 overflow:auto 裁掉 */
+const suggestEl = $("set-suggest");
+let suggestInput = null, suggestItems = [], suggestActive = -1;
+function hideSuggest() {
+  suggestEl.style.display = "none";
+  suggestInput = null; suggestItems = []; suggestActive = -1;
+}
+function renderSuggest() {
+  suggestEl.innerHTML = suggestItems.length
+    ? suggestItems.map((m, i) => `<div class="set-suggest-item${i === suggestActive ? " active" : ""}" data-i="${i}">${esc(m)}</div>`).join("")
+    : `<div class="set-suggest-empty">没有匹配的模型</div>`;
+}
+function openSuggest(input) {
+  if (!input.dataset.models || !input.dataset.models.length) return;
+  const kw = input.value.trim().toLowerCase();
+  suggestItems = JSON.parse(input.dataset.models).filter(m => m.toLowerCase().includes(kw));
+  suggestActive = -1;
+  renderSuggest();
+  const r = input.getBoundingClientRect();
+  const GAP = 4, PAD = 8;
+  suggestEl.style.left = r.left + "px";
+  suggestEl.style.width = r.width + "px";
+  // 先显示再量高度：隐藏元素量不出真实尺寸。下方空间不够就向上翻，并按可用
+  // 空间收紧高度，否则靠近视口底部的输入框会把浮层裁掉
+  suggestEl.style.maxHeight = "240px";
+  suggestEl.style.top = r.bottom + GAP + "px";
+  suggestEl.style.display = "block";
+  const below = window.innerHeight - r.bottom - GAP - PAD;
+  const above = r.top - GAP - PAD;
+  if (suggestEl.offsetHeight > below && above > below) {
+    suggestEl.style.top = Math.max(PAD, r.top - GAP - Math.min(suggestEl.offsetHeight, above)) + "px";
+  } else {
+    suggestEl.style.maxHeight = Math.max(80, Math.min(240, below)) + "px";
+  }
+  suggestInput = input;
+}
+function pickSuggest(input, value) {
+  input.value = value;
+  hideSuggest();
+}
+suggestEl.onmousedown = (e) => {
+  // mousedown 而非 click：click 前输入框会先 blur，浮层已经收起来了
+  const item = e.target.closest(".set-suggest-item");
+  if (item && suggestInput) { e.preventDefault(); pickSuggest(suggestInput, suggestItems[+item.dataset.i]); }
+};
+for (const cfg of FETCH_BUTTONS) {
+  const inputEl = $(cfg.input);
+  inputEl.addEventListener("input", () => openSuggest(inputEl));
+  inputEl.addEventListener("focus", () => openSuggest(inputEl));
+  inputEl.addEventListener("blur", () => setTimeout(hideSuggest, 120));
+  inputEl.addEventListener("keydown", (e) => {
+    if (suggestEl.style.display !== "block") return;
+    if (e.key === "Escape") { hideSuggest(); return; }
+    if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+      e.preventDefault();
+      const n = suggestItems.length;
+      suggestActive = e.key === "ArrowDown" ? (suggestActive + 1) % n : (suggestActive - 1 + n) % n;
+      renderSuggest();
+      suggestEl.querySelector(".active")?.scrollIntoView({ block: "nearest" });
+    } else if (e.key === "Enter" && suggestActive >= 0) {
+      e.preventDefault();
+      pickSuggest(inputEl, suggestItems[suggestActive]);
+    }
+  });
+
+  $(cfg.btn).onclick = async () => {
+    const btn = $(cfg.btn);
+    btn.disabled = true; btn.textContent = "拉取中…";
+    setStatus(cfg.status, "", false);
+    hideSuggest();  // 上一次拉取留下的浮层可能还开着，先收掉
+    try {
+      const r = await fetch("/api/models", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          kind: cfg.kind,
+          base_url: $(cfg.baseUrl).value.trim(),
+          api_key: $(cfg.key).value.trim(),
+        }),
+      });
+      if (!r.ok) throw new Error(await errText(r));
+      const { models } = await r.json();
+      inputEl.dataset.models = JSON.stringify(models);
+      setStatus(cfg.status, models.length ? `已拉取 ${models.length} 个模型，点输入框可挑选` : "该端点没有返回任何模型", !models.length);
+      if (models.length) openSuggest(inputEl);
+    } catch (e) { setStatus(cfg.status, e.message, true); }
+    finally { btn.disabled = false; btn.textContent = "拉取模型"; }
+  };
+}
+$("settings-save").onclick = async () => {
+  // 只提交当前选中供应商的字段，避免把另一家没填的配置清掉
+  const body = {
+    llm_provider: $("set-provider").value,
+    embed_base_url: $("set-embed-base-url").value.trim(),
+    embed_model: $("set-embed-model").value.trim(),
+  };
+  if (body.llm_provider === "openai_compat") {
+    body.openai_base_url = $("set-openai-base-url").value.trim();
+    body.openai_model = $("set-openai-model").value.trim();
+  } else {
+    body.anthropic_model = $("set-anthropic-model").value.trim();
+  }
+  for (const [id, field] of KEY_INPUTS) {
+    const v = $(id).value.trim();
+    if (v) body[field] = v;
+  }
+  const btn = $("settings-save");
+  btn.disabled = true; btn.textContent = "…";
+  try {
+    const r = await fetch("/api/settings", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    if (!r.ok) throw new Error(await errText(r));
+    settingsMask.style.display = "none";
+    showHint("模型配置已保存，立即生效");
+  } catch (e) { showError(e.message); }
+  finally { btn.disabled = false; btn.textContent = "保存"; }
+};
+
 loadDocs();
 loadMemories();
 sessionId ? openSession(sessionId) : loadSessions();

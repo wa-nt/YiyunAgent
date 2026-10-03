@@ -34,6 +34,15 @@ cp .env.example .env
 python -m uvicorn app.main:app --port 8765
 # 打开 http://localhost:8765
 
+# 桌面端：原生窗口 + 系统托盘（点 X 最小化到托盘，托盘菜单退出）
+python -m app.desktop
+
+# 打包成独立 exe：产物在 dist\SecondBrainAgent\，双击即用
+# 脚本会自动把 .env 与 data\ 带到产物旁边（首次从项目根拷贝，之后沿用产物内已有的一份，
+# 所以在设置面板里改过的配置和新增的知识库不会被重新打包冲掉）
+# 重新打包前请先从托盘菜单退出正在运行的实例，否则脚本会直接拒绝构建
+build_desktop.bat
+
 # 跑测试（324 条）
 python -m pytest tests/ -q
 
@@ -55,6 +64,8 @@ LLM 后端通过 `LLM_PROVIDER=openai_compat|anthropic` 切换；OpenAI 兼容�
 | GET | `/api/sessions/{id}/messages` | 会话历史 |
 | GET | `/api/traces` | 调用明细（kind/name/时间窗过滤，分页） |
 | GET | `/api/traces/summary` | 成本聚合（总计 + 按 kind/name 分组） |
+| GET/POST | `/api/settings` | 模型供应商设置（密钥脱敏回显；保存写 .env 并即时生效，对应侧栏 ⚙ 面板） |
+| POST | `/api/models` | 转发供应商 `GET /models` 给设置面板做模型名建议（只读，不落库；失败返回 401/502/422） |
 
 ## 项目结构
 

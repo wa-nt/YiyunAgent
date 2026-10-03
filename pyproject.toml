@@ -17,6 +17,10 @@ dependencies = [
     "pymupdf",
     "python-frontmatter",
     "python-multipart",
+    "pywebview",
+    "pystray",
+    "pillow",
+    "pyinstaller",
     "pytest",
     "pytest-asyncio",
 ]
