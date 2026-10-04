@@ -100,3 +100,41 @@ CREATE INDEX IF NOT EXISTS idx_memories_status ON memories(status);
 CREATE INDEX IF NOT EXISTS idx_traces_kind_name_ts ON traces(kind, name, ts);
 -- /api/gaps?all=false 与定时复习任务（T5）只查「已到期」，列表按到期时间排序
 CREATE INDEX IF NOT EXISTS idx_knowledge_gaps_next_review_at ON knowledge_gaps(next_review_at);
+
+-- 定时任务（T5）。name/cron/prompt 是用户输入（创建时校验非空与长度，cron 还要能被
+-- croniter 解析）；mode 只允许 chat/work，默认 work；timezone 是**创建时**记录的本机
+-- IANA 时区标识（如 Asia/Shanghai），cron 永远按它解释——机器时区后来变了也不迁移既有
+-- 任务，UI 只提示「仍在用创建时区」。除 created_at/last_fired_at 外的所有时间都是
+-- UTC ISO 8601（带 +00:00 偏移），定长格式让比较可以直接走字符串序。
+-- last_fired_at 是最近一次已触发的 occurrence：它在跑 Agent **之前**用
+-- 「任务 ID + occurrence」条件事务占位，因此既是幂等键（同一 occurrence 只 fire 一次），
+-- 也是「不重试失败轮次」的依据（失败只写通知，不回滚占位）。enabled=0 的任务不再被扫描。
+CREATE TABLE IF NOT EXISTS scheduled_tasks (
+    id INTEGER PRIMARY KEY,
+    name TEXT NOT NULL,
+    cron TEXT NOT NULL,
+    prompt TEXT NOT NULL,
+    mode TEXT NOT NULL DEFAULT 'work',
+    timezone TEXT NOT NULL,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    last_fired_at TEXT,
+    created_at TEXT NOT NULL
+);
+
+-- 任务结果通知（T5 写，T6 的托盘线程只读）。单用户桌面应用，本期不做 read 字段与逐条
+-- 已读 API：托盘从应用启动时刻开始查询，用进程内的 last_notified_id 去重，重启不会把旧
+-- 通知再弹一遍。这张表只增不删——是已知的长期增长点，后台清理推迟到有量级证据之后；
+-- 查询侧一律只取最近 N 条（默认 100，见 app/scheduler.py 的 NOTIFICATION_LIMIT）。
+CREATE TABLE IF NOT EXISTS notifications (
+    id INTEGER PRIMARY KEY,
+    task_id INTEGER,
+    session_id TEXT,
+    kind TEXT NOT NULL,
+    title TEXT NOT NULL,
+    body TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+-- 调度扫描每轮都要按 enabled 过滤；通知列表按时间倒序取最近 N 条
+CREATE INDEX IF NOT EXISTS idx_scheduled_tasks_enabled ON scheduled_tasks(enabled);
+CREATE INDEX IF NOT EXISTS idx_notifications_created_at ON notifications(created_at);

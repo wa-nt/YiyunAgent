@@ -12,6 +12,7 @@ from fastapi.staticfiles import StaticFiles
 from openai import APIConnectionError, AsyncOpenAI, AuthenticationError, OpenAIError
 from pydantic import BaseModel, Field
 
+from app import scheduler
 from app.agent.runtime import (
     DEFAULT_MODE,
     SUPPORTED_MODES,
@@ -48,13 +49,24 @@ UPLOAD_MAX_BYTES = 50 * 1024 * 1024  # 固定上限，需要时再做配置
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await init_db()
-    yield
-    # 记忆写入与 trace 写入都是 fire-and-forget（进程内后台任务），退出前给它们一个收尾
-    # 窗口，否则最后几轮对话的记忆与埋点会随进程一起消失。drain 的超时是软上限
-    # （每轮 DRAIN_TIMEOUT，最坏还要加上 sqlite busy timeout），不会无限卡住关闭。
-    # 顺序不能反：记忆抽取自己也会调 LLM（因此产生 llm trace），先收记忆再收 trace
-    await drain_memory_writes()
-    await drain_traces()
+    # 定时任务调度（T5）随应用起停。单进程单 worker 是它的前提：多 worker 会重复触发
+    # （数据库占位只防同一进程内的重复），桌面入口负责单实例。
+    scheduler.start_scheduler()
+    try:
+        yield
+    finally:
+        # 关闭顺序（invariant 8）：先停止接收新任务并取消扫描循环，再等在途 fire task
+        # （超时取消并写通知），最后收尾记忆与 trace 写入。drain 放在 finally 里，保证
+        # 前两步抛错也不会跳过它。
+        try:
+            await scheduler.stop_scheduler()
+        finally:
+            # 记忆写入与 trace 写入都是 fire-and-forget（进程内后台任务），退出前给它们
+            # 一个收尾窗口，否则最后几轮对话的记忆与埋点会随进程一起消失。drain 的超时是
+            # 软上限（每轮 DRAIN_TIMEOUT，最坏还要加上 sqlite busy timeout），不会无限卡住关闭。
+            # 顺序不能反：记忆抽取自己也会调 LLM（因此产生 llm trace），先收记忆再收 trace
+            await drain_memory_writes()
+            await drain_traces()
 
 
 app = FastAPI(title="第二大脑 Agent", lifespan=lifespan)
@@ -458,6 +470,8 @@ async def api_export() -> JSONResponse:
 
     app_settings 里是 persona 这类用户在界面上写的原文，属于用户数据，一并导出。
     knowledge_gaps 同理：漏洞卡片是用户的学习进度，不导出等于备份丢一半。
+    scheduled_tasks 与 notifications（T5）也是用户数据：任务是他自己设的，通知是任务结果
+    记录；不导出的话，「整库备份」与导出文件对不上。
     """
     async with get_db() as conn:
         data: dict = {
@@ -471,6 +485,8 @@ async def api_export() -> JSONResponse:
             "documents",
             "app_settings",
             "knowledge_gaps",
+            "scheduled_tasks",
+            "notifications",
         ):
             rows = await conn.execute_fetchall(f"SELECT * FROM {table}")
             data[table] = [dict(row) for row in rows]
@@ -689,6 +705,81 @@ async def api_gap_delete(gap_id: int) -> dict:
     if not await delete_gap(gap_id):
         raise HTTPException(status_code=404, detail="漏洞不存在")
     return {"deleted": gap_id}
+
+
+class TaskCreate(BaseModel):
+    """新建定时任务。
+
+    mode 缺省 work（复习、整理这类要产出结果的默认走工作模式）；timezone 不接受客户端
+    指定——创建时记下本机时区，此后 cron 永远按它解释（没有时区选择器）。
+    """
+
+    name: str
+    cron: str
+    prompt: str
+    mode: str | None = None
+
+
+def _machine_timezone() -> str | None:
+    """本机当前时区标识；取不到时返回 None。
+
+    这只影响「任务解释时区是否还是本机时区」的提示，不该让任务列表整体 500。
+    """
+    try:
+        return scheduler.local_timezone_name()
+    except scheduler.TaskConfigError:
+        return None
+
+
+@app.get("/api/tasks")
+async def api_tasks() -> list[dict]:
+    """任务列表。每行带上本机当前时区，前端据此提示「仍在用创建时的时区」。"""
+    machine = _machine_timezone()
+    return [scheduler.task_to_dict(task, machine) for task in await scheduler.list_tasks()]
+
+
+@app.post("/api/tasks", status_code=201)
+async def api_task_create(req: TaskCreate) -> dict:
+    """新建任务。mode 复用 /api/chat 的同一套校验（code 给出「本期未开放」的说明），
+    其余字段的校验与落库在 scheduler.create_task 里收口，坏输入不落库。"""
+    mode = _requested_mode(req.mode) or "work"
+    try:
+        task = await scheduler.create_task(req.name, req.cron, req.prompt, mode=mode)
+    except (scheduler.TaskConfigError, UnknownModeError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return scheduler.task_to_dict(task, _machine_timezone())
+
+
+@app.post("/api/tasks/{task_id}/enable")
+async def api_task_enable(task_id: int) -> dict:
+    if not await scheduler.set_task_enabled(task_id, True):
+        raise HTTPException(status_code=404, detail="任务不存在")
+    return {"enabled": task_id}
+
+
+@app.post("/api/tasks/{task_id}/disable")
+async def api_task_disable(task_id: int) -> dict:
+    """停用只挡后续 occurrence：在途的 fire task 照常跑完并写通知。"""
+    if not await scheduler.set_task_enabled(task_id, False):
+        raise HTTPException(status_code=404, detail="任务不存在")
+    return {"disabled": task_id}
+
+
+@app.delete("/api/tasks/{task_id}")
+async def api_task_delete(task_id: int) -> dict:
+    """删任务本身。它建出来的会话与通知是用户可见的结果，不跟着删。"""
+    if not await scheduler.delete_task(task_id):
+        raise HTTPException(status_code=404, detail="任务不存在")
+    return {"deleted": task_id}
+
+
+@app.get("/api/notifications")
+async def api_notifications(
+    limit: int = Query(scheduler.NOTIFICATION_LIMIT, ge=1, le=scheduler.MAX_NOTIFICATION_LIMIT),
+) -> list[dict]:
+    """最近 N 条任务结果通知（新的在前）。本期没有逐条已读 API：托盘只弹应用启动后新增
+    的记录（进程内 last_notified_id 去重），Web 端只做展示。"""
+    return await scheduler.list_notifications(limit)
 
 
 @app.get("/api/documents")

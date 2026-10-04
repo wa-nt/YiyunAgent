@@ -17,6 +17,13 @@ dependencies = [
     "pymupdf",
     "python-frontmatter",
     "python-multipart",
+    # 定时任务（T5）：cron 表达式解析。tzlocal/tzdata 是同一功能的运行时前提而非可选项——
+    # zoneinfo 在 Windows 上没有系统 tz 数据库（必须带 tzdata），而 Windows 注册表里存的是
+    # "China Standard Time" 这类 Windows 时区 ID，stdlib 没有映射表，只有 tzlocal 能给出
+    # 可用的 IANA 名（如 Asia/Shanghai）。
+    "croniter",
+    "tzlocal",
+    "tzdata",
     "pywebview",
     "pystray",
     "pillow",
