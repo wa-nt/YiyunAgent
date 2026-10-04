@@ -271,7 +271,8 @@ async def test_compaction_inserts_summary_after_memory():
     governed = await ctx.govern_context(view, llm=llm)
 
     assert [m.role for m in governed[:4]] == ["system", "system", "system", "user"]
-    assert governed[0].content == runtime.SYSTEM_PROMPT
+    # system prompt 现在 = 基础 prompt + 模式 prompt（T1），内容更长但位置不变
+    assert runtime.SYSTEM_PROMPT in governed[0].content
     assert governed[1].content == memory
     assert governed[2].content.startswith(ctx.SUMMARY_PREFIX)
     assert governed[-1].content == "新问题"
@@ -577,11 +578,13 @@ def long_view(rounds: int = 6, chars: int = 800) -> list[Message]:
 async def test_token_budget_truncates_within_budget(monkeypatch):
     _governance_off(monkeypatch, budget=True, compaction=False)
     view = long_view()
-    assert ctx.prompt_tokens(view) > 200
+    assert ctx.prompt_tokens(view) > 400
 
-    governed = await ctx.govern_context(view, max_tokens=200)
+    # 预算必须高于「system prompt + 模式 prompt + 当前提问」这条不可再压的下限（T1 起
+    # system prompt 变长），否则更小的档位走到的是下一条用例覆盖的 irreducible floor。
+    governed = await ctx.govern_context(view, max_tokens=400)
 
-    assert ctx.prompt_tokens(governed) <= 200
+    assert ctx.prompt_tokens(governed) <= 400
     # 丢过内容就注明，免得模型把残缺的历史当成全部事实
     assert any(m.content == ctx.TRUNCATION_NOTE for m in governed)
     assert governed[-1].content == "新问题"
@@ -744,7 +747,7 @@ async def test_token_budget_drops_memory_only_as_last_resort(monkeypatch):
     governed = await ctx.govern_context(view, max_tokens=40)
 
     assert memory not in [m.content for m in governed]
-    assert governed[0].content == runtime.SYSTEM_PROMPT
+    assert runtime.SYSTEM_PROMPT in governed[0].content
     assert governed[1].content == ctx.TRUNCATION_NOTE
 
 

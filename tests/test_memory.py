@@ -775,7 +775,9 @@ def test_assemble_messages_inserts_memory_after_system_prompt():
     messages = runtime.assemble_messages(history, "新问题", memory)
 
     assert [m.role for m in messages] == ["system", "system", "user", "user"]
-    assert messages[0].content == runtime.SYSTEM_PROMPT
+    # system prompt 由「基础 prompt + 模式 prompt」拼成（T1），记忆仍是紧随其后的第二条
+    assert runtime.SYSTEM_PROMPT in messages[0].content
+    assert runtime.MODE_PROMPTS["chat"] in messages[0].content
     assert messages[1].content == memory
     assert messages[-1].content == "新问题"
 
@@ -993,6 +995,14 @@ async def test_chat_end_to_end_learns_and_recalls_memory(db, monkeypatch):
 
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        # T1 起带 session_id 的 /api/chat 要求会话已存在（未知 id → 404），先建好会话
+        async with get_db(db) as conn:
+            await conn.execute(
+                "INSERT INTO sessions (id, created_at, mode, source) "
+                "VALUES (?, ?, 'chat', 'manual')",
+                (SESSION, "2026-10-04T09:00:00"),
+            )
+            await conn.commit()
         resp = await client.post("/api/chat", json={"session_id": SESSION, "message": "我喜欢用 Markdown"})
         assert resp.status_code == 200
         await runtime.drain_memory_writes()

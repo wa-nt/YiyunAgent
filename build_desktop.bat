@@ -36,17 +36,26 @@ rem Generate the exe icon (idempotent)
 if errorlevel 1 goto fail
 
 rem --paths .  : entry is inside the app package, so let analysis resolve `app.*`
-rem --add-data  : app/schema.sql is read via Path(__file__) at runtime, not importable
+rem --add-data  : resources are read at runtime via app/resources.py (resource_path),
+rem               not importable. Keep dest identical to the repo layout so both
+rem               environments resolve the same relative path.
 rem --collect-all: pywebview/pythonnet runtimes and sqlite-vec native dll
+rem --collect-data tzdata: Windows has no system tz database, so zoneinfo reads it from
+rem               the tzdata package. Nothing imports tzdata directly (zoneinfo finds it
+rem               through importlib), so PyInstaller's dependency analysis misses it and
+rem               the frozen app cannot resolve any IANA zone - local_timezone_name()
+rem               then fails and every scheduled task breaks.
 %PY% -m PyInstaller --noconfirm --clean --windowed ^
   --name SecondBrainAgent ^
   --icon web\app.ico ^
   --paths . ^
   --add-data "web;web" ^
   --add-data "app\schema.sql;app" ^
+  --add-data "app\agent\prompts\persona_default.md;app\agent\prompts" ^
   --collect-all webview ^
   --collect-all pythonnet ^
   --collect-all sqlite_vec ^
+  --collect-data tzdata ^
   app\desktop.py
 if errorlevel 1 goto fail
 

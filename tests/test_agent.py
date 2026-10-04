@@ -274,11 +274,12 @@ async def test_assemble_messages_is_the_assembly_hook(db, monkeypatch):
     # T7/T8/T11 的治理接入点：替换 assemble_messages 应当影响发给模型的消息
     seen: list[list] = []
 
-    def spy(history, user_message, memory=None, skill_prompt=None):
+    def spy(history, user_message, memory=None, skill_prompt=None, mode=None, persona=None):
         # 该用例的 memories 表是空的，召回无结果；记忆注入在 tests/test_memory.py 覆盖。
         # 这条提问不含任何 skill 触发词，所以 skill_prompt 也是 None（触发注入见
-        # tests/test_skills.py）
+        # tests/test_skills.py）；mode 由 run_agent 从会话读出后传进来（默认 chat）
         assert memory is None and skill_prompt is None
+        assert mode == runtime.DEFAULT_MODE
         msgs = runtime.Message(
             role="system", content="被治理过的 system"
         )
@@ -513,9 +514,20 @@ async def test_chat_streams_sse_with_new_session(client, monkeypatch):
     assert rows[0]["content"] == "什么是 RAG？"
 
 
-async def test_chat_reports_llm_error_as_event(client, monkeypatch):
+async def seed_session_row(db, session_id: str) -> None:
+    """给 /api/chat 备一条已存在的会话：带 session_id 的请求现在必须先存在（T1）。"""
+    async with get_db(db) as conn:
+        await conn.execute(
+            "INSERT INTO sessions (id, created_at, mode, source) VALUES (?, ?, ?, ?)",
+            (session_id, "2026-10-04T09:00:00", "chat", "manual"),
+        )
+        await conn.commit()
+
+
+async def test_chat_reports_llm_error_as_event(client, db, monkeypatch):
     use_llm(monkeypatch, BoomLLM())
     fake_chunks(monkeypatch, [])
+    await seed_session_row(db, "s9")
 
     resp = await client.post("/api/chat", json={"session_id": "s9", "message": "hi"})
     events = parse_sse(resp.text)
@@ -524,7 +536,14 @@ async def test_chat_reports_llm_error_as_event(client, monkeypatch):
     assert resp.status_code == 200
 
 
-async def test_chat_survives_run_agent_exception(client, monkeypatch):
+async def test_chat_unknown_session_is_404(client):
+    resp = await client.post("/api/chat", json={"session_id": "不存在", "message": "hi"})
+
+    assert resp.status_code == 404
+    assert resp.json()["detail"] == "会话不存在"
+
+
+async def test_chat_survives_run_agent_exception(client, db, monkeypatch):
     """run_agent 自己抛（比如装配阶段就崩、写库失败），HTTP 码已经发出去了，
     必须补一个 error 事件，否则前端拿到 200 之后就永远等不到 done。"""
 
@@ -533,6 +552,7 @@ async def test_chat_survives_run_agent_exception(client, monkeypatch):
         raise RuntimeError("装配阶段崩了")
 
     monkeypatch.setattr("app.main.run_agent", boom)
+    await seed_session_row(db, "s1")
 
     resp = await client.post("/api/chat", json={"session_id": "s1", "message": "hi"})
     events = parse_sse(resp.text)

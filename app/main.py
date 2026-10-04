@@ -12,15 +12,25 @@ from fastapi.staticfiles import StaticFiles
 from openai import APIConnectionError, AsyncOpenAI, AuthenticationError, OpenAIError
 from pydantic import BaseModel, Field
 
+from app import autostart, scheduler
 from app.agent.runtime import (
+    DEFAULT_MODE,
+    SUPPORTED_MODES,
+    PersonaUnavailableError,
+    UnknownModeError,
     drain_memory_writes,
     ensure_session,
+    get_session_mode,
     list_messages,
+    load_persona,
     run_agent,
 )
+from app.autostart import AutostartError
 from app.config import EDITABLE_FIELDS, env_path, mask_secret, settings, update_env_file
 from app.db import get_db, init_db
-from app.ingest.pipeline import delete_document, ingest, list_documents
+from app.resources import resource_path
+from app.settings_store import PERSONA_KEY, set_setting
+from app.study.gaps import delete_gap, list_gaps
 from app.tracing import (
     InvalidTimestamp,
     drain_traces,
@@ -30,7 +40,7 @@ from app.tracing import (
 
 logger = logging.getLogger(__name__)
 
-WEB_DIR = Path(__file__).resolve().parent.parent / "web"
+WEB_DIR = resource_path("web")
 
 UPLOAD_SUFFIXES = {".md", ".markdown", ".pdf", ".txt"}
 UPLOAD_MAX_BYTES = 50 * 1024 * 1024  # 固定上限，需要时再做配置
@@ -39,13 +49,24 @@ UPLOAD_MAX_BYTES = 50 * 1024 * 1024  # 固定上限，需要时再做配置
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await init_db()
-    yield
-    # 记忆写入与 trace 写入都是 fire-and-forget（进程内后台任务），退出前给它们一个收尾
-    # 窗口，否则最后几轮对话的记忆与埋点会随进程一起消失。drain 的超时是软上限
-    # （每轮 DRAIN_TIMEOUT，最坏还要加上 sqlite busy timeout），不会无限卡住关闭。
-    # 顺序不能反：记忆抽取自己也会调 LLM（因此产生 llm trace），先收记忆再收 trace
-    await drain_memory_writes()
-    await drain_traces()
+    # 定时任务调度（T5）随应用起停。单进程单 worker 是它的前提：多 worker 会重复触发
+    # （数据库占位只防同一进程内的重复），桌面入口负责单实例。
+    scheduler.start_scheduler()
+    try:
+        yield
+    finally:
+        # 关闭顺序（invariant 8）：先停止接收新任务并取消扫描循环，再等在途 fire task
+        # （超时取消并写通知），最后收尾记忆与 trace 写入。drain 放在 finally 里，保证
+        # 前两步抛错也不会跳过它。
+        try:
+            await scheduler.stop_scheduler()
+        finally:
+            # 记忆写入与 trace 写入都是 fire-and-forget（进程内后台任务），退出前给它们
+            # 一个收尾窗口，否则最后几轮对话的记忆与埋点会随进程一起消失。drain 的超时是
+            # 软上限（每轮 DRAIN_TIMEOUT，最坏还要加上 sqlite busy timeout），不会无限卡住关闭。
+            # 顺序不能反：记忆抽取自己也会调 LLM（因此产生 llm trace），先收记忆再收 trace
+            await drain_memory_writes()
+            await drain_traces()
 
 
 app = FastAPI(title="第二大脑 Agent", lifespan=lifespan)
@@ -58,6 +79,40 @@ class IngestRequest(BaseModel):
 class ChatRequest(BaseModel):
     session_id: str | None = None
     message: str
+    # 模式：None = 未指定（新会话按 chat，已有会话沿用库里的值）。取值不在 pydantic 里
+    # 收窄成 Literal：非法值要统一回 400 并说明原因，Literal 会先把它变成 422 的通用
+    # 校验错误；校验唯一来源是 runtime.SUPPORTED_MODES（见 _requested_mode）。
+    mode: str | None = None
+
+
+def _requested_mode(mode: str | None) -> str | None:
+    """校验请求里的 mode，返回 None（未指定）或合法模式名。
+
+    code 本期只有前端占位，后端照样按非法拒绝并说明原因：前端的 disabled 是 UX，
+    不是安全边界。
+    """
+    if mode is None:
+        return None
+    if mode == "code":
+        raise HTTPException(status_code=400, detail="code 模式本期未开放，请使用 chat 或 work")
+    if mode not in SUPPORTED_MODES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"不支持的模式：{mode}（可选：{'、'.join(SUPPORTED_MODES)}）",
+        )
+    return mode
+
+
+async def _existing_session_mode(session_id: str) -> str | None:
+    """已有会话的模式；会话不存在时返回 None。
+
+    库里的 mode 是未知值时由 get_session_mode 抛 UnknownModeError，交给调用方收口。
+    """
+    async with get_db() as conn:
+        rows = await conn.execute_fetchall("SELECT 1 FROM sessions WHERE id = ?", (session_id,))
+    if not rows:
+        return None
+    return await get_session_mode(session_id)
 
 
 async def _sse_events(events) -> AsyncIterator[str]:
@@ -73,19 +128,27 @@ async def _sse_events(events) -> AsyncIterator[str]:
         yield _sse_line("error", {"message": "生成出错，请重试"})
 
 
-async def _sse(req: ChatRequest):
+async def _sse(req: ChatRequest, new_session_mode: str | None = None):
     """SSE 流：每个 AgentEvent 一行 `data: {json}`。session_id 为空的请求
-    先把新建的 id 作为首个事件发出，前端据此续聊。"""
+    先把新建的 id 连同模式作为首个事件发出，前端据此续聊。
+
+    new_session_mode 只在「请求没带 session_id、由本函数新建会话」时用得上；已有会话
+    与补建路径都不给 run_agent 传 mode（模式以库里的为准，见 run_agent）。
+    """
+    created_mode: str | None = None
     try:
         if not req.session_id:
-            req.session_id = await ensure_session(None)
-            yield _sse_line("session", {"session_id": req.session_id})
+            created_mode = new_session_mode or DEFAULT_MODE
+            req.session_id = await ensure_session(None, mode=created_mode)
+            yield _sse_line("session", {"session_id": req.session_id, "mode": created_mode})
     except Exception:
         # 建会话失败同样只能补 error 事件：HTTP 状态码已发出，不能让前端干等
         logger.exception("创建会话失败")
         yield _sse_line("error", {"message": "生成出错，请重试"})
         return
-    async for line in _sse_events(run_agent(req.session_id, req.message)):
+    # 只有刚新建的会话显式传 mode：其余路径交给 run_agent 从会话读，避免两个来源打架
+    extra = {"mode": created_mode} if created_mode else {}
+    async for line in _sse_events(run_agent(req.session_id, req.message, **extra)):
         yield line
 
 
@@ -104,7 +167,25 @@ def _sse_response(lines: AsyncIterator[str]) -> StreamingResponse:
 
 @app.post("/api/chat")
 async def chat(req: ChatRequest) -> StreamingResponse:
-    return _sse_response(_sse(req))
+    """聊天入口。新会话（不带 session_id）用请求里的 mode（缺省 chat）建立会话，
+    session 事件把它回给前端；已有会话一律按库里的 mode 跑，请求带的 mode 只用来
+    校验一致性——不一致说明前端拿着另一个模式的会话在聊，回 409 而不是偷偷改模式。
+    不存在的 session_id 一律 404：补建只发生在不带 session_id 的新会话路径，
+    带 id 的请求代表「续这个会话」，认不出来就该让前端知道。"""
+    mode = _requested_mode(req.mode)
+    if req.session_id is not None:
+        try:
+            session_mode = await _existing_session_mode(req.session_id)
+        except UnknownModeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        if session_mode is None:
+            raise HTTPException(status_code=404, detail="会话不存在")
+        if mode is not None and mode != session_mode:
+            raise HTTPException(
+                status_code=409,
+                detail=f"会话模式为 {session_mode}，不能按 {mode} 继续（模式在创建会话时固定）",
+            )
+    return _sse_response(_sse(req, new_session_mode=mode or DEFAULT_MODE))
 
 
 @app.post("/api/sessions/{session_id}/respond")
@@ -113,7 +194,8 @@ async def respond(session_id: str, mid: int | None = None) -> StreamingResponse:
 
     mid 给出时先把 active_leaf 切到那条提问上（重新生成 = 回到提问再答一次，
     旧回答留在自己的分支上不动）；不给则用当前叶子。叶子必须是 user 消息。
-    与 /api/chat 的差别只在不再插入用户消息——提问已经由调用方写好了。
+    与 /api/chat 的差别只在不再插入用户消息——提问已经由调用方写好了；模式同样不传，
+    由 run_agent 从会话读。
     """
     async with get_db() as conn:
         if mid is not None:
@@ -153,12 +235,15 @@ def _like_escape(q: str) -> str:
 
 @app.get("/api/sessions")
 async def api_sessions(q: str = "") -> list[dict]:
-    """会话列表，最近活跃在前。title 优先用户改名 / 自动标题，回退首条 user 消息前 30 字。
+    """会话列表，最近活跃在前。title 优先用户改名 / 自动标题，回退首条 user 消息前 30 字；
+    带上 mode 与 source，前端据此显示模式、区分定时任务创建的自动会话。NULL 按迁移口径
+    归一（chat / manual），列表读到的 mode、source 因此永远是合法值。
     q 命中标题或任意一条消息内容的会话才返回（LIKE 子串匹配，量大了再考虑 FTS）。"""
     like = f"%{_like_escape(q)}%" if q else ""
     async with get_db() as conn:
         rows = await conn.execute_fetchall(
             "SELECT s.id, s.created_at, s.provider, s.model, "
+            "COALESCE(s.mode, 'chat') AS mode, COALESCE(s.source, 'manual') AS source, "
             "COALESCE(s.title, (SELECT substr(content, 1, 30) FROM messages "
             "WHERE session_id = s.id AND role = 'user' ORDER BY id LIMIT 1), '') AS title, "
             "(SELECT COUNT(*) FROM messages WHERE session_id = s.id) AS message_count "
@@ -380,14 +465,29 @@ async def api_memory_delete(memory_id: int) -> dict:
 
 @app.get("/api/export")
 async def api_export() -> JSONResponse:
-    """用户数据导出（会话/消息/记忆/文档清单）。chunks 与向量是可从文档重建的
-    派生数据，不进导出文件；要完整备份请用 /api/export/db。"""
+    """用户数据导出（会话/消息/记忆/文档清单/设置）。chunks 与向量是可从文档重建的
+    派生数据，不进导出文件；要完整备份请用 /api/export/db。
+
+    app_settings 里是 persona 这类用户在界面上写的原文，属于用户数据，一并导出。
+    knowledge_gaps 同理：漏洞卡片是用户的学习进度，不导出等于备份丢一半。
+    scheduled_tasks 与 notifications（T5）也是用户数据：任务是他自己设的，通知是任务结果
+    记录；不导出的话，「整库备份」与导出文件对不上。
+    """
     async with get_db() as conn:
         data: dict = {
             "version": 1,
             "exported_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         }
-        for table in ("sessions", "messages", "memories", "documents"):
+        for table in (
+            "sessions",
+            "messages",
+            "memories",
+            "documents",
+            "app_settings",
+            "knowledge_gaps",
+            "scheduled_tasks",
+            "notifications",
+        ):
             rows = await conn.execute_fetchall(f"SELECT * FROM {table}")
             data[table] = [dict(row) for row in rows]
     return JSONResponse(
@@ -529,6 +629,34 @@ async def api_chunk(chunk_id: int) -> dict:
     return dict(rows[0])
 
 
+# ---------- 惰性导入：app.ingest.pipeline（T7 启动优化） ----------
+#
+# 这是 `import app.main` 里最大的一块启动成本：pipeline → loaders 顶层导入 pymupdf
+# （实测累计 ~77ms）与 httpx，而这两个库只在**真正导入/查看文档**时才用得上。
+# 数据库、检索、调度这些每轮对话都要走的路不动（brief：不盲目延迟核心 runtime/config）。
+#
+# 为什么是薄包装函数而不是模块级 __getattr__（PEP 562）：__getattr__ 只在**属性访问**
+# 时触发，函数体里的全局名查找不走它（实测 NameError）。包装函数既让延迟导入生效，
+# 也保住了既有测试口径 `monkeypatch.setattr("app.main.ingest", fake)`——替换的仍是
+# 模块上同名的那一个属性，路由读的也是它。
+def ingest(source: str | Path, db_path: str | Path | None = None) -> int:
+    from app.ingest.pipeline import ingest as _ingest
+
+    return _ingest(source, db_path)
+
+
+async def list_documents(db_path: str | Path | None = None) -> list[dict]:
+    from app.ingest.pipeline import list_documents as _list_documents
+
+    return await _list_documents(db_path)
+
+
+async def delete_document(doc_id: int, db_path: str | Path | None = None) -> None:
+    from app.ingest.pipeline import delete_document as _delete_document
+
+    await _delete_document(doc_id, db_path)
+
+
 @app.post("/api/ingest")
 async def api_ingest(req: IngestRequest) -> dict:
     """按 source 导入。非 URL 的来源只能是数据目录内的文件。
@@ -590,6 +718,98 @@ async def api_memories() -> list[dict]:
     return [dict(row) for row in rows]
 
 
+@app.get("/api/gaps")
+async def api_gaps(all_: bool = Query(False, alias="all")) -> list[dict]:
+    """知识漏洞卡片，按到期时间升序。
+
+    默认只返回已到期的（`?all=false`，给「今天该复习什么」用）；`?all=true` 返回全部，
+    含还没到期的。
+    """
+    return await list_gaps(due_only=not all_)
+
+
+@app.delete("/api/gaps/{gap_id}")
+async def api_gap_delete(gap_id: int) -> dict:
+    if not await delete_gap(gap_id):
+        raise HTTPException(status_code=404, detail="漏洞不存在")
+    return {"deleted": gap_id}
+
+
+class TaskCreate(BaseModel):
+    """新建定时任务。
+
+    mode 缺省 work（复习、整理这类要产出结果的默认走工作模式）；timezone 不接受客户端
+    指定——创建时记下本机时区，此后 cron 永远按它解释（没有时区选择器）。
+    """
+
+    name: str
+    cron: str
+    prompt: str
+    mode: str | None = None
+
+
+def _machine_timezone() -> str | None:
+    """本机当前时区标识；取不到时返回 None。
+
+    这只影响「任务解释时区是否还是本机时区」的提示，不该让任务列表整体 500。
+    """
+    try:
+        return scheduler.local_timezone_name()
+    except scheduler.TaskConfigError:
+        return None
+
+
+@app.get("/api/tasks")
+async def api_tasks() -> list[dict]:
+    """任务列表。每行带上本机当前时区，前端据此提示「仍在用创建时的时区」。"""
+    machine = _machine_timezone()
+    return [scheduler.task_to_dict(task, machine) for task in await scheduler.list_tasks()]
+
+
+@app.post("/api/tasks", status_code=201)
+async def api_task_create(req: TaskCreate) -> dict:
+    """新建任务。mode 复用 /api/chat 的同一套校验（code 给出「本期未开放」的说明），
+    其余字段的校验与落库在 scheduler.create_task 里收口，坏输入不落库。"""
+    mode = _requested_mode(req.mode) or "work"
+    try:
+        task = await scheduler.create_task(req.name, req.cron, req.prompt, mode=mode)
+    except (scheduler.TaskConfigError, UnknownModeError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return scheduler.task_to_dict(task, _machine_timezone())
+
+
+@app.post("/api/tasks/{task_id}/enable")
+async def api_task_enable(task_id: int) -> dict:
+    if not await scheduler.set_task_enabled(task_id, True):
+        raise HTTPException(status_code=404, detail="任务不存在")
+    return {"enabled": task_id}
+
+
+@app.post("/api/tasks/{task_id}/disable")
+async def api_task_disable(task_id: int) -> dict:
+    """停用只挡后续 occurrence：在途的 fire task 照常跑完并写通知。"""
+    if not await scheduler.set_task_enabled(task_id, False):
+        raise HTTPException(status_code=404, detail="任务不存在")
+    return {"disabled": task_id}
+
+
+@app.delete("/api/tasks/{task_id}")
+async def api_task_delete(task_id: int) -> dict:
+    """删任务本身。它建出来的会话与通知是用户可见的结果，不跟着删。"""
+    if not await scheduler.delete_task(task_id):
+        raise HTTPException(status_code=404, detail="任务不存在")
+    return {"deleted": task_id}
+
+
+@app.get("/api/notifications")
+async def api_notifications(
+    limit: int = Query(scheduler.NOTIFICATION_LIMIT, ge=1, le=scheduler.MAX_NOTIFICATION_LIMIT),
+) -> list[dict]:
+    """最近 N 条任务结果通知（新的在前）。本期没有逐条已读 API：托盘只弹应用启动后新增
+    的记录（进程内 last_notified_id 去重），Web 端只做展示。"""
+    return await scheduler.list_notifications(limit)
+
+
 @app.get("/api/documents")
 async def api_documents() -> list[dict]:
     return await list_documents()
@@ -642,7 +862,14 @@ async def api_traces_summary(
 
 
 class SettingsUpdate(BaseModel):
-    """设置面板的可编辑字段（全集见 config.EDITABLE_FIELDS）。api_key 留空 = 保持现状。"""
+    """设置面板的可编辑字段（.env 全集见 config.EDITABLE_FIELDS）。api_key 留空 = 保持现状。
+
+    persona 与 autostart 是两个例外，都不进 .env：
+    - persona 是多行用户数据，存 SQLite（app_settings）；
+    - autostart 是注册表状态（app/autostart.py），进 .env 只会变成一次静默回退。
+
+    None = 本次不动它；persona 空字符串 = 用户明确不要人格。
+    """
 
     llm_provider: Literal["openai_compat", "anthropic"] | None = None
     openai_base_url: str | None = None
@@ -654,15 +881,39 @@ class SettingsUpdate(BaseModel):
     embed_api_key: str | None = None
     embed_model: str | None = None
     embed_dim: int | None = Field(default=None, gt=0)
+    persona: str | None = None
+    autostart: bool | None = None
 
 
 # 密钥字段不接受空串覆盖：清空密钥属于破坏性操作，让它只能去改 .env 完成
 _SECRET_FIELDS = {"openai_api_key", "anthropic_api_key", "embed_api_key"}
 
 
+def _autostart_state() -> bool:
+    """自启当前是否打开。
+
+    源码环境不读注册表：开关在界面上本来就是禁用的，读出来的值没有意义（而且注册表里
+    可能还留着上一次打包版写的项，显示成「已开启」会让人以为这个环境真会自启）。
+    注册表读不到（权限/策略）也只回 False——自启是可选功能，不该把整个设置面板变成 500。
+    """
+    if not autostart.is_supported:
+        return False
+    try:
+        return autostart.is_enabled()
+    except AutostartError as exc:
+        logger.warning("读取自启状态失败：%s", exc)
+        return False
+
+
 @app.get("/api/settings")
 async def api_settings_get() -> dict:
-    """当前模型 / embedding 配置，密钥脱敏回显（只露末 4 位）。"""
+    """当前模型 / embedding 配置，密钥脱敏回显（只露末 4 位）；persona 是多行用户数据，
+    原样返回（没设置过时就是默认人格文件的内容）；autostart 是注册表当前状态 + 是否支持。"""
+    try:
+        persona = await load_persona()
+    except PersonaUnavailableError as exc:
+        # 默认人格文件缺失是安装/打包问题：把原因说清楚，不要伪装成空人格
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
     return {
         "llm_provider": settings.llm_provider,
         "openai_base_url": settings.openai_base_url or "",
@@ -674,6 +925,9 @@ async def api_settings_get() -> dict:
         "embed_api_key": mask_secret(settings.embed_api_key),
         "embed_model": settings.embed_model or "",
         "embed_dim": settings.embed_dim,
+        "persona": persona,
+        "autostart": _autostart_state(),
+        "autostart_supported": autostart.is_supported,
     }
 
 
@@ -684,6 +938,14 @@ async def api_settings_update(req: SettingsUpdate) -> dict:
     LLM / embedding 客户端都是每次调用时新建（llm/__init__.py、llm/embed.py），
     所以保存立即生效，无需重启。注意 embed_dim 只影响之后写入的向量：与现有
     vec0 表维度不一致时检索会报错，前端已提示需重新导入文档。
+
+    persona 走另一条路：原文 UPSERT 进 SQLite。它不进 .env（多行文本会被写坏），
+    也不受下面「供应商配置必须齐全」的校验影响——那是模型配置的约束，跟人格无关，
+    但提交时字段缺失（None）表示这次不改人格。
+
+    autostart 同样特判：它写的是注册表（app/autostart.py），不是配置项。源码环境明确
+    拒绝 true（只提示「仅打包版可用」，不静默忽略——用户以为开了才是真问题），
+    false 一律成功（关掉一个本来就关着的开关不该报错）。
     """
     updates: dict = {}
     for name in EDITABLE_FIELDS:
@@ -706,7 +968,26 @@ async def api_settings_update(req: SettingsUpdate) -> dict:
         update_env_file(env_path(), {n: str(v) for n, v in updates.items()})
         for name, value in updates.items():
             setattr(settings, name, value)
-    return {"updated": sorted(updates)}
+
+    updated = sorted(updates)
+    if req.persona is not None:
+        await set_setting(PERSONA_KEY, req.persona)
+        updated.append(PERSONA_KEY)
+    if req.autostart is not None:
+        # 先判支持再动手：不支持的请求不许留下任何副作用
+        if req.autostart and not autostart.is_supported:
+            raise HTTPException(
+                status_code=400, detail="开机自启仅打包版可用，源码环境请用快捷方式或任务计划"
+            )
+        try:
+            if req.autostart:
+                autostart.enable()
+            else:
+                autostart.disable()
+        except AutostartError as exc:
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+        updated.append("autostart")
+    return {"updated": sorted(updated)}
 
 
 class ModelListRequest(BaseModel):

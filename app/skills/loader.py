@@ -46,9 +46,14 @@ TOOLS_FILE = "tools.py"
 SKILL_ENCODING = "utf-8-sig"
 
 # runtime 自己拥有的工具名，skill 不得占用（占用会让 skill 的同名实现永远不可达）。
-# 改动 app/agent/runtime.py 的 SEARCH_TOOL.name 时必须同步这里——tests/test_skills.py
-# 有一条用例把两者钉在一起，漂移会当场变红。
-RESERVED_TOOL_NAMES = frozenset({"search_knowledge"})
+# 名单 = runtime.MODE_TOOLS 里所有内置工具名：search_knowledge 现在就在用，
+# record_knowledge_gap / review_knowledge_gap 是 work 模式白名单里的内置工具（T3 接上
+# 实现）——在实现落地之前就保留名字，skill 才不能抢先用同名工具把它顶掉。
+# 改动 app/agent/runtime.py 的工具名时必须同步这里——tests/test_skills.py
+# 有两条用例把两侧钉在一起，漂移会当场变红。
+RESERVED_TOOL_NAMES = frozenset(
+    {"search_knowledge", "record_knowledge_gap", "review_knowledge_gap"}
+)
 
 # skill 专用工具的调用约定，与 app/agent/runtime.py 的 execute_tool 同一口径：
 # 入参 (工具参数, db_path)，返回 (结果文本, 展示用摘要)
