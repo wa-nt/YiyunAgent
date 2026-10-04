@@ -17,6 +17,11 @@ PyInstaller 打包后先把 CWD 锚到 exe 所在目录——从源码跑时则�
     不影响窗口和 Web 端的任务管理。pystray 不可用时整个托盘功能降级为纯窗口模式——这时
     点 X 是真退出（藏进一个不存在的托盘 = 窗口和进程一起失联）。
 
+单实例（T7）
+    调度器的幂等只防同一进程内的重复触发（数据库占位挡不住跨进程），两个实例同时跑就会
+    各跑一遍 cron。所以启动时先取一个具名内核互斥体（acquire_single_instance），第二个
+    实例在起服务之前就弹框退出。放在最前面是有意的：此刻还没建库、没起调度循环。
+
 用法：
     python -m app.desktop              启动桌面端
     python -m app.desktop --make-icon  生成 web/app.ico（build_desktop.bat 打包前用）
@@ -41,6 +46,56 @@ logger = logging.getLogger(__name__)
 NOTIFY_POLL_INTERVAL = 5.0
 NOTIFY_LIMIT = 50
 NOTIFY_BUSY_TIMEOUT_MS = 5000
+
+# 单实例互斥体（T5/T6 交接）：调度器的幂等只防同一进程内的重复触发，两个实例同时跑就会
+# 各跑一遍 cron（数据库占位挡不住跨进程）。用一个具名内核互斥体把第二个实例挡在启动阶段，
+# 而不是让它起完服务再发现端口/调度冲突。名字带 Local\ 前缀 = 只在当前用户会话内生效，
+# 不干扰多用户同时登录的场景（本应用只影响自己的数据目录）。
+INSTANCE_MUTEX_NAME = r"Local\SecondBrainAgent.single-instance"
+# 已持有的互斥体句柄。进程存活期间必须一直持有（关掉就等于放弃单实例），
+# 所以只在模块级保存引用，由进程退出时释放。
+_instance_handle = None
+
+
+def _create_mutex(name: str) -> tuple[object, bool]:
+    """CreateMutexW，返回 (句柄, 是否已存在)。单独成函数便于测试替换。"""
+    import ctypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateMutexW.argtypes = (ctypes.c_void_p, ctypes.c_bool, ctypes.c_wchar_p)
+    kernel32.CreateMutexW.restype = ctypes.c_void_p
+    handle = kernel32.CreateMutexW(None, False, name)
+    # 不能只看句柄：CreateMutex 对已存在的名字同样返回有效句柄，靠 GetLastError 区分
+    already = ctypes.get_last_error() == 183  # ERROR_ALREADY_EXISTS
+    if not handle:
+        raise OSError(f"创建互斥体失败：{ctypes.get_last_error()}")
+    return handle, already
+
+
+def _close_mutex(handle: object) -> None:
+    import ctypes
+
+    ctypes.WinDLL("kernel32", use_last_error=True).CloseHandle(ctypes.c_void_p(handle))
+
+
+def acquire_single_instance() -> bool:
+    """取单实例锁；已经有一个实例在跑时返回 False。
+
+    非 Windows 直接放行（本期的打包目标只有 Windows，其他平台不引入第二套锁）。
+    同一进程内重复调用也放行——已经持有互斥体，再建一次会把自己误判成「另一个实例」。
+    """
+    global _instance_handle
+    if _instance_handle is not None:
+        return True
+    if sys.platform != "win32":
+        return True
+    handle, already = _create_mutex(INSTANCE_MUTEX_NAME)
+    if already:
+        # 拿到的这个句柄要关掉，否则每拒绝一次就泄漏一个内核对象
+        _close_mutex(handle)
+        return False
+    _instance_handle = handle
+    return True
 
 
 def _free_port() -> int:
@@ -242,6 +297,11 @@ def main() -> None:
         # PyInstaller 包：把 .env / data/ / skills/ 的相对路径口径锚到 exe 旁边，
         # 这样无论从快捷方式、任务栏还是资源管理器启动行为都一致
         os.chdir(os.path.dirname(sys.executable))
+
+    # 单实例闸门放在起服务之前：第二个实例此刻还没建库、没起调度循环，直接退出最干净。
+    # 放行后再重复启动一次也不会重复触发 cron（T5 的幂等只覆盖同进程）。
+    if not acquire_single_instance():
+        _fatal("第二大脑 Agent 已经在运行了。\n\n请到托盘图标菜单里操作，不要重复启动。")
 
     import webview
 

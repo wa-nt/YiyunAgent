@@ -12,7 +12,7 @@ from fastapi.staticfiles import StaticFiles
 from openai import APIConnectionError, AsyncOpenAI, AuthenticationError, OpenAIError
 from pydantic import BaseModel, Field
 
-from app import scheduler
+from app import autostart, scheduler
 from app.agent.runtime import (
     DEFAULT_MODE,
     SUPPORTED_MODES,
@@ -25,9 +25,9 @@ from app.agent.runtime import (
     load_persona,
     run_agent,
 )
+from app.autostart import AutostartError
 from app.config import EDITABLE_FIELDS, env_path, mask_secret, settings, update_env_file
 from app.db import get_db, init_db
-from app.ingest.pipeline import delete_document, ingest, list_documents
 from app.resources import resource_path
 from app.settings_store import PERSONA_KEY, set_setting
 from app.study.gaps import delete_gap, list_gaps
@@ -629,6 +629,34 @@ async def api_chunk(chunk_id: int) -> dict:
     return dict(rows[0])
 
 
+# ---------- 惰性导入：app.ingest.pipeline（T7 启动优化） ----------
+#
+# 这是 `import app.main` 里最大的一块启动成本：pipeline → loaders 顶层导入 pymupdf
+# （实测累计 ~77ms）与 httpx，而这两个库只在**真正导入/查看文档**时才用得上。
+# 数据库、检索、调度这些每轮对话都要走的路不动（brief：不盲目延迟核心 runtime/config）。
+#
+# 为什么是薄包装函数而不是模块级 __getattr__（PEP 562）：__getattr__ 只在**属性访问**
+# 时触发，函数体里的全局名查找不走它（实测 NameError）。包装函数既让延迟导入生效，
+# 也保住了既有测试口径 `monkeypatch.setattr("app.main.ingest", fake)`——替换的仍是
+# 模块上同名的那一个属性，路由读的也是它。
+def ingest(source: str | Path, db_path: str | Path | None = None) -> int:
+    from app.ingest.pipeline import ingest as _ingest
+
+    return _ingest(source, db_path)
+
+
+async def list_documents(db_path: str | Path | None = None) -> list[dict]:
+    from app.ingest.pipeline import list_documents as _list_documents
+
+    return await _list_documents(db_path)
+
+
+async def delete_document(doc_id: int, db_path: str | Path | None = None) -> None:
+    from app.ingest.pipeline import delete_document as _delete_document
+
+    await _delete_document(doc_id, db_path)
+
+
 @app.post("/api/ingest")
 async def api_ingest(req: IngestRequest) -> dict:
     """按 source 导入。非 URL 的来源只能是数据目录内的文件。
@@ -836,8 +864,11 @@ async def api_traces_summary(
 class SettingsUpdate(BaseModel):
     """设置面板的可编辑字段（.env 全集见 config.EDITABLE_FIELDS）。api_key 留空 = 保持现状。
 
-    persona 是唯一的例外：它是多行用户数据，存 SQLite（app_settings）而不是 .env，
-    所以不在 EDITABLE_FIELDS 里。None = 本次不动它；空字符串 = 用户明确不要人格。
+    persona 与 autostart 是两个例外，都不进 .env：
+    - persona 是多行用户数据，存 SQLite（app_settings）；
+    - autostart 是注册表状态（app/autostart.py），进 .env 只会变成一次静默回退。
+
+    None = 本次不动它；persona 空字符串 = 用户明确不要人格。
     """
 
     llm_provider: Literal["openai_compat", "anthropic"] | None = None
@@ -851,16 +882,33 @@ class SettingsUpdate(BaseModel):
     embed_model: str | None = None
     embed_dim: int | None = Field(default=None, gt=0)
     persona: str | None = None
+    autostart: bool | None = None
 
 
 # 密钥字段不接受空串覆盖：清空密钥属于破坏性操作，让它只能去改 .env 完成
 _SECRET_FIELDS = {"openai_api_key", "anthropic_api_key", "embed_api_key"}
 
 
+def _autostart_state() -> bool:
+    """自启当前是否打开。
+
+    源码环境不读注册表：开关在界面上本来就是禁用的，读出来的值没有意义（而且注册表里
+    可能还留着上一次打包版写的项，显示成「已开启」会让人以为这个环境真会自启）。
+    注册表读不到（权限/策略）也只回 False——自启是可选功能，不该把整个设置面板变成 500。
+    """
+    if not autostart.is_supported:
+        return False
+    try:
+        return autostart.is_enabled()
+    except AutostartError as exc:
+        logger.warning("读取自启状态失败：%s", exc)
+        return False
+
+
 @app.get("/api/settings")
 async def api_settings_get() -> dict:
     """当前模型 / embedding 配置，密钥脱敏回显（只露末 4 位）；persona 是多行用户数据，
-    原样返回（没设置过时就是默认人格文件的内容）。"""
+    原样返回（没设置过时就是默认人格文件的内容）；autostart 是注册表当前状态 + 是否支持。"""
     try:
         persona = await load_persona()
     except PersonaUnavailableError as exc:
@@ -878,6 +926,8 @@ async def api_settings_get() -> dict:
         "embed_model": settings.embed_model or "",
         "embed_dim": settings.embed_dim,
         "persona": persona,
+        "autostart": _autostart_state(),
+        "autostart_supported": autostart.is_supported,
     }
 
 
@@ -892,6 +942,10 @@ async def api_settings_update(req: SettingsUpdate) -> dict:
     persona 走另一条路：原文 UPSERT 进 SQLite。它不进 .env（多行文本会被写坏），
     也不受下面「供应商配置必须齐全」的校验影响——那是模型配置的约束，跟人格无关，
     但提交时字段缺失（None）表示这次不改人格。
+
+    autostart 同样特判：它写的是注册表（app/autostart.py），不是配置项。源码环境明确
+    拒绝 true（只提示「仅打包版可用」，不静默忽略——用户以为开了才是真问题），
+    false 一律成功（关掉一个本来就关着的开关不该报错）。
     """
     updates: dict = {}
     for name in EDITABLE_FIELDS:
@@ -919,6 +973,20 @@ async def api_settings_update(req: SettingsUpdate) -> dict:
     if req.persona is not None:
         await set_setting(PERSONA_KEY, req.persona)
         updated.append(PERSONA_KEY)
+    if req.autostart is not None:
+        # 先判支持再动手：不支持的请求不许留下任何副作用
+        if req.autostart and not autostart.is_supported:
+            raise HTTPException(
+                status_code=400, detail="开机自启仅打包版可用，源码环境请用快捷方式或任务计划"
+            )
+        try:
+            if req.autostart:
+                autostart.enable()
+            else:
+                autostart.disable()
+        except AutostartError as exc:
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+        updated.append("autostart")
     return {"updated": sorted(updated)}
 
 
