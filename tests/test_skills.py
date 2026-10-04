@@ -406,13 +406,17 @@ def test_reserved_tool_name_is_rejected(skills_root, caplog):
 def test_reserved_names_match_runtime_search_tool():
     """RESERVED_TOOL_NAMES 必须覆盖 runtime 真正拥有的工具名。
 
-    这份名单是手写的：runtime 改了 SEARCH_TOOL.name 而这里没跟上，m2 的守卫就静默
-    失效（重名工具又能注册进来了）。这条用例把两侧钉在一起。
+    这份名单是手写的：runtime 改了工具名而这里没跟上，m2 的守卫就静默失效（重名工具
+    又能注册进来了）。这条用例把两侧钉在一起——包括 T1 写进 work 白名单、T3 才实现
+    的两个漏洞工具。
     """
-    from app.agent.runtime import SEARCH_TOOL
+    from app.agent.runtime import MODE_TOOLS, SEARCH_TOOL
     from app.skills.loader import RESERVED_TOOL_NAMES
 
     assert SEARCH_TOOL.name in RESERVED_TOOL_NAMES
+    assert {
+        name for names in MODE_TOOLS.values() for name in names
+    } <= RESERVED_TOOL_NAMES
 
 
 def test_duplicate_tool_in_same_tools_py_keeps_first(skills_root, caplog):
@@ -949,6 +953,14 @@ async def test_chat_end_to_end_triggers_resume_writing(db, monkeypatch, tmp_path
 
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        # T1 起带 session_id 的 /api/chat 要求会话已存在（未知 id → 404），先建好会话
+        async with get_db(db) as conn:
+            await conn.execute(
+                "INSERT INTO sessions (id, created_at, mode, source) "
+                "VALUES (?, ?, 'chat', 'manual')",
+                (SESSION, "2026-10-04T09:00:00"),
+            )
+            await conn.commit()
         resp = await client.post(
             "/api/chat", json={"session_id": SESSION, "message": "帮我优化简历"}
         )

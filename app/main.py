@@ -152,7 +152,9 @@ def _sse_response(lines: AsyncIterator[str]) -> StreamingResponse:
 async def chat(req: ChatRequest) -> StreamingResponse:
     """聊天入口。新会话（不带 session_id）用请求里的 mode（缺省 chat）建立会话，
     session 事件把它回给前端；已有会话一律按库里的 mode 跑，请求带的 mode 只用来
-    校验一致性——不一致说明前端拿着另一个模式的会话在聊，回 409 而不是偷偷改模式。"""
+    校验一致性——不一致说明前端拿着另一个模式的会话在聊，回 409 而不是偷偷改模式。
+    不存在的 session_id 一律 404：补建只发生在不带 session_id 的新会话路径，
+    带 id 的请求代表「续这个会话」，认不出来就该让前端知道。"""
     mode = _requested_mode(req.mode)
     if req.session_id is not None:
         try:
@@ -160,11 +162,8 @@ async def chat(req: ChatRequest) -> StreamingResponse:
         except UnknownModeError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         if session_mode is None:
-            # 未知 id：老调用方（含测试）一直靠 run_agent 里的 ensure_session 补建，
-            # 只有显式声明了 mode 的请求才按「指错了会话」处理
-            if mode is not None:
-                raise HTTPException(status_code=404, detail="会话不存在")
-        elif mode is not None and mode != session_mode:
+            raise HTTPException(status_code=404, detail="会话不存在")
+        if mode is not None and mode != session_mode:
             raise HTTPException(
                 status_code=409,
                 detail=f"会话模式为 {session_mode}，不能按 {mode} 继续（模式在创建会话时固定）",

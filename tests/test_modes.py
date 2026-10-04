@@ -16,7 +16,7 @@ import pytest
 
 from app.agent import runtime
 from app.db import get_db, init_db
-from app.llm.types import ChatResult, StreamChunk, ToolCall
+from app.llm.types import ChatResult, StreamChunk, ToolCall, ToolDef
 from app.main import app
 from app.memory import writer as memory_writer
 
@@ -218,13 +218,22 @@ async def test_existing_chat_session_rejects_work_mode(client, db):
     assert resp.status_code == 409
 
 
-async def test_unknown_session_with_explicit_mode_is_404(client, db):
-    """带 mode 的请求是「续某个已存在会话」的显式声明，未知 id 直接 404。"""
+async def test_unknown_session_is_404(client, db):
+    """带 session_id 的请求 = 「续这个会话」，未知 id 一律 404（补建只走新建会话路径）。
+
+    不论请求有没有带 mode：认不出来的会话都该让前端知道，而不是偷偷建一条新的。
+    """
+    assert (
+        await client.post("/api/chat", json={"session_id": "nope", "message": "hi"})
+    ).status_code == 404
     resp = await client.post(
         "/api/chat", json={"session_id": "nope", "message": "hi", "mode": "work"}
     )
-
     assert resp.status_code == 404
+    # 404 是真的没建会话：库里不该多出一行
+    async with get_db(db) as conn:
+        rows = await conn.execute_fetchall("SELECT id FROM sessions")
+    assert rows == []
 
 
 # ---------- respond：模式同样从会话读 ----------
@@ -356,21 +365,46 @@ def test_mode_tools_whitelist():
     }
 
 
-def test_chat_mode_tools_exclude_gap_tools():
-    names = [tool.name for tool in runtime.tools_for_mode("chat")]
+FAKE_GAP_TOOL = ToolDef(
+    name="record_knowledge_gap",
+    description="记录知识漏洞（测试替身，T3 才实现）",
+    parameters={"type": "object", "properties": {"topic": {"type": "string"}}},
+)
 
-    assert names == ["search_knowledge"]
-    assert "search_knowledge" in [tool.name for tool in runtime.tools_for_mode("work")]
+
+def test_tools_for_mode_filters_by_whitelist(monkeypatch):
+    """白名单真的在过滤，而不是「BUILTIN_TOOLS 里恰好没有 gap 工具」。
+
+    注入一个 gap 名字的工具定义，让 chat / work 的差别真正来自 MODE_TOOLS：T3 接上
+    真实现后这条断言仍然成立（chat 永远只有 search_knowledge）。
+    """
+    monkeypatch.setattr(runtime, "BUILTIN_TOOLS", [*runtime.BUILTIN_TOOLS, FAKE_GAP_TOOL])
+
+    chat_names = [tool.name for tool in runtime.tools_for_mode("chat")]
+    work_names = [tool.name for tool in runtime.tools_for_mode("work")]
+
+    assert chat_names == ["search_knowledge"]
+    assert chat_names.count(FAKE_GAP_TOOL.name) == 0
+    assert FAKE_GAP_TOOL.name in work_names
+    assert "search_knowledge" in work_names
 
 
-async def test_chat_run_agent_offers_only_chat_tools(db, monkeypatch):
+async def test_run_agent_offers_only_the_current_modes_tools(db, monkeypatch):
+    """端到端同一件事：注入 gap 工具后，chat 会话看不到它，work 会话拿得到。"""
+    monkeypatch.setattr(runtime, "BUILTIN_TOOLS", [*runtime.BUILTIN_TOOLS, FAKE_GAP_TOOL])
     await seed_session(db, SESSION, "chat")
+    await seed_session(db, WORK_SESSION, "work")
     llm = FakeLLM()
     use_llm(monkeypatch, llm)
 
     [event async for event in runtime.run_agent(SESSION, "什么是 RAG？", str(db))]
+    [event async for event in runtime.run_agent(WORK_SESSION, "继续", str(db))]
 
-    assert [tool.name for tool in llm.tools[0]] == ["search_knowledge"]
+    chat_tools = [tool.name for tool in llm.tools[0]]
+    work_tools = [tool.name for tool in llm.tools[1]]
+    assert "search_knowledge" in chat_tools
+    assert FAKE_GAP_TOOL.name not in chat_tools
+    assert FAKE_GAP_TOOL.name in work_tools
 
 
 async def test_chat_dispatch_refuses_gap_tool_call(db):
