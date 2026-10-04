@@ -9,12 +9,13 @@ clean_scheduler 夹具把 accepting 重新打开、收尾时等在途 fire 结�
 """
 
 import asyncio
+import threading
 from datetime import datetime, timedelta, timezone
 
 import httpx
 import pytest
 
-from app import scheduler
+from app import desktop, scheduler
 from app.agent import runtime
 from app.agent.runtime import AgentEvent
 from app.config import settings
@@ -584,6 +585,116 @@ async def test_list_notifications_returns_newest_first_with_limit(db):
     assert [r["title"] for r in await scheduler.list_notifications(limit=1, db_path=db)] == ["任务 2"]
 
 
+# ---------- 托盘轮询：同步只读查询 + 一次性通知（T6） ----------
+#
+# desktop 的轮询线程在 uvicorn 之外、且可能先于 lifespan 的 init_db 跑起来，所以这里钉
+# 的是这一层的行为：同步 sqlite3 只读连接、库不存在不建文件、读不到不抛、启动时已有的
+# 记录不重弹、每条只弹一次、停止靠 threading.Event。pystray 用假图标替身，不碰真托盘。
+
+
+class FakeIcon:
+    def __init__(self, fail: bool = False):
+        self.calls: list[tuple[str, str | None]] = []
+        self._fail = fail
+
+    def notify(self, message, title=None):
+        self.calls.append((message, title))
+        if self._fail:
+            raise RuntimeError("图标还没就绪")
+
+
+async def test_read_notifications_sync_reads_the_db_without_creating_files(db):
+    await scheduler.add_notification(1, "s", "success", "任务", "结果", db_path=db)
+
+    rows = desktop.read_notifications_sync(5, db_path=db)
+
+    assert [r["title"] for r in rows] == ["任务"]
+    assert set(rows[0]) == {"id", "task_id", "session_id", "kind", "title", "body", "created_at"}
+
+
+def test_read_notifications_sync_is_a_noop_when_the_db_is_missing(tmp_path):
+    """轮询线程可能先于 lifespan 的 init_db 跑起来：这时只读查询必须返回空而不是建库，
+    否则托盘线程会在用户数据目录里造出一个空库，把真正的库顶掉。"""
+    missing = tmp_path / "nope" / "app.db"
+
+    assert desktop.read_notifications_sync(5, db_path=missing) == []
+    assert not missing.parent.exists()
+
+
+def test_read_notifications_sync_swallows_unreadable_db(tmp_path):
+    """库损坏/被独占时返回空，不能让轮询线程死掉（托盘通知是尽力而为的旁路）。"""
+    broken = tmp_path / "app.db"
+    broken.write_bytes(b"not a sqlite file at all")
+
+    assert desktop.read_notifications_sync(5, db_path=broken) == []
+
+
+async def test_tray_notifier_notifies_each_record_exactly_once(db):
+    icon = FakeIcon()
+    notifier = desktop.TrayNotifier(icon, db_path=db)
+    notifier.prime()
+
+    await scheduler.add_notification(1, "s1", "success", "任务 A 已完成", "结果 A", db_path=db)
+    await scheduler.add_notification(2, "s2", "error", "任务 B 执行失败", "结果 B", db_path=db)
+
+    assert [r["title"] for r in notifier.poll_once()] == ["任务 A 已完成", "任务 B 执行失败"]
+    # 旧的先弹，最新的最后留在气泡里
+    assert icon.calls == [("结果 A", "任务 A 已完成"), ("结果 B", "任务 B 执行失败")]
+
+    # 再轮询两遍：同一条不会再弹
+    assert notifier.poll_once() == []
+    assert notifier.poll_once() == []
+    assert len(icon.calls) == 2
+
+    await scheduler.add_notification(3, None, "success", "任务 C 已完成", "结果 C", db_path=db)
+    assert [r["id"] for r in notifier.poll_once()] == [3]
+    assert len(icon.calls) == 3
+
+
+async def test_tray_notifier_prime_skips_records_that_existed_at_startup(db):
+    """重启不该把历史通知再弹一遍：prime 记下启动时的最大 id。"""
+    await scheduler.add_notification(1, "s", "success", "上个进程的任务", "旧结果", db_path=db)
+    icon = FakeIcon()
+    notifier = desktop.TrayNotifier(icon, db_path=db)
+
+    notifier.prime()
+
+    assert notifier.poll_once() == []
+    assert icon.calls == []
+
+
+async def test_tray_notifier_survives_a_failing_notify(db):
+    """弹不出来（图标还没就绪）只记日志：不重试同一条，也不让轮询线程炸掉。"""
+    icon = FakeIcon(fail=True)
+    notifier = desktop.TrayNotifier(icon, db_path=db)
+    notifier.prime()
+    await scheduler.add_notification(1, "s", "success", "任务", "结果", db_path=db)
+
+    assert [r["id"] for r in notifier.poll_once()] == [1]  # 不抛
+    assert notifier.poll_once() == []
+    assert len(icon.calls) == 1
+
+
+async def test_tray_notifier_stop_event_ends_the_polling_thread(db):
+    """停止由 threading.Event 控制：stop 后轮询线程很快退出，不拖住窗口关闭。"""
+    icon = FakeIcon()
+    notifier = desktop.TrayNotifier(icon, db_path=db, interval=0.01)
+    thread = threading.Thread(target=notifier.run, daemon=True)
+    thread.start()
+    await scheduler.add_notification(1, "s", "success", "任务", "结果", db_path=db)
+
+    for _ in range(200):
+        if icon.calls:
+            break
+        await asyncio.sleep(0.01)
+
+    notifier.stop()
+    thread.join(timeout=2.0)
+
+    assert icon.calls == [("结果", "任务")]
+    assert thread.is_alive() is False
+
+
 # ---------- API ----------
 
 
@@ -725,6 +836,34 @@ async def test_export_covers_tasks_and_notifications(client, db):
     data = (await client.get("/api/export")).json()
     assert [t["name"] for t in data["scheduled_tasks"]] == ["每日复习"]
     assert [n["title"] for n in data["notifications"]] == ["任务"]
+
+
+async def test_task_list_carries_every_field_the_ui_renders(client, db, monkeypatch):
+    """T6 的任务面板直接消费这些键（名字/状态/时区提示/上次结果）。少一个键前端不会报错，
+    只会静默渲染出 undefined——所以把契约钉在 API 侧，改名时这里先红。"""
+    monkeypatch.setattr(scheduler, "local_timezone_name", lambda: SHANGHAI)
+    await client.post("/api/tasks", json={"name": "每日复习", "cron": DAILY, "prompt": "复习"})
+
+    row = (await client.get("/api/tasks")).json()[0]
+
+    assert set(row) == {
+        "id", "name", "cron", "prompt", "mode", "timezone", "enabled",
+        "last_fired_at", "created_at", "machine_timezone", "timezone_changed",
+    }
+
+
+async def test_tasks_have_no_patch_route(client, db, monkeypatch):
+    """任务编辑本期不做（改一条 = 删了重建），前端据此不给「编辑」按钮。
+    哪天加了 PATCH，这里的 405 会变 200，提示把界面的说明一起改掉。"""
+    monkeypatch.setattr(scheduler, "local_timezone_name", lambda: SHANGHAI)
+    task_id = (await client.post(
+        "/api/tasks", json={"name": "每日复习", "cron": DAILY, "prompt": "复习"}
+    )).json()["id"]
+
+    resp = await client.patch(f"/api/tasks/{task_id}", json={"name": "改名"})
+
+    assert resp.status_code == 405
+    assert (await scheduler.list_tasks(db))[0].name == "每日复习"
 
 
 # ---------- 生命周期 ----------

@@ -210,6 +210,54 @@ body {
 }
 .gap-item:hover .gap-act { visibility: visible; }
 .gap-act.del:hover { color: var(--error); }
+/* 定时任务入口：与漏洞面板同一套头部样式 */
+.tasks-box { flex-shrink: 0; border-top: 1px solid var(--hairline); padding: 12px 12px 10px; }
+.task-form-row { display: flex; gap: 8px; }
+.task-form-row > * { flex: 1; min-width: 0; }
+.task-item {
+  background: var(--canvas); border: 1px solid var(--hairline);
+  border-radius: var(--r-md); padding: 10px 12px; margin-bottom: 8px;
+}
+.task-head { display: flex; align-items: center; gap: 8px; }
+.task-name {
+  font-size: 13px; font-weight: 600; color: var(--ink); flex: 1;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.task-state {
+  font-size: 11px; padding: 1px 8px; border-radius: 9999px; flex-shrink: 0;
+  border: 1px solid var(--hairline); color: var(--stone);
+}
+.task-state.on { background: var(--tint-teal); border-color: transparent; color: var(--teal); font-weight: 600; }
+.task-meta { font-size: 11px; color: var(--stone); margin-top: 4px; }
+.task-warn { font-size: 11px; color: var(--error); margin-top: 4px; }
+.task-actions { display: flex; gap: 6px; margin-top: 8px; }
+.task-act {
+  border: 1px solid var(--hairline); background: var(--canvas); color: var(--slate);
+  font-size: 11px; padding: 2px 10px; border-radius: var(--r-sm); cursor: pointer;
+}
+.task-act:hover { border-color: var(--hairline-strong); color: var(--ink); }
+.task-act.del:hover { color: var(--error); border-color: var(--error-border); }
+.notif-item { border-top: 1px solid var(--hairline); padding: 8px 0; }
+.notif-item:first-child { border-top: none; }
+.notif-head { display: flex; align-items: baseline; gap: 8px; }
+.notif-kind { font-size: 11px; font-weight: 600; color: var(--teal); flex-shrink: 0; }
+.notif-kind.error { color: var(--error); }
+.notif-title {
+  font-size: 12px; font-weight: 600; color: var(--charcoal); flex: 1;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.notif-time { font-size: 11px; color: var(--muted); flex-shrink: 0; }
+.notif-body {
+  font-size: 12px; color: var(--slate); margin-top: 2px;
+  white-space: pre-wrap; word-break: break-word;
+  max-height: 66px; overflow-y: auto;
+}
+.notif-actions { margin-top: 4px; }
+/* 说明文字里的行内代码（如 {due_gaps}）：跟正文区分开，但别抢眼 */
+.set-note code {
+  font-family: ui-monospace, Consolas, "Courier New", monospace;
+  font-size: 11px; background: var(--surface-card); border-radius: 3px; padding: 0 3px;
+}
 /* ---------- 主区 ---------- */
 .main { flex: 1; display: flex; flex-direction: column; height: 100vh; }
 .chat-scroll { flex: 1; overflow-y: auto; }
@@ -419,15 +467,17 @@ cite.chunk-ref:hover { background: var(--primary); color: #fff; }
 .usage-row span:last-child { color: var(--stone); white-space: nowrap; }
 .export-row { display: flex; gap: 8px; margin-top: 4px; }
 .export-row .set-fetch { text-decoration: none; display: inline-flex; align-items: center; height: 30px; }
-#settings-mask {
+/* 浮层面板骨架：设置面板与定时任务面板共用（同一套遮罩、宽度、内边距、表单控件） */
+.overlay-mask {
   position: fixed; inset: 0; z-index: 60; display: none;
   background: rgba(20,20,19,.4); align-items: flex-start; justify-content: center;
 }
-#settings-panel {
+.overlay-panel {
   width: 420px; max-width: calc(100vw - 48px); max-height: 85vh; overflow-y: auto;
   margin-top: 8vh; background: var(--canvas); border: 1px solid var(--hairline);
   border-radius: var(--r-lg); padding: 24px 28px 28px; box-shadow: var(--shadow-2);
 }
+#tasks-panel { width: 520px; }
 .set-head {
   display: flex; align-items: center; justify-content: space-between;
   font-family: var(--font-display); font-size: 22px; margin-bottom: 4px;
@@ -445,15 +495,20 @@ cite.chunk-ref:hover { background: var(--primary); color: #fff; }
   text-transform: none; color: var(--muted); margin-top: 2px;
 }
 .set-label { display: block; font-size: 13px; font-weight: 500; color: var(--charcoal); margin: 10px 0 4px; }
-#settings-panel input, #settings-panel select, #settings-panel textarea {
+.overlay-panel input, .overlay-panel select, .overlay-panel textarea {
   width: 100%; height: 40px; padding: 10px 14px; font-size: 14px;
   border: 1px solid var(--hairline); border-radius: var(--r-md);
   background: var(--canvas); color: var(--ink); outline: none;
 }
-#settings-panel input:focus, #settings-panel select:focus, #settings-panel textarea:focus { border-color: var(--primary); }
+.overlay-panel input:focus, .overlay-panel select:focus, .overlay-panel textarea:focus { border-color: var(--primary); }
 /* 人格是多行原文：固定 40px 高会看不出换行，给个可拖拽的编辑器高度 */
-#settings-panel textarea {
+#set-persona {
   height: auto; min-height: 160px; resize: vertical;
+  line-height: 1.6; font-family: inherit;
+}
+/* 任务内容是多行 prompt：同人格，但要矮一些（面板里还有表单和列表） */
+#task-prompt {
+  height: auto; min-height: 80px; resize: vertical;
   line-height: 1.6; font-family: inherit;
 }
 .set-model-picker { display: flex; align-items: stretch; gap: 8px; }
@@ -544,6 +599,12 @@ cite.chunk-ref:hover { background: var(--primary); color: #fff; }
     <div class="panel-head"><span class="doc-list-label">漏洞</span></div>
     <div class="gap-list" id="gap-list"></div>
   </div>
+  <div class="tasks-box">
+    <div class="panel-head">
+      <span class="doc-list-label">定时任务</span>
+      <button class="link-btn" id="tasks-btn" title="创建、启停、删除定时任务">管理</button>
+    </div>
+  </div>
 </aside>
 <main class="main">
   <div class="chat-scroll" id="chat-scroll">
@@ -580,8 +641,8 @@ cite.chunk-ref:hover { background: var(--primary); color: #fff; }
 <div id="popover"></div>
 <div id="palette"></div>
 <div id="set-suggest"></div>
-<div id="settings-mask">
-  <div id="settings-panel">
+<div id="settings-mask" class="overlay-mask">
+  <div id="settings-panel" class="overlay-panel">
     <div class="set-head"><span>模型设置</span><button id="settings-close" title="关闭">✕</button></div>
     <div class="set-sec">对话模型（LLM）<span class="set-note">保存后立即生效，无需重启</span></div>
     <label class="set-label">供应商</label>
@@ -628,6 +689,35 @@ cite.chunk-ref:hover { background: var(--primary); color: #fff; }
       <a class="set-fetch" href="/api/export/db" download>下载数据库</a>
     </div>
     <div class="set-actions"><button class="btn btn-primary" id="settings-save">保存</button></div>
+  </div>
+</div>
+<div id="tasks-mask" class="overlay-mask">
+  <div id="tasks-panel" class="overlay-panel">
+    <div class="set-head"><span>定时任务</span><button id="tasks-close" title="关闭">✕</button></div>
+    <div class="set-sec">新建任务<span class="set-note">到点自动开一个会话跑这条内容；通知走系统托盘气泡</span></div>
+    <label class="set-label">任务名</label>
+    <input id="task-name" maxlength="60" placeholder="如 每日复习" autocomplete="off">
+    <div class="task-form-row">
+      <div>
+        <label class="set-label">时间（cron）</label>
+        <input id="task-cron" placeholder="0 9 * * *" autocomplete="off" spellcheck="false">
+      </div>
+      <div>
+        <label class="set-label">模式</label>
+        <select id="task-mode">
+          <option value="work">工作</option>
+          <option value="chat">聊天</option>
+        </select>
+      </div>
+    </div>
+    <label class="set-label">内容<span class="set-note">就是发给 Agent 的话。写 <code>{due_gaps}</code> 会在触发时替换成当天到期的漏洞卡片</span></label>
+    <textarea id="task-prompt" rows="4" spellcheck="false" placeholder="复习一下到期的知识漏洞"></textarea>
+    <span class="set-status" id="task-form-status"></span>
+    <div class="set-actions"><button class="btn btn-primary" id="task-create">创建任务</button></div>
+    <div class="set-sec">任务列表<span class="set-note">cron 按创建时那台机器的时区解释，之后不随时区变更迁移</span></div>
+    <div id="task-list"></div>
+    <div class="set-sec">最近结果<span class="set-note">任务跑完的结果通知（只读，不做已读/通知中心）</span></div>
+    <div id="notif-list"></div>
   </div>
 </div>
 <script src="/vendor/marked.min.js"></script>
@@ -1180,6 +1270,141 @@ function reviewText(iso) {
   return days <= 0 ? "该复习了" : `${days} 天后复习`;
 }
 
+/* ---------- 定时任务（T5 的任务 API + 最近结果通知） ----------
+   通知渠道本期选的是系统托盘气泡（desktop 端直读 SQLite），所以这里**不做**通知铃铛、
+   不做通知中心、不做逐条已读：面板只展示任务与最近结果，点结果跳到那次自动会话。
+   任务不能改（没有 PATCH），改一条就是删了重建——界面上明说，不给「编辑」按钮。 */
+const taskMask = $("tasks-mask");
+/* cron 按创建时那台机器的时区解释。用户看到的是本机时区，所以这里只把 IANA 名亮出来；
+   timezone_changed=true 说明机器时区换过了、任务仍按创建时那个走，必须显式提示，
+   否则用户会觉得「我明明设的是早上九点，怎么下午才跑」 */
+function taskMeta(t) {
+  const parts = [t.cron, `模式 ${MODE_LABELS[t.mode] || t.mode}`];
+  parts.push(t.timezone ? `按 ${t.timezone} 解释` : "时区未知");
+  parts.push(t.last_fired_at ? `上次 ${localTime(t.last_fired_at)}` : "还没跑过");
+  return parts.join(" · ");
+}
+/* 库里存的是 UTC ISO 串，列表里按本机时区说人话 */
+function localTime(iso) {
+  const d = new Date(iso);
+  return Number.isNaN(d.getTime()) ? "" : d.toLocaleString();
+}
+async function loadTasks() {
+  try {
+    const r = await fetch("/api/tasks");
+    if (!r.ok) throw new Error(await errText(r));
+    const tasks = await r.json();
+    const list = $("task-list");
+    list.innerHTML = "";
+    if (!tasks.length) {
+      list.innerHTML = `<div class="empty-docs">还没有定时任务。上面填一条，到点它自己开会话跑。</div>`;
+    }
+    for (const t of tasks) {
+      const item = document.createElement("div");
+      item.className = "task-item";
+      item.innerHTML = `<div class="task-head"><span class="task-name"></span>
+        <span class="task-state"></span></div>
+        <div class="task-meta"></div><div class="task-warn" hidden></div>
+        <div class="task-actions">
+          <button class="task-act toggle"></button>
+          <button class="task-act del">删除</button>
+        </div>`;
+      item.querySelector(".task-name").textContent = t.name;
+      const state = item.querySelector(".task-state");
+      state.textContent = t.enabled ? "启用中" : "已停用";
+      state.classList.toggle("on", t.enabled);
+      item.querySelector(".task-meta").textContent = taskMeta(t);
+      if (t.timezone_changed) {
+        const warn = item.querySelector(".task-warn");
+        warn.hidden = false;
+        warn.textContent =
+          `本机时区现在是 ${t.machine_timezone}，但这条任务仍按创建时的 ${t.timezone} 解释。`
+          + ` 需要按新时区跑就删掉重建。`;
+      }
+      const toggle = item.querySelector(".toggle");
+      toggle.textContent = t.enabled ? "停用" : "启用";
+      toggle.onclick = async () => {
+        const r = await fetch(`/api/tasks/${t.id}/${t.enabled ? "disable" : "enable"}`, {
+          method: "POST",
+        });
+        if (!r.ok) { showError(await errText(r)); return; }
+        showHint(t.enabled ? `已停用「${t.name}」，在途的那次仍会跑完` : `已启用「${t.name}」`);
+        loadTasks();
+      };
+      item.querySelector(".del").onclick = async () => {
+        if (!confirm(`删除任务「${t.name}」？它跑出来的会话和结果不会跟着删。`)) return;
+        const r = await fetch(`/api/tasks/${t.id}`, { method: "DELETE" });
+        if (!r.ok) { showError(await errText(r)); return; }
+        loadTasks();
+      };
+      list.appendChild(item);
+    }
+  } catch (e) { showError(e.message); }
+}
+async function loadNotifications() {
+  try {
+    const r = await fetch("/api/notifications");
+    if (!r.ok) throw new Error(await errText(r));
+    const notes = await r.json();
+    const list = $("notif-list");
+    list.innerHTML = "";
+    if (!notes.length) {
+      list.innerHTML = `<div class="empty-docs">还没有任务结果。任务跑完会在这里和托盘各留一条。</div>`;
+      return;
+    }
+    for (const n of notes) {
+      const item = document.createElement("div");
+      item.className = "notif-item";
+      item.innerHTML = `<div class="notif-head"><span class="notif-kind"></span>
+        <span class="notif-title"></span><span class="notif-time"></span></div>
+        <div class="notif-body"></div><div class="notif-actions"></div>`;
+      const kind = item.querySelector(".notif-kind");
+      kind.textContent = n.kind === "error" ? "失败" : "完成";
+      kind.classList.toggle("error", n.kind === "error");
+      item.querySelector(".notif-title").textContent = n.title;
+      item.querySelector(".notif-time").textContent = localTime(n.created_at);
+      item.querySelector(".notif-body").textContent = n.body;
+      /* 结果本身存在那次自动会话里，这里只给入口——面板不承担通知中心的职责 */
+      if (n.session_id) {
+        const open = document.createElement("button");
+        open.className = "link-btn";
+        open.textContent = "打开那次会话";
+        open.onclick = () => { closeTasks(); openSession(n.session_id); };
+        item.querySelector(".notif-actions").appendChild(open);
+      }
+      list.appendChild(item);
+    }
+  } catch (e) { showError(e.message); }
+}
+async function openTasks() {
+  taskMask.style.display = "flex";
+  await Promise.all([loadTasks(), loadNotifications()]);
+}
+function closeTasks() { taskMask.style.display = "none"; }
+$("tasks-close").onclick = closeTasks;
+taskMask.onclick = (e) => { if (e.target === taskMask) closeTasks(); };
+/* 新建任务：后端校验 cron / 名称 / 内容，400 的 detail 直接显示在表单下方 */
+$("task-create").onclick = async () => {
+  const btn = $("task-create");
+  const name = $("task-name").value.trim();
+  const cron = $("task-cron").value.trim();
+  const prompt = $("task-prompt").value.trim();
+  setStatus("task-form-status", "", false);
+  btn.disabled = true; btn.textContent = "创建中…";
+  try {
+    const r = await fetch("/api/tasks", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name, cron, prompt, mode: $("task-mode").value }),
+    });
+    if (!r.ok) throw new Error(await errText(r));
+    const t = await r.json();
+    setStatus("task-form-status", `已创建「${t.name}」，按 ${t.timezone} 解释`, false);
+    $("task-name").value = ""; $("task-cron").value = ""; $("task-prompt").value = "";
+    loadTasks();
+  } catch (e) { setStatus("task-form-status", e.message, true); }
+  finally { btn.disabled = false; btn.textContent = "创建任务"; }
+};
+
 /* ---------- 聊天 ---------- */
 async function send() {
   const text = inputEl.value.trim();
@@ -1573,6 +1798,8 @@ $("settings-save").onclick = async () => {
   } catch (e) { showError(e.message); }
   finally { btn.disabled = false; btn.textContent = "保存"; }
 };
+
+$("tasks-btn").onclick = openTasks;
 
 loadDocs();
 loadMemories();
