@@ -1034,13 +1034,20 @@ async function openSession(id) {
 /* 打开旧会话时把模式切换器同步成库里的值（模式在创建时固定，UI 不能各说各话）。
 
   顺带兜住「localStorage 里的 id 已被删除」：列表里查无此会话说明它真的没了，直接
-  当失效处理——不然用户看到的是空对话，下一条消息必然撞 404。 */
+  当失效处理——不然用户看到的是空对话，下一条消息必然撞 404。
+
+  id 在**进入时**固定：/api/sessions 回来时用户可能已经切走了（新对话、打开别的会话、
+  或刚新建的会话 id 从 SSE 到达）。拿当时的 sessionId 去 find，会把「列表里没有新 id」
+  误判成会话失效，把一个还活着的会话清掉。这份响应只属于 id，只有 sessionId 仍是它时
+  才允许改状态。 */
 async function loadSessionMode() {
-  if (!sessionId) { sessionMode = null; renderMode(); return; }
+  const id = sessionId;
+  if (!id) { sessionMode = null; renderMode(); return; }
   try {
     const r = await fetch("/api/sessions");
     if (!r.ok) return;
-    const s = (await r.json()).find(x => x.id === sessionId);
+    const s = (await r.json()).find(x => x.id === id);
+    if (sessionId !== id) return;  // 挂起期间切走了：这份结果已经过期，丢掉
     if (!s) { resetStaleSession(); return; }
     sessionMode = s.mode || "chat";
     renderMode();
