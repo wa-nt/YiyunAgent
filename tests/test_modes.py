@@ -365,6 +365,49 @@ def test_mode_prompts_cover_supported_modes_only():
     assert all(prompt.strip() for prompt in runtime.MODE_PROMPTS.values())
 
 
+# work 模式是复习教练：prompt 得把「什么时候调哪个漏洞工具」写清楚。工具定义只说
+# 「这个工具干什么」，调用时机归模式 prompt（它随每一轮请求发给模型）；prompt 不点名，
+# 模型不知道自己有这个工具可用，工具就永远不会被调用。断言按语义取词，不逐字比对，
+# 允许之后改写措辞。
+
+
+def test_work_prompt_turns_unmastered_points_into_gap_cards():
+    prompt = runtime.MODE_PROMPTS["work"]
+
+    assert "record_knowledge_gap" in prompt
+    # 「没掌握就记」的触发条件
+    assert any(word in prompt for word in ("没掌握", "未掌握", "没听懂", "答不上来", "答错"))
+
+
+def test_work_prompt_asks_a_check_question_after_answering():
+    """讲完一个知识点要追问一句，让用户自己复述/举例——这是发现漏洞的信号来源。"""
+    prompt = runtime.MODE_PROMPTS["work"]
+
+    assert any(word in prompt for word in ("追问", "再问", "接着问"))
+    assert any(word in prompt for word in ("让用户自己", "复述", "举例"))
+
+
+def test_work_prompt_reviews_through_the_review_tool():
+    """复习：先出题让用户真的答，拿到结果再调 review_knowledge_gap。"""
+    prompt = runtime.MODE_PROMPTS["work"]
+
+    assert "review_knowledge_gap" in prompt
+    assert any(word in prompt for word in ("先出题", "出题让用户"))
+    assert "不要替用户判断" in prompt
+
+
+def test_work_prompt_names_every_tool_in_its_whitelist():
+    """白名单里有、prompt 里没提 = 工具永远不被调用。"""
+    prompt = runtime.MODE_PROMPTS["work"]
+
+    assert [name for name in runtime.MODE_TOOLS["work"] if name not in prompt] == []
+
+
+def test_chat_prompt_does_not_mention_gap_tools():
+    """chat 白名单里没有漏洞工具，prompt 也不能提——否则模型会硬调一个不可用的工具。"""
+    assert "knowledge_gap" not in runtime.MODE_PROMPTS["chat"]
+
+
 def test_mode_tools_whitelist():
     assert runtime.MODE_TOOLS == {
         "chat": ["search_knowledge"],

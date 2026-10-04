@@ -190,6 +190,26 @@ body {
 }
 .mem-act:hover { color: var(--primary); background: var(--tint-coral); }
 .mem-act.del:hover { color: var(--error); }
+/* 漏洞面板：与记忆面板同一类卡片列表，样式同源，视觉上是一套 */
+.gaps-box { flex-shrink: 0; border-top: 1px solid var(--hairline); padding: 12px 12px 4px; }
+.gap-list { max-height: 150px; overflow-y: auto; padding-bottom: 8px; }
+.gap-item {
+  background: var(--canvas); border: 1px solid var(--hairline);
+  border-radius: var(--r-sm); padding: 8px 10px; margin-bottom: 6px;
+}
+.gap-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.gap-topic {
+  font-size: 12px; font-weight: 600; color: var(--ink);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.gap-detail { font-size: 12px; color: var(--charcoal); word-break: break-word; }
+.gap-meta { font-size: 11px; color: var(--stone); margin-top: 2px; }
+.gap-act {
+  border: none; background: none; color: var(--muted); font-size: 12px;
+  cursor: pointer; padding: 0 3px; border-radius: 4px; visibility: hidden; flex-shrink: 0;
+}
+.gap-item:hover .gap-act { visibility: visible; }
+.gap-act.del:hover { color: var(--error); }
 /* ---------- 主区 ---------- */
 .main { flex: 1; display: flex; flex-direction: column; height: 100vh; }
 .chat-scroll { flex: 1; overflow-y: auto; }
@@ -304,6 +324,23 @@ cite.chunk-ref:hover { background: var(--primary); color: #fff; }
   background: var(--canvas); color: var(--ink); outline: none;
 }
 .model-row input:focus { border-color: var(--primary); }
+/* 模式切换器：只决定「下一个新会话」怎么建，所以放在输入区（会话内的模型行之上），
+   不属于 per-session 的模型行。已有会话的模式以库里的为准，打开时回填 */
+.mode-row { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin-top: 10px; }
+.mode-label { font-size: 12px; color: var(--stone); white-space: nowrap; }
+.mode-btn {
+  border: 1px solid var(--hairline); background: var(--canvas); color: var(--charcoal);
+  font-size: 12px; padding: 2px 10px; border-radius: 9999px; cursor: pointer;
+}
+.mode-btn:hover:not(:disabled) { border-color: var(--hairline-strong); color: var(--ink); }
+.mode-btn.active {
+  background: var(--tint-coral); border-color: var(--primary);
+  color: var(--primary-deep); font-weight: 600;
+}
+.mode-btn:disabled { color: var(--muted); cursor: default; }
+/* 「即将推出」是说明而不是按钮文案，用可读的 --stone，别跟着 disabled 一起变灰 */
+.mode-btn em { font-style: normal; font-size: 10px; margin-left: 4px; color: var(--stone); }
+.mode-hint { font-size: 11px; color: var(--stone); }
 .pop-title { font-size: 12px; font-weight: 600; color: var(--steel); margin-bottom: 6px; }
 .pop-body { font-size: 14px; color: var(--charcoal); white-space: pre-wrap; word-break: break-word; }
 /* 输入区 */
@@ -503,6 +540,10 @@ cite.chunk-ref:hover { background: var(--primary); color: #fff; }
     <div class="panel-head"><span class="doc-list-label">记忆</span></div>
     <div class="memory-list" id="memory-list"></div>
   </div>
+  <div class="gaps-box">
+    <div class="panel-head"><span class="doc-list-label">漏洞</span></div>
+    <div class="gap-list" id="gap-list"></div>
+  </div>
 </aside>
 <main class="main">
   <div class="chat-scroll" id="chat-scroll">
@@ -520,6 +561,13 @@ cite.chunk-ref:hover { background: var(--primary); color: #fff; }
         <button class="send-btn" id="send" title="发送">↑</button>
       </div>
       <div class="hint" id="hint">回答基于你的知识库检索结果生成</div>
+      <div class="mode-row" id="mode-row">
+        <span class="mode-label">模式</span>
+        <button class="mode-btn" data-mode="chat" title="日常问答：对话为主，需要时查知识库">聊天</button>
+        <button class="mode-btn" data-mode="work" title="工作/学习：带复习教练，会记知识漏洞卡片">工作</button>
+        <button class="mode-btn" data-mode="code" disabled title="即将推出">代码<em>即将推出</em></button>
+        <span class="mode-hint" id="mode-hint"></span>
+      </div>
       <div class="model-row" id="model-row" hidden>
         <span class="model-label">本会话模型</span>
         <input id="session-model" placeholder="留空 = 跟随全局默认" autocomplete="off">
@@ -607,6 +655,32 @@ let sessionId = localStorage.getItem(LS_KEY), busy = false, controller = null;
 /* 移动端抽屉：☰ 开关；点会话项/新对话/抽屉外区域自动收起 */
 const sidebarEl = document.querySelector(".sidebar");
 $("menu-btn").onclick = () => sidebarEl.classList.toggle("open");
+
+/* ---------- 模式 ---------- */
+/* currentMode 只决定「下一个新会话」怎么建；已有会话的模式以库里的为准（sessionMode），
+   打开旧会话时从 sessions API 或 SSE 的 session 事件同步回来。两者不一致时明说切换只对
+   新对话生效，免得用户以为当前会话换了模式。 */
+const MODE_LABELS = { chat: "聊天", work: "工作", code: "代码" };
+let currentMode = "chat", sessionMode = null;
+
+function setMode(mode) { currentMode = mode; renderMode(); }
+function renderMode() {
+  for (const btn of $("mode-row").querySelectorAll(".mode-btn"))
+    btn.classList.toggle("active", btn.dataset.mode === currentMode);
+  if (!sessionId) {
+    $("mode-hint").textContent = `下一条消息开「${MODE_LABELS[currentMode]}」新对话`;
+    return;
+  }
+  /* 打开旧会话时模式是异步取回来的：还不知道就先说读取中，别编一个模式出来 */
+  const cur = MODE_LABELS[sessionMode];
+  $("mode-hint").textContent = !cur
+    ? "本会话模式读取中…"
+    : (sessionMode === currentMode
+        ? `本会话：${cur}`
+        : `本会话仍是「${cur}」，切换只对新对话生效`);
+}
+for (const btn of $("mode-row").querySelectorAll(".mode-btn"))
+  btn.onclick = () => { if (!busy && !btn.disabled) setMode(btn.dataset.mode); };
 
 function esc(s) {
   return s.replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
@@ -950,11 +1024,36 @@ async function openSession(id) {
   sidebarEl.classList.remove("open");
   loadSessions();
   loadSessionModel();
+  loadSessionMode();
   try {
     const r = await fetch(`/api/sessions/${id}/messages`);
     if (!r.ok) throw new Error(await errText(r));
     renderMessages(await r.json());
   } catch (e) { showError(e.message); }
+}
+/* 打开旧会话时把模式切换器同步成库里的值（模式在创建时固定，UI 不能各说各话）。
+
+  顺带兜住「localStorage 里的 id 已被删除」：列表里查无此会话说明它真的没了，直接
+  当失效处理——不然用户看到的是空对话，下一条消息必然撞 404。 */
+async function loadSessionMode() {
+  if (!sessionId) { sessionMode = null; renderMode(); return; }
+  try {
+    const r = await fetch("/api/sessions");
+    if (!r.ok) return;
+    const s = (await r.json()).find(x => x.id === sessionId);
+    if (!s) { resetStaleSession(); return; }
+    sessionMode = s.mode || "chat";
+    renderMode();
+  } catch { /* 列表拿不到就保留现状，不打扰 */ }
+}
+/* 会话已不存在：清掉本地 id 回到新对话，别把用户卡在「会话不存在」上 */
+function resetStaleSession() {
+  sessionId = null; sessionMode = null;
+  localStorage.removeItem(LS_KEY);
+  $("model-row").hidden = true;
+  renderMode();
+  loadSessions();
+  showHint("原会话已不存在，已回到新对话：再发一次就开一个新会话");
 }
 /* per-session 模型覆盖：从会话列表里捞当前会话的 model 填进输入框 */
 async function loadSessionModel() {
@@ -981,11 +1080,12 @@ $("session-model-save").onclick = async () => {
 $("session-model").onkeydown = (e) => { if (e.key === "Enter") $("session-model-save").click(); };
 $("new-session").onclick = () => {
   if (busy) return;
-  sessionId = null;
+  sessionId = null; sessionMode = null;
   localStorage.removeItem(LS_KEY);
   closePopover();
   sidebarEl.classList.remove("open");
   clearChat();
+  renderMode();
   loadSessions();
   inputEl.focus();
 };
@@ -1031,15 +1131,60 @@ async function loadMemories() {
   } catch (e) { showError(e.message); }
 }
 
+/* ---------- 漏洞（work 模式记下的复习卡片） ---------- */
+async function loadGaps() {
+  try {
+    /* 必须带 all=true：新记的卡片默认 1 天后才到期，而后端 /api/gaps 默认只回到期的
+       —— 不带这个参数，用户刚让 work 模式记完，面板里反而是空的 */
+    const r = await fetch("/api/gaps?all=true");
+    if (!r.ok) throw new Error(await errText(r));
+    const gaps = await r.json();
+    const list = $("gap-list");
+    list.innerHTML = "";
+    if (!gaps.length) {
+      list.innerHTML = `<div class="empty-docs">还没有漏洞卡片。用「工作」模式说清哪里没掌握，它会替你记下来。</div>`;
+      return;
+    }
+    for (const g of gaps) {
+      const item = document.createElement("div");
+      item.className = "gap-item";
+      item.innerHTML = `<div class="gap-head"><span class="gap-topic"></span>
+        <button class="gap-act del" title="删除">✕</button></div>
+        <div class="gap-detail"></div><div class="gap-meta"></div>`;
+      item.querySelector(".gap-topic").textContent = g.topic || "";
+      item.querySelector(".gap-detail").textContent = g.detail || "";
+      item.querySelector(".gap-meta").textContent =
+        `间隔 ${g.interval_days} 天 · ${reviewText(g.next_review_at)}`;
+      item.querySelector(".del").onclick = async () => {
+        if (!confirm(`删除漏洞「${g.topic}」？`)) return;
+        const r = await fetch(`/api/gaps/${g.id}`, { method: "DELETE" });
+        if (!r.ok) { showError(await errText(r)); return; }
+        loadGaps();
+      };
+      list.appendChild(item);
+    }
+  } catch (e) { showError(e.message); }
+}
+/* next_review_at 是 UTC ISO 串，界面上按天数差说人话（今天/明天不必算给用户看） */
+function reviewText(iso) {
+  const t = Date.parse(iso);
+  if (Number.isNaN(t)) return "";
+  const days = Math.round((t - Date.now()) / 86400000);
+  return days <= 0 ? "该复习了" : `${days} 天后复习`;
+}
+
 /* ---------- 聊天 ---------- */
 async function send() {
   const text = inputEl.value.trim();
   if (!text || busy) return;
   inputEl.value = ""; inputEl.style.height = "auto";
   addMsg("user").textContent = text;
+  /* 只有新会话带 mode：已有会话的模式由后端按库里的判定，带上不同的值只会换来 409 */
+  const payload = { session_id: sessionId, message: text };
+  if (!sessionId) payload.mode = currentMode;
   await streamFrom("/api/chat", {
     method: "POST", headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ session_id: sessionId, message: text }),
+    body: JSON.stringify(payload),
   });
 }
 
@@ -1094,10 +1239,16 @@ async function streamFrom(url, opts) {
   sendBtn.textContent = "■"; sendBtn.title = "停止生成";
   const answerEl = addMsg("assistant");
   answerEl.classList.add("cursor-blink");
-  let answer = "", chips = [];
+  let answer = "", chips = [], stale = false;
   try {
     const resp = await fetch(url, { ...opts, signal: controller.signal });
-    if (!resp.ok) throw new Error(await errText(resp));
+    if (!resp.ok) {
+      /* 404 = 这个会话不存在了（后端对不认识的 session_id 一律 404，见 /api/chat）。
+         localStorage 里可能还留着上个版本的 id：清掉它回到新对话，顺便不再弹一次
+         「会话不存在」——resetStaleSession 的提示已经把话说完了 */
+      if (resp.status === 404 && sessionId) { resetStaleSession(); stale = true; }
+      throw new Error(await errText(resp));
+    }
     const reader = resp.body.getReader();
     const decoder = new TextDecoder();
     let buf = "";
@@ -1113,6 +1264,8 @@ async function streamFrom(url, opts) {
         if (ev.type === "session") {
           sessionId = ev.data.session_id;
           localStorage.setItem(LS_KEY, sessionId);
+          /* 新会话落库的模式就在事件里（后端已带 mode），不用再查一次列表 */
+          if (ev.data.mode) { sessionMode = ev.data.mode; renderMode(); }
           loadSessionModel();
         }
         else if (ev.type === "text_delta") {
@@ -1128,7 +1281,7 @@ async function streamFrom(url, opts) {
     }
   } catch (e) {
     if (e.name === "AbortError") showHint("已停止生成");
-    else showError(e.message);
+    else if (!stale) showError(e.message);
   } finally {
     answerEl.classList.remove("cursor-blink");
     busy = false; controller = null;
@@ -1137,6 +1290,8 @@ async function streamFrom(url, opts) {
     await refreshMessages();
     loadSessions();
     loadMemories();
+    /* 这一轮可能刚记下一张漏洞卡片（work 模式），收尾顺手刷新面板 */
+    loadGaps();
   }
 }
 
@@ -1414,6 +1569,8 @@ $("settings-save").onclick = async () => {
 
 loadDocs();
 loadMemories();
+loadGaps();
+renderMode();
 sessionId ? openSession(sessionId) : loadSessions();
 inputEl.focus();
 </script>
