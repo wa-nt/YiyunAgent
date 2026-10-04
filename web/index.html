@@ -408,12 +408,17 @@ cite.chunk-ref:hover { background: var(--primary); color: #fff; }
   text-transform: none; color: var(--muted); margin-top: 2px;
 }
 .set-label { display: block; font-size: 13px; font-weight: 500; color: var(--charcoal); margin: 10px 0 4px; }
-#settings-panel input, #settings-panel select {
+#settings-panel input, #settings-panel select, #settings-panel textarea {
   width: 100%; height: 40px; padding: 10px 14px; font-size: 14px;
   border: 1px solid var(--hairline); border-radius: var(--r-md);
   background: var(--canvas); color: var(--ink); outline: none;
 }
-#settings-panel input:focus, #settings-panel select:focus { border-color: var(--primary); }
+#settings-panel input:focus, #settings-panel select:focus, #settings-panel textarea:focus { border-color: var(--primary); }
+/* 人格是多行原文：固定 40px 高会看不出换行，给个可拖拽的编辑器高度 */
+#settings-panel textarea {
+  height: auto; min-height: 160px; resize: vertical;
+  line-height: 1.6; font-family: inherit;
+}
 .set-model-picker { display: flex; align-items: stretch; gap: 8px; }
 .set-model-picker input { flex: 1; min-width: 0; }
 .set-model-picker .set-fetch { height: 40px; padding: 0 12px; }
@@ -565,6 +570,8 @@ cite.chunk-ref:hover { background: var(--primary); color: #fff; }
       <button class="set-fetch" id="set-embed-fetch" type="button">拉取模型</button>
     </div>
     <span class="set-status" id="set-embed-fetch-status"></span>
+    <div class="set-sec">人格<span class="set-note">每轮对话前置的设定，支持多行；清空保存 = 不再注入任何人设（不会回退默认人格）</span></div>
+    <textarea id="set-persona" rows="10" spellcheck="false" aria-label="人格设定"></textarea>
     <div class="set-sec">用量统计</div>
     <div class="usage-box" id="usage-box">加载中…</div>
     <div class="set-sec">数据<span class="set-note">JSON 含全部会话/记忆/文档清单；数据库文件是含知识库向量的完整备份</span></div>
@@ -1230,6 +1237,7 @@ $("settings-btn").onclick = async () => {
     $("set-anthropic-model").value = s.anthropic_model;
     $("set-embed-base-url").value = s.embed_base_url;
     $("set-embed-model").value = s.embed_model;
+    $("set-persona").value = s.persona;
     // 密钥不回填全量：placeholder 显示脱敏现状，留空 = 保持不变
     for (const [id, field] of KEY_INPUTS) {
       $(id).value = "";
@@ -1377,6 +1385,8 @@ $("settings-save").onclick = async () => {
     llm_provider: $("set-provider").value,
     embed_base_url: $("set-embed-base-url").value.trim(),
     embed_model: $("set-embed-model").value.trim(),
+    // 人格不 trim：原文（含空行）要原样保存，清空 = 明确不要人格
+    persona: $("set-persona").value,
   };
   if (body.llm_provider === "openai_compat") {
     body.openai_base_url = $("set-openai-base-url").value.trim();

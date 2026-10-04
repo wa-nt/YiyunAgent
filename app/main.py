@@ -15,16 +15,20 @@ from pydantic import BaseModel, Field
 from app.agent.runtime import (
     DEFAULT_MODE,
     SUPPORTED_MODES,
+    PersonaUnavailableError,
     UnknownModeError,
     drain_memory_writes,
     ensure_session,
     get_session_mode,
     list_messages,
+    load_persona,
     run_agent,
 )
 from app.config import EDITABLE_FIELDS, env_path, mask_secret, settings, update_env_file
 from app.db import get_db, init_db
 from app.ingest.pipeline import delete_document, ingest, list_documents
+from app.resources import resource_path
+from app.settings_store import PERSONA_KEY, set_setting
 from app.tracing import (
     InvalidTimestamp,
     drain_traces,
@@ -34,7 +38,7 @@ from app.tracing import (
 
 logger = logging.getLogger(__name__)
 
-WEB_DIR = Path(__file__).resolve().parent.parent / "web"
+WEB_DIR = resource_path("web")
 
 UPLOAD_SUFFIXES = {".md", ".markdown", ".pdf", ".txt"}
 UPLOAD_MAX_BYTES = 50 * 1024 * 1024  # 固定上限，需要时再做配置
@@ -448,14 +452,17 @@ async def api_memory_delete(memory_id: int) -> dict:
 
 @app.get("/api/export")
 async def api_export() -> JSONResponse:
-    """用户数据导出（会话/消息/记忆/文档清单）。chunks 与向量是可从文档重建的
-    派生数据，不进导出文件；要完整备份请用 /api/export/db。"""
+    """用户数据导出（会话/消息/记忆/文档清单/设置）。chunks 与向量是可从文档重建的
+    派生数据，不进导出文件；要完整备份请用 /api/export/db。
+
+    app_settings 里是 persona 这类用户在界面上写的原文，属于用户数据，一并导出。
+    """
     async with get_db() as conn:
         data: dict = {
             "version": 1,
             "exported_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         }
-        for table in ("sessions", "messages", "memories", "documents"):
+        for table in ("sessions", "messages", "memories", "documents", "app_settings"):
             rows = await conn.execute_fetchall(f"SELECT * FROM {table}")
             data[table] = [dict(row) for row in rows]
     return JSONResponse(
@@ -710,7 +717,11 @@ async def api_traces_summary(
 
 
 class SettingsUpdate(BaseModel):
-    """设置面板的可编辑字段（全集见 config.EDITABLE_FIELDS）。api_key 留空 = 保持现状。"""
+    """设置面板的可编辑字段（.env 全集见 config.EDITABLE_FIELDS）。api_key 留空 = 保持现状。
+
+    persona 是唯一的例外：它是多行用户数据，存 SQLite（app_settings）而不是 .env，
+    所以不在 EDITABLE_FIELDS 里。None = 本次不动它；空字符串 = 用户明确不要人格。
+    """
 
     llm_provider: Literal["openai_compat", "anthropic"] | None = None
     openai_base_url: str | None = None
@@ -722,6 +733,7 @@ class SettingsUpdate(BaseModel):
     embed_api_key: str | None = None
     embed_model: str | None = None
     embed_dim: int | None = Field(default=None, gt=0)
+    persona: str | None = None
 
 
 # 密钥字段不接受空串覆盖：清空密钥属于破坏性操作，让它只能去改 .env 完成
@@ -730,7 +742,13 @@ _SECRET_FIELDS = {"openai_api_key", "anthropic_api_key", "embed_api_key"}
 
 @app.get("/api/settings")
 async def api_settings_get() -> dict:
-    """当前模型 / embedding 配置，密钥脱敏回显（只露末 4 位）。"""
+    """当前模型 / embedding 配置，密钥脱敏回显（只露末 4 位）；persona 是多行用户数据，
+    原样返回（没设置过时就是默认人格文件的内容）。"""
+    try:
+        persona = await load_persona()
+    except PersonaUnavailableError as exc:
+        # 默认人格文件缺失是安装/打包问题：把原因说清楚，不要伪装成空人格
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
     return {
         "llm_provider": settings.llm_provider,
         "openai_base_url": settings.openai_base_url or "",
@@ -742,6 +760,7 @@ async def api_settings_get() -> dict:
         "embed_api_key": mask_secret(settings.embed_api_key),
         "embed_model": settings.embed_model or "",
         "embed_dim": settings.embed_dim,
+        "persona": persona,
     }
 
 
@@ -752,6 +771,10 @@ async def api_settings_update(req: SettingsUpdate) -> dict:
     LLM / embedding 客户端都是每次调用时新建（llm/__init__.py、llm/embed.py），
     所以保存立即生效，无需重启。注意 embed_dim 只影响之后写入的向量：与现有
     vec0 表维度不一致时检索会报错，前端已提示需重新导入文档。
+
+    persona 走另一条路：原文 UPSERT 进 SQLite。它不进 .env（多行文本会被写坏），
+    也不受下面「供应商配置必须齐全」的校验影响——那是模型配置的约束，跟人格无关，
+    但提交时字段缺失（None）表示这次不改人格。
     """
     updates: dict = {}
     for name in EDITABLE_FIELDS:
@@ -774,7 +797,12 @@ async def api_settings_update(req: SettingsUpdate) -> dict:
         update_env_file(env_path(), {n: str(v) for n, v in updates.items()})
         for name, value in updates.items():
             setattr(settings, name, value)
-    return {"updated": sorted(updates)}
+
+    updated = sorted(updates)
+    if req.persona is not None:
+        await set_setting(PERSONA_KEY, req.persona)
+        updated.append(PERSONA_KEY)
+    return {"updated": sorted(updated)}
 
 
 class ModelListRequest(BaseModel):

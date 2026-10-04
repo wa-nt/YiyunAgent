@@ -7,10 +7,11 @@ import aiosqlite
 import sqlite_vec
 
 from app.config import settings
+from app.resources import resource_path
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_PATH = Path(__file__).with_name("schema.sql")
+SCHEMA_PATH = resource_path("app/schema.sql")
 
 CHUNK_VECTORS_SQL = """
 CREATE VIRTUAL TABLE IF NOT EXISTS chunk_vectors USING vec0(

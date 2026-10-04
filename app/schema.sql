@@ -70,6 +70,14 @@ CREATE TABLE IF NOT EXISTS traces (
     cost REAL
 );
 
+-- 用户在界面上编辑的多行文本数据（当前只有 persona）。.env 是单行 KEY=VALUE 口径，
+-- 多行原文会被写坏，所以这类用户数据单独存表。无记录 = 没设置过（加载默认人格文件），
+-- 空字符串 = 用户明确不要人格，两者语义不同，不能互相顶替。
+CREATE TABLE IF NOT EXISTS app_settings (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+
 -- 三张热表的过滤列都缺索引，实际查询退化成全表扫描：按 session_id 取会话历史与
 -- 消息列表、按 status 筛有效记忆、看板按 (kind, name, ts) 过滤 trace。
 -- 全部 IF NOT EXISTS，init_db 每次启动重放本文件时给存量库补上，无需迁移脚本。

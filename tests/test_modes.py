@@ -77,9 +77,16 @@ async def db(tmp_path, monkeypatch):
     monkeypatch.setattr(memory_writer, "get_llm", lambda: _SilentWriterLLM())
     # 默认给个不发请求的桩：用例要断言 prompt/tools 时再用 use_llm 换成自己的实例
     monkeypatch.setattr(runtime, "get_llm", lambda: FakeLLM())
+    # 这些用例断言的是 system 消息里的**模式** prompt：人格另由 tests/test_persona.py
+    # 覆盖，这里钉成「用户明确不要人格」，免得默认人格原文混进模式断言
+    monkeypatch.setattr(runtime, "load_persona", _no_persona)
     await init_db(tmp_path / "app.db", DIM)
     yield tmp_path / "app.db"
     await runtime.drain_memory_writes()
+
+
+async def _no_persona(db_path=None):
+    return ""
 
 
 @pytest.fixture

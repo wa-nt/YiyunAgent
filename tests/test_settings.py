@@ -1,9 +1,12 @@
 """设置面板（/api/settings）：脱敏回显、.env 就地更新、保存即热生效。"""
 
+import asyncio
+
 import pytest
 from fastapi.testclient import TestClient
 
 from app.config import mask_secret, settings, update_env_file
+from app.db import init_db
 from app.main import app
 
 
@@ -33,6 +36,10 @@ def test_update_env_file_preserves_unrelated_lines(tmp_path):
 def client(tmp_path, monkeypatch):
     # .env 写到临时目录，绝不动仓库里真实的 .env
     monkeypatch.setattr("app.main.env_path", lambda: tmp_path / ".env")
+    # /api/settings 会读 persona（SQLite）：库也指到临时目录并建表，不碰 data/app.db。
+    # TestClient 不进入 with 就不会跑 lifespan，建表的责任在夹具（同 tests/test_api.py）
+    monkeypatch.setattr(settings, "db_path", str(tmp_path / "app.db"))
+    asyncio.run(init_db(tmp_path / "app.db", 8))
     return TestClient(app)
 
 

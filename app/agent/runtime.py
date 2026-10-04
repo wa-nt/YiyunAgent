@@ -6,6 +6,7 @@ import logging
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, AsyncIterator
 
 from app.agent.context import govern_context
@@ -15,8 +16,10 @@ from app.llm import get_llm
 from app.llm.types import Message, ToolCall, ToolDef
 from app.memory.recall import recall_memories
 from app.memory.writer import extract_and_store
+from app.resources import resource_path
 from app.retrieval.hybrid import hybrid_search
 from app.retrieval.types import RetrievedChunk
+from app.settings_store import PERSONA_KEY, get_setting
 from app.skills import (
     Skill,
     ToolFn,
@@ -346,6 +349,47 @@ async def session_model(session_id: str, db_path: str | None = None) -> str | No
     return rows[0]["model"] if rows else None
 
 
+# ---------- 可配置人格（T2） ----------
+#
+# 人格原文是**用户数据**：存 app_settings（见 app/settings_store.py），不进 .env、不进
+# EDITABLE_FIELDS。没设置过时加载仓库内的默认人格文件；空字符串表示用户明确不要人格。
+# 默认人格的原则（有温度但不谄媚、守住边界与独立判断、事实/原理/证据优先、抽象用类比
+# 落地、坦诚不确定、避免模板化收尾）参考了 liliMozi/openhanako 的 Hanako 模板
+# （Apache-2.0）所体现的思路；文字为本项目原创中文重写，不保留其用户/访客身份设定，
+# 也不在运行时访问外部仓库。
+PERSONA_FILE = "app/agent/prompts/persona_default.md"
+
+
+class PersonaUnavailableError(RuntimeError):
+    """没设置过人格、默认人格文件又读不到。
+
+    不静默返回空人格：那会把「人格文件没打进包」表现成「模型忽然不按人格说话」，从
+    现象看不出因果。这里直接抛，交给 HTTP 层（/api/settings）或 run_agent 既有的错误
+    路径报出来。
+    """
+
+
+def persona_default_path() -> Path:
+    """默认人格文件的真实位置：源码环境与 PyInstaller 解包目录由 resource_path 统一解析。"""
+    return resource_path(PERSONA_FILE)
+
+
+async def load_persona(db_path: str | None = None) -> str:
+    """本轮要用的人格原文。
+
+    用户设置过就原样返回（包括空串 = 明确禁用人格，不回退默认文件）；没有记录才回退
+    默认人格文件。文件读不到时抛 PersonaUnavailableError（见上）。
+    """
+    stored = await get_setting(PERSONA_KEY, db_path)
+    if stored is not None:
+        return stored
+    path = persona_default_path()
+    try:
+        return path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise PersonaUnavailableError(f"默认人格文件不可读：{path}（{exc}）") from exc
+
+
 def assemble_messages(
     history: list[Message],
     user_message: str,
@@ -538,6 +582,9 @@ async def run_agent(
 
     本轮触发的 skill（T11）在开跑前一次性探测：正文进 system 消息，专用工具进本轮
     工具集与执行判据（见 _apply_skill）。探测只做一次，工具集在整轮里不变。
+
+    人格（T2）在开跑前从 app_settings 读一次（见 load_persona），非空时前置到 system
+    消息；设置面板保存后下一轮即生效，不用重建会话。
     """
     path = db_path or settings.db_path
     await ensure_session(session_id, path, mode=mode if mode is not None else DEFAULT_MODE)
@@ -554,7 +601,11 @@ async def run_agent(
     # skill 与记忆同一口径：探测失败退化为「本轮无 skill」，正文进 system 消息、
     # 专用工具进本轮工具集。工具集与正文同寿命——只在触发它的这一轮可用
     skill_prompt, skill_tools, skill_fns = _apply_skill(user_message, path)
-    messages = assemble_messages(history, user_message, memory, skill_prompt, session_mode)
+    # 人格是用户数据：设置过用设置过的（空串 = 不要人格），没设置过加载默认人格文件
+    persona = await load_persona(path)
+    messages = assemble_messages(
+        history, user_message, memory, skill_prompt, session_mode, persona
+    )
     tools = [*tools_for_mode(session_mode), *skill_tools]
 
     # 用户提问立刻落库，不等本轮结束：客户端中途关页面时任务会被取消

@@ -36,7 +36,9 @@ rem Generate the exe icon (idempotent)
 if errorlevel 1 goto fail
 
 rem --paths .  : entry is inside the app package, so let analysis resolve `app.*`
-rem --add-data  : app/schema.sql is read via Path(__file__) at runtime, not importable
+rem --add-data  : resources are read at runtime via app/resources.py (resource_path),
+rem               not importable. Keep dest identical to the repo layout so both
+rem               environments resolve the same relative path.
 rem --collect-all: pywebview/pythonnet runtimes and sqlite-vec native dll
 %PY% -m PyInstaller --noconfirm --clean --windowed ^
   --name SecondBrainAgent ^
@@ -44,6 +46,7 @@ rem --collect-all: pywebview/pythonnet runtimes and sqlite-vec native dll
   --paths . ^
   --add-data "web;web" ^
   --add-data "app\schema.sql;app" ^
+  --add-data "app\agent\prompts\persona_default.md;app\agent\prompts" ^
   --collect-all webview ^
   --collect-all pythonnet ^
   --collect-all sqlite_vec ^
