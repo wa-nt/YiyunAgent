@@ -775,7 +775,9 @@ def test_assemble_messages_inserts_memory_after_system_prompt():
     messages = runtime.assemble_messages(history, "新问题", memory)
 
     assert [m.role for m in messages] == ["system", "system", "user", "user"]
-    assert messages[0].content == runtime.SYSTEM_PROMPT
+    # system prompt 由「基础 prompt + 模式 prompt」拼成（T1），记忆仍是紧随其后的第二条
+    assert runtime.SYSTEM_PROMPT in messages[0].content
+    assert runtime.MODE_PROMPTS["chat"] in messages[0].content
     assert messages[1].content == memory
     assert messages[-1].content == "新问题"
 

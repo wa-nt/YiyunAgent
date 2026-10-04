@@ -13,8 +13,12 @@ from openai import APIConnectionError, AsyncOpenAI, AuthenticationError, OpenAIE
 from pydantic import BaseModel, Field
 
 from app.agent.runtime import (
+    DEFAULT_MODE,
+    SUPPORTED_MODES,
+    UnknownModeError,
     drain_memory_writes,
     ensure_session,
+    get_session_mode,
     list_messages,
     run_agent,
 )
@@ -58,6 +62,40 @@ class IngestRequest(BaseModel):
 class ChatRequest(BaseModel):
     session_id: str | None = None
     message: str
+    # 模式：None = 未指定（新会话按 chat，已有会话沿用库里的值）。取值不在 pydantic 里
+    # 收窄成 Literal：非法值要统一回 400 并说明原因，Literal 会先把它变成 422 的通用
+    # 校验错误；校验唯一来源是 runtime.SUPPORTED_MODES（见 _requested_mode）。
+    mode: str | None = None
+
+
+def _requested_mode(mode: str | None) -> str | None:
+    """校验请求里的 mode，返回 None（未指定）或合法模式名。
+
+    code 本期只有前端占位，后端照样按非法拒绝并说明原因：前端的 disabled 是 UX，
+    不是安全边界。
+    """
+    if mode is None:
+        return None
+    if mode == "code":
+        raise HTTPException(status_code=400, detail="code 模式本期未开放，请使用 chat 或 work")
+    if mode not in SUPPORTED_MODES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"不支持的模式：{mode}（可选：{'、'.join(SUPPORTED_MODES)}）",
+        )
+    return mode
+
+
+async def _existing_session_mode(session_id: str) -> str | None:
+    """已有会话的模式；会话不存在时返回 None。
+
+    库里的 mode 是未知值时由 get_session_mode 抛 UnknownModeError，交给调用方收口。
+    """
+    async with get_db() as conn:
+        rows = await conn.execute_fetchall("SELECT 1 FROM sessions WHERE id = ?", (session_id,))
+    if not rows:
+        return None
+    return await get_session_mode(session_id)
 
 
 async def _sse_events(events) -> AsyncIterator[str]:
@@ -73,19 +111,27 @@ async def _sse_events(events) -> AsyncIterator[str]:
         yield _sse_line("error", {"message": "生成出错，请重试"})
 
 
-async def _sse(req: ChatRequest):
+async def _sse(req: ChatRequest, new_session_mode: str | None = None):
     """SSE 流：每个 AgentEvent 一行 `data: {json}`。session_id 为空的请求
-    先把新建的 id 作为首个事件发出，前端据此续聊。"""
+    先把新建的 id 连同模式作为首个事件发出，前端据此续聊。
+
+    new_session_mode 只在「请求没带 session_id、由本函数新建会话」时用得上；已有会话
+    与补建路径都不给 run_agent 传 mode（模式以库里的为准，见 run_agent）。
+    """
+    created_mode: str | None = None
     try:
         if not req.session_id:
-            req.session_id = await ensure_session(None)
-            yield _sse_line("session", {"session_id": req.session_id})
+            created_mode = new_session_mode or DEFAULT_MODE
+            req.session_id = await ensure_session(None, mode=created_mode)
+            yield _sse_line("session", {"session_id": req.session_id, "mode": created_mode})
     except Exception:
         # 建会话失败同样只能补 error 事件：HTTP 状态码已发出，不能让前端干等
         logger.exception("创建会话失败")
         yield _sse_line("error", {"message": "生成出错，请重试"})
         return
-    async for line in _sse_events(run_agent(req.session_id, req.message)):
+    # 只有刚新建的会话显式传 mode：其余路径交给 run_agent 从会话读，避免两个来源打架
+    extra = {"mode": created_mode} if created_mode else {}
+    async for line in _sse_events(run_agent(req.session_id, req.message, **extra)):
         yield line
 
 
@@ -104,7 +150,26 @@ def _sse_response(lines: AsyncIterator[str]) -> StreamingResponse:
 
 @app.post("/api/chat")
 async def chat(req: ChatRequest) -> StreamingResponse:
-    return _sse_response(_sse(req))
+    """聊天入口。新会话（不带 session_id）用请求里的 mode（缺省 chat）建立会话，
+    session 事件把它回给前端；已有会话一律按库里的 mode 跑，请求带的 mode 只用来
+    校验一致性——不一致说明前端拿着另一个模式的会话在聊，回 409 而不是偷偷改模式。"""
+    mode = _requested_mode(req.mode)
+    if req.session_id is not None:
+        try:
+            session_mode = await _existing_session_mode(req.session_id)
+        except UnknownModeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        if session_mode is None:
+            # 未知 id：老调用方（含测试）一直靠 run_agent 里的 ensure_session 补建，
+            # 只有显式声明了 mode 的请求才按「指错了会话」处理
+            if mode is not None:
+                raise HTTPException(status_code=404, detail="会话不存在")
+        elif mode is not None and mode != session_mode:
+            raise HTTPException(
+                status_code=409,
+                detail=f"会话模式为 {session_mode}，不能按 {mode} 继续（模式在创建会话时固定）",
+            )
+    return _sse_response(_sse(req, new_session_mode=mode or DEFAULT_MODE))
 
 
 @app.post("/api/sessions/{session_id}/respond")
@@ -113,7 +178,8 @@ async def respond(session_id: str, mid: int | None = None) -> StreamingResponse:
 
     mid 给出时先把 active_leaf 切到那条提问上（重新生成 = 回到提问再答一次，
     旧回答留在自己的分支上不动）；不给则用当前叶子。叶子必须是 user 消息。
-    与 /api/chat 的差别只在不再插入用户消息——提问已经由调用方写好了。
+    与 /api/chat 的差别只在不再插入用户消息——提问已经由调用方写好了；模式同样不传，
+    由 run_agent 从会话读。
     """
     async with get_db() as conn:
         if mid is not None:
@@ -153,12 +219,15 @@ def _like_escape(q: str) -> str:
 
 @app.get("/api/sessions")
 async def api_sessions(q: str = "") -> list[dict]:
-    """会话列表，最近活跃在前。title 优先用户改名 / 自动标题，回退首条 user 消息前 30 字。
+    """会话列表，最近活跃在前。title 优先用户改名 / 自动标题，回退首条 user 消息前 30 字；
+    带上 mode 与 source，前端据此显示模式、区分定时任务创建的自动会话。NULL 按迁移口径
+    归一（chat / manual），列表读到的 mode、source 因此永远是合法值。
     q 命中标题或任意一条消息内容的会话才返回（LIKE 子串匹配，量大了再考虑 FTS）。"""
     like = f"%{_like_escape(q)}%" if q else ""
     async with get_db() as conn:
         rows = await conn.execute_fetchall(
             "SELECT s.id, s.created_at, s.provider, s.model, "
+            "COALESCE(s.mode, 'chat') AS mode, COALESCE(s.source, 'manual') AS source, "
             "COALESCE(s.title, (SELECT substr(content, 1, 30) FROM messages "
             "WHERE session_id = s.id AND role = 'user' ORDER BY id LIMIT 1), '') AS title, "
             "(SELECT COUNT(*) FROM messages WHERE session_id = s.id) AS message_count "

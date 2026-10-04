@@ -49,6 +49,67 @@ SEARCH_TOOL = ToolDef(
     },
 )
 
+# ---------- 模式框架（T1） ----------
+#
+# chat / work 是本期的两个可用模式；code 的运行时（sidecar、沙箱）不在本期，API 也不
+# 接受它。SUPPORTED_MODES 是**唯一**的模式校验来源：API 校验、迁移归一化、运行时读取
+# 都从它取，MODE_PROMPTS / MODE_TOOLS 也以它为准，避免几处各写一份允许清单。
+
+SUPPORTED_MODES = ("chat", "work")
+DEFAULT_MODE = "chat"
+
+MODE_PROMPTS = {
+    "chat": (
+        "\n\n当前模式：聊天。\n"
+        "像一位有温度但不谄媚的对话伙伴：有不同看法就说出来，不为顺着对方而附和。\n"
+        "保持边界和自主判断，不替用户做决定，也不假装拥有自己并不具备的权威。\n"
+        "优先从事实、原理和证据出发分析问题；抽象概念用类比或具体例子讲清楚。\n"
+        "不确定的信息不要编造，直接说明哪些地方需要用户确认。\n"
+        "少用破折号和模板化收尾，用自然的节奏收束回答。"
+    ),
+    "work": (
+        "\n\n当前模式：工作。\n"
+        "把用户的问题当成要交付的任务：先明确目标与约束，再拆成可执行的步骤。\n"
+        "需要事实依据时先调工具查证，结论要落到能直接使用的产出或动作上。\n"
+        "信息不足时直接指出还缺什么，不用套话填充。"
+    ),
+}
+
+# 每个模式开放的**内置**工具名。skill 自带的工具不受这张表约束：它们只在触发的那一轮
+# 生效，由 run_agent 单独追加（见 _apply_skill）。T3 会把漏洞复习工具接进这张白名单。
+MODE_TOOLS: dict[str, list[str]] = {
+    "chat": ["search_knowledge"],
+    "work": ["search_knowledge", "record_knowledge_gap", "review_knowledge_gap"],
+}
+
+# 所有模式白名单的并集：dispatch 用它区分「本模式没开放」和「根本没这个工具」
+_MODE_TOOL_NAMES = frozenset(name for names in MODE_TOOLS.values() for name in names)
+
+BUILTIN_TOOLS: list[ToolDef] = [SEARCH_TOOL]
+
+
+class UnknownModeError(ValueError):
+    """读到的 mode 不在 SUPPORTED_MODES 内。
+
+    不静默降级到默认模式：脏数据的会话如果被当成 chat 继续跑，用户看到的行为与
+    记录的模式对不上，问题会被藏起来；这里的调用方（HTTP 层）要能看见并说清楚。
+    """
+
+
+def _check_mode(mode: str) -> str:
+    if mode not in SUPPORTED_MODES:
+        raise UnknownModeError(f"未知模式：{mode}（支持：{'、'.join(SUPPORTED_MODES)}）")
+    return mode
+
+
+def tools_for_mode(mode: str) -> list[ToolDef]:
+    """本模式可用的内置工具定义（按 MODE_TOOLS 的白名单过滤）。
+
+    T3 把漏洞工具加进 BUILTIN_TOOLS 即可，这里不用改。
+    """
+    allowed = set(MODE_TOOLS[_check_mode(mode)])
+    return [tool for tool in BUILTIN_TOOLS if tool.name in allowed]
+
 
 @dataclass
 class AgentEvent:
@@ -140,17 +201,44 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
-async def ensure_session(session_id: str | None, db_path: str | None = None) -> str:
-    """session_id 为空时新建会话；传入未知 id 时补建对应行（外键约束要求）。"""
+async def ensure_session(
+    session_id: str | None,
+    db_path: str | None = None,
+    *,
+    mode: str = DEFAULT_MODE,
+    source: str = "manual",
+    scheduled_task_id: str | None = None,
+    scheduled_occurrence_at: str | None = None,
+) -> str:
+    """session_id 为空时新建会话；传入未知 id 时补建对应行（外键约束要求）。
+
+    mode / source / 调度归属只在**真正建行**时写入：已存在的会话一律不改（模式在创建
+    那一刻固定，续聊以库里的值为准），这条约定由 INSERT OR IGNORE 保证。未知 mode 直接
+    抛 UnknownModeError，不落一条跑不起来的会话。
+    """
+    mode = _check_mode(mode)
     if session_id is None:
         session_id = uuid.uuid4().hex
     async with get_db(db_path) as conn:
         await conn.execute(
-            "INSERT OR IGNORE INTO sessions (id, created_at) VALUES (?, ?)",
-            (session_id, _now()),
+            "INSERT OR IGNORE INTO sessions (id, created_at, mode, source, "
+            "scheduled_task_id, scheduled_occurrence_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (session_id, _now(), mode, source, scheduled_task_id, scheduled_occurrence_at),
         )
         await conn.commit()
     return session_id
+
+
+async def get_session_mode(session_id: str, db_path: str | None = None) -> str:
+    """会话模式。行不存在或 mode 为 NULL/空（迁移前的存量数据）时按 chat 处理；
+    非空的未知值抛 UnknownModeError——不静默进入一个没定义的运行时。"""
+    async with get_db(db_path) as conn:
+        rows = await conn.execute_fetchall(
+            "SELECT mode FROM sessions WHERE id = ?", (session_id,)
+        )
+    if not rows or not rows[0]["mode"]:
+        return DEFAULT_MODE
+    return _check_mode(rows[0]["mode"])
 
 
 async def _save_message(session_id: str, role: str, content: str, db_path: str | None) -> None:
@@ -263,16 +351,23 @@ def assemble_messages(
     user_message: str,
     memory: str | None = None,
     skill_prompt: str | None = None,
+    mode: str = DEFAULT_MODE,
+    persona: str | None = None,
 ) -> list[Message]:
-    """组装发给模型的 prompt view。召回的长期记忆作为一条 system 消息插在 system
-    prompt 之后，命中的 skill 正文排在记忆之后（skill 比记忆更贴近本轮任务）。
+    """组装发给模型的 prompt view。system prompt = SYSTEM_PROMPT + 模式 prompt；
+    persona 非空时前置（T2 从 app_settings 读；空串表示用户明确不要人格，不回退默认）。
+    召回的长期记忆作为一条 system 消息插在 system prompt 之后，命中的 skill 正文排在
+    记忆之后（skill 比记忆更贴近本轮任务）。
     T8 的上下文治理（工具结果清理、历史压缩、token 预算）由 run_agent 在每次调用模型
     前对这里的产物走一遍 govern_context，不改 Agent 循环。
 
     memory 由 run_agent 先调 recall_memories 取好（本函数是同步的，召回是异步的）；
     skill_prompt 同理，由 run_agent 触发并渲染好（见 _apply_skill）。
     """
-    messages = [Message(role="system", content=SYSTEM_PROMPT)]
+    system = SYSTEM_PROMPT + MODE_PROMPTS[_check_mode(mode)]
+    if persona:
+        system = f"{persona}\n\n{system}"
+    messages = [Message(role="system", content=system)]
     if memory:
         messages.append(Message(role="system", content=memory))
     if skill_prompt:
@@ -297,31 +392,45 @@ async def execute_tool(
     call: ToolCall,
     db_path: str | None = None,
     skill_tools: dict[str, ToolFn] | None = None,
+    mode: str = DEFAULT_MODE,
 ) -> tuple[str, str]:
     """执行一次工具调用，返回 (结果文本, 展示用摘要)。
 
     返回前记一条 kind='tool' 的 trace（detail 即展示用摘要）：失败路径（未知工具、
-    缺 query）同样计入，工具层的失败在成本看板上要看得见。工具**抛异常**（检索本身
-    出错）时不在这里记——那次调用没走完，run_agent 在降级分支里补记一条。
+    缺 query、模式未开放）同样计入，工具层的失败在成本看板上要看得见。工具**抛异常**
+    （检索本身出错）时不在这里记——那次调用没走完，run_agent 在降级分支里补记一条。
+
+    mode 决定白名单（MODE_TOOLS）：模型偶尔会调用别的模式才开放的工具，这里再挡一次
+    ——prompt 里的工具清单不是安全边界。
 
     skill_tools 是本轮触发的 skill 带来的专用工具（{工具名: 实现}）。默认空：HTTP 层
     与测试不会直接调用它，只有 run_agent 在触发了 skill 的那一轮传进来——skill 工具
-    的可用范围严格限定在触发它的那一轮（brief 的「动态工具集」）。
+    的可用范围严格限定在触发它的那一轮（brief 的「动态工具集」），也不受 mode 白名单
+    约束（它们本就不在 MODE_TOOLS 里）。
     """
-    result, label = await _dispatch_tool(call, db_path, skill_tools or {})
+    result, label = await _dispatch_tool(call, db_path, skill_tools or {}, mode)
     record_tool(call.name, label, db_path)
     return result, label
 
 
 async def _dispatch_tool(
-    call: ToolCall, db_path: str | None, skill_tools: dict[str, ToolFn]
+    call: ToolCall, db_path: str | None, skill_tools: dict[str, ToolFn], mode: str
 ) -> tuple[str, str]:
+    allowed = MODE_TOOLS[_check_mode(mode)]
+    if call.name not in allowed:
+        fn = skill_tools.get(call.name)
+        if fn is not None:
+            return await _call_skill_tool(call.name, fn, call.arguments, db_path)
+        if call.name in _MODE_TOOL_NAMES:
+            return (
+                f"工具 {call.name} 在当前模式（{mode}）不可用",
+                f"{call.name}（{mode} 模式不可用）",
+            )
+        return f"未知工具：{call.name}", f"未知工具 {call.name}"
     if call.name == SEARCH_TOOL.name:
         return await _search(call, db_path)
-    fn = skill_tools.get(call.name)
-    if fn is not None:
-        return await _call_skill_tool(call.name, fn, call.arguments, db_path)
-    return f"未知工具：{call.name}", f"未知工具 {call.name}"
+    # T3 的漏洞复习工具在这里接上；在那之前白名单里只有 search_knowledge 有实现
+    return f"工具 {call.name} 尚未实现", f"{call.name}（尚未实现）"
 
 
 async def _search(call: ToolCall, db_path: str | None) -> tuple[str, str]:
@@ -413,6 +522,7 @@ async def run_agent(
     db_path: str | None = None,
     *,
     user_saved: bool = False,
+    mode: str | None = None,
 ) -> AsyncIterator[AgentEvent]:
     """ReAct 主循环：加载历史 → 流式生成 → 有工具调用则执行并回到生成。
 
@@ -422,11 +532,16 @@ async def run_agent(
     user_saved=True 用于「回答已有提问」（编辑后重答 / 重新生成）：调用方已把提问
     落库为会话最后一条，这里从加载到的历史里摘掉它、不再重复插入。
 
+    mode 只在**新建会话**的那次调用显式传入（新会话还没有可读的库记录）；其余情况传
+    None，由这里从会话读——「会话模式」因此只有一个事实来源，续聊不会因为调用方忘传
+    模式而跑错。读到的未知 mode 抛 UnknownModeError（不静默按 chat 跑）。
+
     本轮触发的 skill（T11）在开跑前一次性探测：正文进 system 消息，专用工具进本轮
     工具集与执行判据（见 _apply_skill）。探测只做一次，工具集在整轮里不变。
     """
     path = db_path or settings.db_path
-    await ensure_session(session_id, path)
+    await ensure_session(session_id, path, mode=mode if mode is not None else DEFAULT_MODE)
+    session_mode = mode if mode is not None else await get_session_mode(session_id, path)
 
     history = await load_history(session_id, HISTORY_LIMIT, path)
     if user_saved:
@@ -439,8 +554,8 @@ async def run_agent(
     # skill 与记忆同一口径：探测失败退化为「本轮无 skill」，正文进 system 消息、
     # 专用工具进本轮工具集。工具集与正文同寿命——只在触发它的这一轮可用
     skill_prompt, skill_tools, skill_fns = _apply_skill(user_message, path)
-    messages = assemble_messages(history, user_message, memory, skill_prompt)
-    tools = [SEARCH_TOOL, *skill_tools]
+    messages = assemble_messages(history, user_message, memory, skill_prompt, session_mode)
+    tools = [*tools_for_mode(session_mode), *skill_tools]
 
     # 用户提问立刻落库，不等本轮结束：客户端中途关页面时任务会被取消
     # （CancelledError），清理阶段的 await 会被打断，只有提前写才能保证提问不丢。
@@ -517,7 +632,7 @@ async def run_agent(
                         {"id": call.id, "name": call.name, "arguments": call.arguments},
                     )
                     try:
-                        result, label = await execute_tool(call, path, skill_fns)
+                        result, label = await execute_tool(call, path, skill_fns, session_mode)
                     except Exception as exc:  # 工具失败降级为一段说明，让模型自行收尾
                         result = f"工具失败：{exc}"
                         label = f"{call.name} 失败：{exc}"

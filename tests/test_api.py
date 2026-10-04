@@ -90,11 +90,14 @@ async def test_sessions_list_orders_by_last_message(client, db):
 
     # s2 最近发言排最前；s3 一条消息都没有，只能排最后且标题为空
     assert [r["id"] for r in rows] == ["s2", "s1", "s3"]
+    # mode / source 由 T1 起随列表返回（NULL 按迁移口径归一为 chat / manual）
     assert rows[0] == {
         "id": "s2",
         "created_at": "2026-09-28T10:00:00",
         "provider": None,
         "model": None,
+        "mode": "chat",
+        "source": "manual",
         "title": "RAG 是什么？",
         "message_count": 1,
     }

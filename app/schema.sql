@@ -32,6 +32,9 @@ CREATE TABLE IF NOT EXISTS memories (
     supersedes INTEGER
 );
 
+-- 模式框架（T1）用到的 mode / source / scheduled_task_id / scheduled_occurrence_at
+-- 刻意不写在这张表里：新老安装都只走 db.init_db 里那段幂等 ALTER TABLE + 归一化，
+-- 避免「新库由 schema.sql 建列、旧库由迁移补列」两条路径各自漂移。
 CREATE TABLE IF NOT EXISTS sessions (
     id TEXT PRIMARY KEY,
     created_at TEXT,
