@@ -28,6 +28,8 @@ from app.skills import (
     match_skill,
     render_skill_prompt,
 )
+from app.study.tools import TOOL_FNS as STUDY_TOOL_FNS
+from app.study.tools import TOOLS as STUDY_TOOLS
 from app.tracing import record_skill, record_tool
 
 logger = logging.getLogger(__name__)
@@ -79,7 +81,7 @@ MODE_PROMPTS = {
 }
 
 # 每个模式开放的**内置**工具名。skill 自带的工具不受这张表约束：它们只在触发的那一轮
-# 生效，由 run_agent 单独追加（见 _apply_skill）。T3 会把漏洞复习工具接进这张白名单。
+# 生效，由 run_agent 单独追加（见 _apply_skill）。
 MODE_TOOLS: dict[str, list[str]] = {
     "chat": ["search_knowledge"],
     "work": ["search_knowledge", "record_knowledge_gap", "review_knowledge_gap"],
@@ -88,7 +90,9 @@ MODE_TOOLS: dict[str, list[str]] = {
 # 所有模式白名单的并集：dispatch 用它区分「本模式没开放」和「根本没这个工具」
 _MODE_TOOL_NAMES = frozenset(name for names in MODE_TOOLS.values() for name in names)
 
-BUILTIN_TOOLS: list[ToolDef] = [SEARCH_TOOL]
+# 内置工具定义。漏洞工具（T3）来自 app/study/tools.py，与白名单里的名字一一对应；
+# tools_for_mode 只按 MODE_TOOLS 过滤，不关心实现放在哪个模块。
+BUILTIN_TOOLS: list[ToolDef] = [SEARCH_TOOL, *STUDY_TOOLS]
 
 
 class UnknownModeError(ValueError):
@@ -106,10 +110,7 @@ def _check_mode(mode: str) -> str:
 
 
 def tools_for_mode(mode: str) -> list[ToolDef]:
-    """本模式可用的内置工具定义（按 MODE_TOOLS 的白名单过滤）。
-
-    T3 把漏洞工具加进 BUILTIN_TOOLS 即可，这里不用改。
-    """
+    """本模式可用的内置工具定义（按 MODE_TOOLS 的白名单过滤）。"""
     allowed = set(MODE_TOOLS[_check_mode(mode)])
     return [tool for tool in BUILTIN_TOOLS if tool.name in allowed]
 
@@ -473,7 +474,13 @@ async def _dispatch_tool(
         return f"未知工具：{call.name}", f"未知工具 {call.name}"
     if call.name == SEARCH_TOOL.name:
         return await _search(call, db_path)
-    # T3 的漏洞复习工具在这里接上；在那之前白名单里只有 search_knowledge 有实现
+    # 漏洞复习工具（T3）：handler 自己把参数错误与「卡片不存在」写成结果文本返回，
+    # 不抛异常——工具层能自行说清的失败不该走 run_agent 的降级分支
+    fn = STUDY_TOOL_FNS.get(call.name)
+    if fn is not None:
+        return await fn(call.arguments, db_path)
+    # 白名单里有名字、却没有实现：本期不会发生（MODE_TOOLS 里每一项都有 handler），
+    # 留着是为了将来加模式/工具时，漏做实现表现为一句说明而不是一次 AttributeError
     return f"工具 {call.name} 尚未实现", f"{call.name}（尚未实现）"
 
 

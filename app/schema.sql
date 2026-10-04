@@ -78,9 +78,25 @@ CREATE TABLE IF NOT EXISTS app_settings (
     value TEXT NOT NULL
 );
 
+-- 知识漏洞：work 模式的间隔重复卡片（record/review 两个内置工具与 /api/gaps 共用）。
+-- interval_days 只由 app/study/gaps.py 的复习逻辑维护；next_review_at 与两种时间戳都是
+-- UTC ISO 8601（带 +00:00 偏移），定长格式让「到期」可以直接做字符串比较。
+-- 本期不做归档，因此没有 resolved 一类的字段（见 app/study/gaps.py 的模块说明）。
+CREATE TABLE IF NOT EXISTS knowledge_gaps (
+    id INTEGER PRIMARY KEY,
+    topic TEXT NOT NULL,
+    detail TEXT NOT NULL,
+    interval_days INTEGER NOT NULL DEFAULT 1,
+    next_review_at TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
 -- 三张热表的过滤列都缺索引，实际查询退化成全表扫描：按 session_id 取会话历史与
 -- 消息列表、按 status 筛有效记忆、看板按 (kind, name, ts) 过滤 trace。
 -- 全部 IF NOT EXISTS，init_db 每次启动重放本文件时给存量库补上，无需迁移脚本。
 CREATE INDEX IF NOT EXISTS idx_messages_session_id ON messages(session_id);
 CREATE INDEX IF NOT EXISTS idx_memories_status ON memories(status);
 CREATE INDEX IF NOT EXISTS idx_traces_kind_name_ts ON traces(kind, name, ts);
+-- /api/gaps?all=false 与定时复习任务（T5）只查「已到期」，列表按到期时间排序
+CREATE INDEX IF NOT EXISTS idx_knowledge_gaps_next_review_at ON knowledge_gaps(next_review_at);

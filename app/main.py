@@ -29,6 +29,7 @@ from app.db import get_db, init_db
 from app.ingest.pipeline import delete_document, ingest, list_documents
 from app.resources import resource_path
 from app.settings_store import PERSONA_KEY, set_setting
+from app.study.gaps import delete_gap, list_gaps
 from app.tracing import (
     InvalidTimestamp,
     drain_traces,
@@ -456,13 +457,21 @@ async def api_export() -> JSONResponse:
     派生数据，不进导出文件；要完整备份请用 /api/export/db。
 
     app_settings 里是 persona 这类用户在界面上写的原文，属于用户数据，一并导出。
+    knowledge_gaps 同理：漏洞卡片是用户的学习进度，不导出等于备份丢一半。
     """
     async with get_db() as conn:
         data: dict = {
             "version": 1,
             "exported_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         }
-        for table in ("sessions", "messages", "memories", "documents", "app_settings"):
+        for table in (
+            "sessions",
+            "messages",
+            "memories",
+            "documents",
+            "app_settings",
+            "knowledge_gaps",
+        ):
             rows = await conn.execute_fetchall(f"SELECT * FROM {table}")
             data[table] = [dict(row) for row in rows]
     return JSONResponse(
@@ -663,6 +672,23 @@ async def api_memories() -> list[dict]:
             "ORDER BY id DESC LIMIT 200"
         )
     return [dict(row) for row in rows]
+
+
+@app.get("/api/gaps")
+async def api_gaps(all_: bool = Query(False, alias="all")) -> list[dict]:
+    """知识漏洞卡片，按到期时间升序。
+
+    默认只返回已到期的（`?all=false`，给「今天该复习什么」用）；`?all=true` 返回全部，
+    含还没到期的。
+    """
+    return await list_gaps(due_only=not all_)
+
+
+@app.delete("/api/gaps/{gap_id}")
+async def api_gap_delete(gap_id: int) -> dict:
+    if not await delete_gap(gap_id):
+        raise HTTPException(status_code=404, detail="漏洞不存在")
+    return {"deleted": gap_id}
 
 
 @app.get("/api/documents")
