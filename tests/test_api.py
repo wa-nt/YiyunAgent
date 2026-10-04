@@ -93,6 +93,8 @@ async def test_sessions_list_orders_by_last_message(client, db):
     assert rows[0] == {
         "id": "s2",
         "created_at": "2026-09-28T10:00:00",
+        "provider": None,
+        "model": None,
         "title": "RAG 是什么？",
         "message_count": 1,
     }

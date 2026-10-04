@@ -34,7 +34,16 @@ CREATE TABLE IF NOT EXISTS memories (
 
 CREATE TABLE IF NOT EXISTS sessions (
     id TEXT PRIMARY KEY,
-    created_at TEXT
+    created_at TEXT,
+    -- 用户改名 / LLM 自动标题 / ChatGPT 导入写入；NULL = 列表回退到首条消息前 30 字。
+    -- 旧库没有这一列，由 db.init_db 的 ALTER TABLE 兜底补列
+    title TEXT,
+    -- 分支模型：当前生效分支的叶子消息；NULL（无消息/旧数据）时回退 max(id)
+    active_leaf INTEGER,
+    -- per-session 供应商覆盖；NULL = 跟随全局 llm_provider
+    provider TEXT,
+    -- per-session 模型覆盖；NULL = 跟随全局该供应商默认模型
+    model TEXT
 );
 
 CREATE TABLE IF NOT EXISTS messages (
@@ -42,7 +51,9 @@ CREATE TABLE IF NOT EXISTS messages (
     session_id TEXT REFERENCES sessions(id),
     role TEXT,
     content TEXT,
-    created_at TEXT
+    created_at TEXT,
+    -- 分支模型：指向前驱消息；同 parent 的多条消息互为分支。旧数据由迁移回填成线性链
+    parent_id INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS traces (

@@ -370,11 +370,20 @@ async def _seed_sample(sample: dict[str, Any], session_id: str, db_path: str) ->
             "INSERT OR IGNORE INTO sessions (id, created_at) VALUES (?, ?)",
             (session_id, now),
         )
+        # 历史消息要串成 parent 链并落 active_leaf：load_history 走分支链回溯，
+        # 不串链的话它只能看到最后一条
+        prev_id = None
         for msg in sample.get("sessions", []):
+            cursor = await conn.execute(
+                "INSERT INTO messages (session_id, role, content, created_at, parent_id) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (session_id, msg["role"], msg["content"], now, prev_id),
+            )
+            prev_id = cursor.lastrowid
+        if prev_id is not None:
             await conn.execute(
-                "INSERT INTO messages (session_id, role, content, created_at) "
-                "VALUES (?, ?, ?, ?)",
-                (session_id, msg["role"], msg["content"], now),
+                "UPDATE sessions SET active_leaf = ? WHERE id = ?",
+                (prev_id, session_id),
             )
         for mem in sample.get("seed_memories", []):
             await conn.execute(

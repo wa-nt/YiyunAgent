@@ -76,6 +76,46 @@ def spawn_memory_write(
     return task
 
 
+async def _write_title(session_id: str, user_message: str, db_path: str) -> None:
+    """首轮对话后用 LLM 起个短标题。只在 title 还是 NULL 时写入：用户改名或
+    ChatGPT 导入带来的标题不被覆盖。失败只告警——标题是锦上添花，不值得打断对话。"""
+    try:
+        llm = get_llm()
+        result = await llm.chat(
+            [
+                Message(
+                    role="user",
+                    content="为下面这段提问起一个不超过 15 字的会话标题，"
+                    "只输出标题本身，不要引号、不要标点结尾：\n\n" + user_message[:200],
+                )
+            ]
+        )
+        title = (result.text or "").strip().strip('"“”').splitlines()[0][:30].strip()
+        if not title:
+            return
+        async with get_db(db_path) as conn:
+            await conn.execute(
+                "UPDATE sessions SET title = ? WHERE id = ? AND title IS NULL",
+                (title, session_id),
+            )
+            await conn.commit()
+    except Exception as exc:
+        logger.warning("生成会话标题失败：%s: %s", type(exc).__name__, exc)
+
+
+def spawn_title_write(
+    session_id: str, user_message: str, db_path: str
+) -> asyncio.Task:
+    """与记忆写入同一口径：fire-and-forget，进 _pending_writes 保证退出/测试时能 drain。"""
+    task = asyncio.create_task(
+        _write_title(session_id, user_message, db_path),
+        name=f"title-write:{session_id}",
+    )
+    _pending_writes.add(task)
+    task.add_done_callback(_pending_writes.discard)
+    return task
+
+
 async def drain_memory_writes(timeout: float = DRAIN_TIMEOUT) -> None:
     """等所有在途的记忆写入结束（测试与服务退出时用，不影响 HTTP 流）。
 
@@ -114,37 +154,108 @@ async def ensure_session(session_id: str | None, db_path: str | None = None) -> 
 
 
 async def _save_message(session_id: str, role: str, content: str, db_path: str | None) -> None:
+    """落库一条消息并把它挂到当前分支末尾：parent = 会话的 active_leaf
+    （旧数据没有 leaf 时回退最后一条），随后 active_leaf 指向新消息。"""
     async with get_db(db_path) as conn:
+        leaf = (
+            await conn.execute_fetchall(
+                "SELECT COALESCE(s.active_leaf, "
+                "(SELECT MAX(id) FROM messages WHERE session_id = ?)) AS leaf "
+                "FROM sessions s WHERE s.id = ?",
+                (session_id, session_id),
+            )
+        )[0]["leaf"]
+        cursor = await conn.execute(
+            "INSERT INTO messages (session_id, role, content, created_at, parent_id) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (session_id, role, content, _now(), leaf),
+        )
         await conn.execute(
-            "INSERT INTO messages (session_id, role, content, created_at) VALUES (?, ?, ?, ?)",
-            (session_id, role, content, _now()),
+            "UPDATE sessions SET active_leaf = ? WHERE id = ?",
+            (cursor.lastrowid, session_id),
         )
         await conn.commit()
+
+
+# 沿当前分支向上回溯的递归 CTE：起点是 active_leaf（无则回退最后一条），
+# 逐步走 parent_id。分支模型下「历史」= 从叶子到根的一条链，而不是全表按 id 排
+_LEAF_CHAIN_SQL = """
+WITH RECURSIVE chain AS (
+    SELECT m.id, m.role, m.content, m.parent_id FROM messages m
+    WHERE m.session_id = :sid
+      AND m.id = COALESCE((SELECT active_leaf FROM sessions WHERE id = :sid),
+                          (SELECT MAX(id) FROM messages WHERE session_id = :sid))
+    UNION ALL
+    SELECT m.id, m.role, m.content, m.parent_id FROM messages m
+    JOIN chain c ON m.id = c.parent_id
+)
+"""
 
 
 async def load_history(
     session_id: str, limit: int = HISTORY_LIMIT, db_path: str | None = None
 ) -> list[Message]:
-    """按时间正序返回最近 limit 条历史（子查询倒序取，再翻正）。"""
+    """按时间正序返回当前分支最近 limit 条历史（链是新到旧，翻正后截断）。"""
     async with get_db(db_path) as conn:
         rows = await conn.execute_fetchall(
-            "SELECT role, content FROM ("
-            "  SELECT id, role, content FROM messages WHERE session_id = ?"
-            "  ORDER BY id DESC LIMIT ?"
-            ") ORDER BY id",
-            (session_id, limit),
+            _LEAF_CHAIN_SQL + "SELECT role, content FROM chain ORDER BY id DESC LIMIT :lim",
+            {"sid": session_id, "lim": limit},
         )
+    rows.reverse()
     return [Message(role=row["role"], content=row["content"] or "") for row in rows]
 
 
 async def list_messages(session_id: str, db_path: str | None = None) -> list[dict]:
+    """当前分支的完整消息链（根到叶），每条带分支位置信息供前端渲染 ◀ 2/3 ▶。"""
     async with get_db(db_path) as conn:
+        chain = await conn.execute_fetchall(
+            _LEAF_CHAIN_SQL + "SELECT id FROM chain",
+            {"sid": session_id},
+        )
+        if not chain:
+            return []
+        path = [r["id"] for r in reversed(chain)]
+        placeholders = ", ".join("?" for _ in path)
         rows = await conn.execute_fetchall(
-            "SELECT id, role, content, created_at FROM messages "
-            "WHERE session_id = ? ORDER BY id",
+            f"SELECT id, role, content, created_at, parent_id FROM messages "
+            f"WHERE id IN ({placeholders})",
+            path,
+        )
+        # 同 parent 的兄弟互为分支；roots（parent NULL）互为第一问的分支
+        siblings = await conn.execute_fetchall(
+            "SELECT id, parent_id FROM messages WHERE session_id = ? ORDER BY id",
             (session_id,),
         )
-    return [dict(row) for row in rows]
+    groups: dict[int | None, list[int]] = {}
+    for s in siblings:
+        groups.setdefault(s["parent_id"], []).append(s["id"])
+    by_id = {r["id"]: dict(r) for r in rows}
+    out = []
+    for mid in path:
+        m = by_id[mid]
+        sibs = groups.get(m["parent_id"], [mid])
+        m["branch_index"] = sibs.index(mid) + 1
+        m["branch_count"] = len(sibs)
+        out.append(m)
+    return out
+
+
+async def session_provider(session_id: str, db_path: str | None = None) -> str | None:
+    """会话的供应商覆盖；NULL = 跟随全局 llm_provider。"""
+    async with get_db(db_path) as conn:
+        rows = await conn.execute_fetchall(
+            "SELECT provider FROM sessions WHERE id = ?", (session_id,)
+        )
+    return rows[0]["provider"] if rows else None
+
+
+async def session_model(session_id: str, db_path: str | None = None) -> str | None:
+    """会话的模型覆盖；NULL = 跟随全局该供应商默认模型。"""
+    async with get_db(db_path) as conn:
+        rows = await conn.execute_fetchall(
+            "SELECT model FROM sessions WHERE id = ?", (session_id,)
+        )
+    return rows[0]["model"] if rows else None
 
 
 def assemble_messages(
@@ -297,12 +408,19 @@ def _apply_skill(
 
 
 async def run_agent(
-    session_id: str, user_message: str, db_path: str | None = None
+    session_id: str,
+    user_message: str,
+    db_path: str | None = None,
+    *,
+    user_saved: bool = False,
 ) -> AsyncIterator[AgentEvent]:
     """ReAct 主循环：加载历史 → 流式生成 → 有工具调用则执行并回到生成。
 
     不建表：HTTP 层由 main.py 的 lifespan 调 init_db，测试自行初始化。
     db_path 仅测试用；HTTP 层走默认路径（app.config.settings.db_path）。
+
+    user_saved=True 用于「回答已有提问」（编辑后重答 / 重新生成）：调用方已把提问
+    落库为会话最后一条，这里从加载到的历史里摘掉它、不再重复插入。
 
     本轮触发的 skill（T11）在开跑前一次性探测：正文进 system 消息，专用工具进本轮
     工具集与执行判据（见 _apply_skill）。探测只做一次，工具集在整轮里不变。
@@ -311,6 +429,11 @@ async def run_agent(
     await ensure_session(session_id, path)
 
     history = await load_history(session_id, HISTORY_LIMIT, path)
+    if user_saved:
+        # respond 端点已校验最后一条就是这条提问，直接摘掉，避免 prompt 里出现两遍
+        if history and history[-1].role == "user":
+            history = history[:-1]
+    first_turn = not history
     # 召回是同步等价的（要进本轮提示词），但失败只降级为无记忆，不抛
     memory = await recall_memories(user_message, path)
     # skill 与记忆同一口径：探测失败退化为「本轮无 skill」，正文进 system 消息、
@@ -321,7 +444,8 @@ async def run_agent(
 
     # 用户提问立刻落库，不等本轮结束：客户端中途关页面时任务会被取消
     # （CancelledError），清理阶段的 await 会被打断，只有提前写才能保证提问不丢。
-    await _save_message(session_id, "user", user_message, path)
+    if not user_saved:
+        await _save_message(session_id, "user", user_message, path)
 
     answer = ""
     calls: list[ToolCall] = []
@@ -352,10 +476,17 @@ async def run_agent(
         # 半截或失败的问答本身就是噪声。整个写入 fire-and-forget，不阻塞 SSE。
         if not interrupted and not degraded:
             spawn_memory_write(session_id, user_message, answer, path)
+            if first_turn:
+                # 首轮成功后顺手起标题（会话列表不再永远是首条消息的前 30 字）
+                spawn_title_write(session_id, user_message, path)
 
     try:
         try:
-            llm = get_llm()
+            # 会话有供应商/模型覆盖时用它建客户端（密钥仍取该供应商的全局配置）。
+            # 不带参数调 get_llm() 是为了兼容测试里 zero-arg 的桩
+            provider = await session_provider(session_id, path)
+            model = await session_model(session_id, path)
+            llm = get_llm(provider=provider, model=model) if provider or model else get_llm()
             for _ in range(MAX_TOOL_ROUNDS):
                 # 每轮都重新治理：轮内追加的工具结果同样要进预算。治理结果接着用作
                 # 下一轮的基底，历史摘要因此只生成一次（不然每轮都会重调一次摘要 LLM）；

@@ -82,13 +82,18 @@ def test_update_settings_blank_secret_keeps_current(client, monkeypatch):
 
 
 class _FakeModel:
-    def __init__(self, mid):
+    def __init__(self, mid, context=None):
         self.id = mid
+        if context is not None:
+            self.context_length = context  # 供应商可选的扩展字段
 
 
 class _FakePage:
-    def __init__(self, ids):
-        self.data = [_FakeModel(i) for i in ids]
+    def __init__(self, items):
+        self.data = [
+            _FakeModel(*spec) if isinstance(spec, tuple) else _FakeModel(spec)
+            for spec in items
+        ]
 
 
 class _FakeModels:
@@ -135,10 +140,24 @@ def test_models_uses_form_values_and_dedupes_sorted(client, monkeypatch):
         json={"kind": "llm", "base_url": "https://relay.example/v1", "api_key": "sk-typed"},
     )
     assert r.status_code == 200, r.text
-    assert r.json()["models"] == ["bge-m3", "gpt-4o-mini"]  # 去重且有序
+    assert r.json()["models"] == [  # 去重且有序；context 缺失落成 null
+        {"id": "bge-m3", "context": None},
+        {"id": "gpt-4o-mini", "context": None},
+    ]
     assert created[0].kwargs["base_url"] == "https://relay.example/v1"
     assert created[0].kwargs["api_key"] == "sk-typed"
     assert created[0].closed  # 用完关掉，不泄漏连接
+
+
+def test_models_carries_context_length(client, monkeypatch):
+    # 供应商给的 context_length 要透传给前端做提示；没给（如 OpenAI 官方）就是 null
+    _install_fake(monkeypatch, ids=[("kimi-k3", 1_000_000), "gpt-4o-mini"])
+    r = client.post("/api/models", json={"kind": "llm", "api_key": "sk-x"})
+    assert r.status_code == 200, r.text
+    assert {m["id"]: m["context"] for m in r.json()["models"]} == {
+        "gpt-4o-mini": None,
+        "kimi-k3": 1_000_000,
+    }
 
 
 def test_models_falls_back_to_saved_config(client, monkeypatch):

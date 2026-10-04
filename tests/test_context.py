@@ -125,17 +125,24 @@ async def seed_history(db, count: int, prefix: str) -> None:
             "INSERT INTO sessions (id, created_at) VALUES (?, ?)",
             (SESSION, "2026-09-24T10:00:00"),
         )
+        # 串成 parent 链并落 active_leaf：load_history 沿分支链回溯，不串链只见叶子
+        prev_id = None
         for i in range(count):
-            await conn.execute(
-                "INSERT INTO messages (session_id, role, content, created_at) "
-                "VALUES (?, ?, ?, ?)",
+            cursor = await conn.execute(
+                "INSERT INTO messages (session_id, role, content, created_at, parent_id) "
+                "VALUES (?, ?, ?, ?, ?)",
                 (
                     SESSION,
                     "user" if i % 2 == 0 else "assistant",
                     f"{prefix}{i}",
                     "2026-09-24T10:00:00",
+                    prev_id,
                 ),
             )
+            prev_id = cursor.lastrowid
+        await conn.execute(
+            "UPDATE sessions SET active_leaf = ? WHERE id = ?", (prev_id, SESSION)
+        )
         await conn.commit()
 
 

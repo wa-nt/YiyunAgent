@@ -65,7 +65,7 @@ LLM 后端通过 `LLM_PROVIDER=openai_compat|anthropic` 切换；OpenAI 兼容�
 | GET | `/api/traces` | 调用明细（kind/name/时间窗过滤，分页） |
 | GET | `/api/traces/summary` | 成本聚合（总计 + 按 kind/name 分组） |
 | GET/POST | `/api/settings` | 模型供应商设置（密钥脱敏回显；保存写 .env 并即时生效，对应侧栏 ⚙ 面板） |
-| POST | `/api/models` | 转发供应商 `GET /models` 给设置面板做模型名建议（只读，不落库；失败返回 401/502/422） |
+| POST | `/api/models` | 转发供应商 `GET /models` 给设置面板做模型名建议，附带上下文窗口长度（字段名各家不一，取不到为 null）。只读，不落库；失败返回 401/502/422 |
 
 ## 项目结构
 

@@ -1,11 +1,13 @@
 import json
 import logging
+import uuid
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Literal
+from typing import AsyncIterator, Literal
 
 from fastapi import FastAPI, HTTPException, Query, UploadFile
-from fastapi.responses import StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from openai import APIConnectionError, AsyncOpenAI, AuthenticationError, OpenAIError
 from pydantic import BaseModel, Field
@@ -58,19 +60,12 @@ class ChatRequest(BaseModel):
     message: str
 
 
-async def _sse(req: ChatRequest):
-    """SSE 流：每个 AgentEvent 一行 `data: {json}`。session_id 为空的请求
-    先把新建的 id 作为首个事件发出，前端据此续聊。
-
-    整个流包在 try/except 里：run_agent 抛出、或写库 / json.dumps 失败时，
-    HTTP 状态码已经发出去了，只能尽量补一个 error 事件再结束——否则前端
-    收到的是 200 加静默截断，会一直等 done。
-    """
+async def _sse_events(events) -> AsyncIterator[str]:
+    """把 AgentEvent 流编成 SSE 行。整个流包在 try/except 里：run_agent 抛出、或写库 /
+    json.dumps 失败时，HTTP 状态码已经发出去了，只能尽量补一个 error 事件再结束——
+    否则前端收到的是 200 加静默截断，会一直等 done。"""
     try:
-        if not req.session_id:
-            req.session_id = await ensure_session(None)
-            yield _sse_line("session", {"session_id": req.session_id})
-        async for event in run_agent(req.session_id, req.message):
+        async for event in events:
             yield _sse_line(event.type, event.data)
     except Exception:
         # 异常文本对用户没有意义（还可能带出内部路径），只记日志，界面给一句可重试的提示
@@ -78,18 +73,72 @@ async def _sse(req: ChatRequest):
         yield _sse_line("error", {"message": "生成出错，请重试"})
 
 
+async def _sse(req: ChatRequest):
+    """SSE 流：每个 AgentEvent 一行 `data: {json}`。session_id 为空的请求
+    先把新建的 id 作为首个事件发出，前端据此续聊。"""
+    try:
+        if not req.session_id:
+            req.session_id = await ensure_session(None)
+            yield _sse_line("session", {"session_id": req.session_id})
+    except Exception:
+        # 建会话失败同样只能补 error 事件：HTTP 状态码已发出，不能让前端干等
+        logger.exception("创建会话失败")
+        yield _sse_line("error", {"message": "生成出错，请重试"})
+        return
+    async for line in _sse_events(run_agent(req.session_id, req.message)):
+        yield line
+
+
 def _sse_line(event_type: str, data: dict) -> str:
     """SSE 一行。事件数据都由 runtime 用 JSON 可序列化的值构造，无需再做兜底。"""
     return f"data: {json.dumps({'type': event_type, 'data': data}, ensure_ascii=False)}\n\n"
 
 
-@app.post("/api/chat")
-async def chat(req: ChatRequest) -> StreamingResponse:
+def _sse_response(lines: AsyncIterator[str]) -> StreamingResponse:
     return StreamingResponse(
-        _sse(req),
+        lines,
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
+
+
+@app.post("/api/chat")
+async def chat(req: ChatRequest) -> StreamingResponse:
+    return _sse_response(_sse(req))
+
+
+@app.post("/api/sessions/{session_id}/respond")
+async def respond(session_id: str, mid: int | None = None) -> StreamingResponse:
+    """回答会话里已落库的用户提问（编辑后重答 / 重新生成的共用入口）。
+
+    mid 给出时先把 active_leaf 切到那条提问上（重新生成 = 回到提问再答一次，
+    旧回答留在自己的分支上不动）；不给则用当前叶子。叶子必须是 user 消息。
+    与 /api/chat 的差别只在不再插入用户消息——提问已经由调用方写好了。
+    """
+    async with get_db() as conn:
+        if mid is not None:
+            rows = await conn.execute_fetchall(
+                "SELECT role FROM messages WHERE id = ? AND session_id = ?",
+                (mid, session_id),
+            )
+            if not rows:
+                raise HTTPException(status_code=404, detail="消息不存在")
+            if rows[0]["role"] != "user":
+                raise HTTPException(status_code=422, detail="只能对用户提问重新生成")
+            await conn.execute(
+                "UPDATE sessions SET active_leaf = ? WHERE id = ?", (mid, session_id)
+            )
+            await conn.commit()
+        rows = await conn.execute_fetchall(
+            "SELECT role, content FROM messages WHERE session_id = ?1 AND id = "
+            "COALESCE((SELECT active_leaf FROM sessions WHERE id = ?1), "
+            "(SELECT MAX(id) FROM messages WHERE session_id = ?1))",
+            (session_id,),
+        )
+    if not rows or rows[0]["role"] != "user":
+        raise HTTPException(status_code=409, detail="会话末尾没有待回答的提问")
+    message = rows[0]["content"] or ""
+    return _sse_response(_sse_events(run_agent(session_id, message, user_saved=True)))
 
 
 @app.get("/api/sessions/{session_id}/messages")
@@ -97,19 +146,373 @@ async def session_messages(session_id: str) -> list[dict]:
     return await list_messages(session_id)
 
 
+def _like_escape(q: str) -> str:
+    """LIKE 的 %/_ 转义（配合 ESCAPE '\\'），否则用户搜个 100% 就变成全匹配。"""
+    return q.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
 @app.get("/api/sessions")
-async def api_sessions() -> list[dict]:
-    """会话列表，最近活跃在前。title 取首条 user 消息前 30 字，还没发过言的会话为空串。"""
+async def api_sessions(q: str = "") -> list[dict]:
+    """会话列表，最近活跃在前。title 优先用户改名 / 自动标题，回退首条 user 消息前 30 字。
+    q 命中标题或任意一条消息内容的会话才返回（LIKE 子串匹配，量大了再考虑 FTS）。"""
+    like = f"%{_like_escape(q)}%" if q else ""
     async with get_db() as conn:
         rows = await conn.execute_fetchall(
-            "SELECT s.id, s.created_at, "
-            "COALESCE((SELECT substr(content, 1, 30) FROM messages WHERE session_id = s.id "
-            "AND role = 'user' ORDER BY id LIMIT 1), '') AS title, "
+            "SELECT s.id, s.created_at, s.provider, s.model, "
+            "COALESCE(s.title, (SELECT substr(content, 1, 30) FROM messages "
+            "WHERE session_id = s.id AND role = 'user' ORDER BY id LIMIT 1), '') AS title, "
             "(SELECT COUNT(*) FROM messages WHERE session_id = s.id) AS message_count "
             "FROM sessions s "
-            "ORDER BY (SELECT MAX(id) FROM messages WHERE session_id = s.id) DESC"
+            "WHERE (? = '' OR COALESCE(s.title, '') LIKE ? ESCAPE '\\' "
+            "OR EXISTS (SELECT 1 FROM messages m WHERE m.session_id = s.id "
+            "AND m.content LIKE ? ESCAPE '\\')) "
+            "ORDER BY (SELECT MAX(id) FROM messages WHERE session_id = s.id) DESC",
+            (q, like, like),
         )
     return [dict(row) for row in rows]
+
+
+class SessionUpdate(BaseModel):
+    """字段缺省 = 不动；provider/model 传空串 = 清掉覆盖（跟随全局）。"""
+
+    title: str | None = None
+    provider: Literal["openai_compat", "anthropic", ""] | None = None
+    model: str | None = None
+
+
+@app.patch("/api/sessions/{session_id}")
+async def api_session_update(session_id: str, req: SessionUpdate) -> dict:
+    if req.title is None and req.provider is None and req.model is None:
+        raise HTTPException(status_code=422, detail="没有要更新的字段")
+    async with get_db() as conn:
+        rows = await conn.execute_fetchall(
+            "SELECT 1 FROM sessions WHERE id = ?", (session_id,)
+        )
+        if not rows:
+            raise HTTPException(status_code=404, detail="会话不存在")
+        if req.title is not None:
+            title = req.title.strip()
+            if not title:
+                raise HTTPException(status_code=422, detail="标题不能为空")
+            await conn.execute(
+                "UPDATE sessions SET title = ? WHERE id = ?", (title, session_id)
+            )
+        if req.provider is not None:
+            await conn.execute(
+                "UPDATE sessions SET provider = ? WHERE id = ?",
+                (req.provider or None, session_id),
+            )
+        if req.model is not None:
+            await conn.execute(
+                "UPDATE sessions SET model = ? WHERE id = ?",
+                (req.model.strip() or None, session_id),
+            )
+        await conn.commit()
+    return {"updated": session_id}
+
+
+@app.delete("/api/sessions/{session_id}")
+async def api_session_delete(session_id: str) -> dict:
+    """删会话连带消息：messages 引用 sessions 且没有 ON DELETE CASCADE，
+    必须先删子表再删父表，否则外键约束直接拒。"""
+    async with get_db() as conn:
+        rows = await conn.execute_fetchall(
+            "SELECT 1 FROM sessions WHERE id = ?", (session_id,)
+        )
+        if not rows:
+            raise HTTPException(status_code=404, detail="会话不存在")
+        await conn.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
+        await conn.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
+        await conn.commit()
+    return {"deleted": session_id}
+
+
+class MessageUpdate(BaseModel):
+    content: str
+
+
+@app.put("/api/messages/{message_id}")
+async def api_message_edit(message_id: int, req: MessageUpdate) -> dict:
+    """编辑用户提问 = 开分支：原消息原样保留，在同 parent 下新建一条兄弟消息
+    并把 active_leaf 切过去，前端随后调 /respond 在新分支上生成回答。
+    只允许编辑 user 消息——改 assistant 的回答等于伪造历史。"""
+    content = req.content.strip()
+    if not content:
+        raise HTTPException(status_code=422, detail="内容不能为空")
+    async with get_db() as conn:
+        rows = await conn.execute_fetchall(
+            "SELECT session_id, role, parent_id FROM messages WHERE id = ?", (message_id,)
+        )
+        if not rows:
+            raise HTTPException(status_code=404, detail="消息不存在")
+        if rows[0]["role"] != "user":
+            raise HTTPException(status_code=422, detail="只能编辑自己的提问")
+        cursor = await conn.execute(
+            "INSERT INTO messages (session_id, role, content, created_at, parent_id) "
+            "VALUES (?, 'user', ?, ?, ?)",
+            (
+                rows[0]["session_id"],
+                content,
+                datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                rows[0]["parent_id"],
+            ),
+        )
+        new_id = cursor.lastrowid
+        await conn.execute(
+            "UPDATE sessions SET active_leaf = ? WHERE id = ?",
+            (new_id, rows[0]["session_id"]),
+        )
+        await conn.commit()
+    return {"updated": message_id, "new_id": new_id}
+
+
+@app.delete("/api/messages/{message_id}")
+async def api_message_delete(message_id: int) -> dict:
+    """删除一条消息及其整个子分支；当前分支被删断时 active_leaf 回退到被删节点的 parent
+    （None 也行——读取侧会回退到 max(id)）。"""
+    async with get_db() as conn:
+        rows = await conn.execute_fetchall(
+            "SELECT session_id, parent_id FROM messages WHERE id = ?", (message_id,)
+        )
+        if not rows:
+            raise HTTPException(status_code=404, detail="消息不存在")
+        session_id, parent_id = rows[0]["session_id"], rows[0]["parent_id"]
+        # aiosqlite 对 CTE+DELETE 的 rowcount 不可靠（恒为 -1），用 changes() 取真实删除数
+        await conn.execute(
+            "WITH RECURSIVE sub AS ("
+            "  SELECT id FROM messages WHERE id = ?"
+            "  UNION ALL"
+            "  SELECT m.id FROM messages m JOIN sub s ON m.parent_id = s.id"
+            ") DELETE FROM messages WHERE id IN (SELECT id FROM sub)",
+            (message_id,),
+        )
+        deleted_n = (await conn.execute_fetchall("SELECT changes() AS n"))[0]["n"]
+        leaf = await conn.execute_fetchall(
+            "SELECT active_leaf FROM sessions WHERE id = ?", (session_id,)
+        )
+        if leaf and leaf[0]["active_leaf"] is not None:
+            alive = await conn.execute_fetchall(
+                "SELECT 1 FROM messages WHERE id = ?", (leaf[0]["active_leaf"],)
+            )
+            if not alive:
+                await conn.execute(
+                    "UPDATE sessions SET active_leaf = ? WHERE id = ?",
+                    (parent_id, session_id),
+                )
+        await conn.commit()
+    return {"deleted": deleted_n}
+
+
+class BranchSwitch(BaseModel):
+    direction: Literal[-1, 1]
+
+
+@app.post("/api/messages/{message_id}/branch")
+async def api_message_branch(message_id: int, req: BranchSwitch) -> dict:
+    """切到相邻分支：找到同 parent 的上一个/下一个兄弟，把 active_leaf 落到它
+    子树里最新的一支（分支切换后看到的是该分支最近一次对话的结尾）。"""
+    async with get_db() as conn:
+        rows = await conn.execute_fetchall(
+            "SELECT session_id, parent_id FROM messages WHERE id = ?", (message_id,)
+        )
+        if not rows:
+            raise HTTPException(status_code=404, detail="消息不存在")
+        session_id, parent_id = rows[0]["session_id"], rows[0]["parent_id"]
+        if parent_id is None:
+            sibs = await conn.execute_fetchall(
+                "SELECT id FROM messages WHERE session_id = ? AND parent_id IS NULL "
+                "ORDER BY id",
+                (session_id,),
+            )
+        else:
+            sibs = await conn.execute_fetchall(
+                "SELECT id FROM messages WHERE session_id = ? AND parent_id = ? "
+                "ORDER BY id",
+                (session_id, parent_id),
+            )
+        ids = [s["id"] for s in sibs]
+        target = ids.index(message_id) + req.direction
+        if not 0 <= target < len(ids):
+            raise HTTPException(status_code=404, detail="那个方向没有更多分支")
+        # 沿最新子节点下探到叶子
+        leaf = ids[target]
+        while True:
+            child = (
+                await conn.execute_fetchall(
+                    "SELECT MAX(id) AS c FROM messages WHERE parent_id = ?", (leaf,)
+                )
+            )[0]["c"]
+            if child is None:
+                break
+            leaf = child
+        await conn.execute(
+            "UPDATE sessions SET active_leaf = ? WHERE id = ?", (leaf, session_id)
+        )
+        await conn.commit()
+    return {"leaf": leaf}
+
+
+@app.patch("/api/memories/{memory_id}")
+async def api_memory_edit(memory_id: int, req: MessageUpdate) -> dict:
+    content = req.content.strip()
+    if not content:
+        raise HTTPException(status_code=422, detail="内容不能为空")
+    async with get_db() as conn:
+        cursor = await conn.execute(
+            "UPDATE memories SET content = ?, updated_at = ? WHERE id = ?",
+            (content, datetime.now(timezone.utc).isoformat(timespec="seconds"), memory_id),
+        )
+        await conn.commit()
+    if cursor.rowcount == 0:
+        raise HTTPException(status_code=404, detail="记忆不存在")
+    return {"updated": memory_id}
+
+
+@app.delete("/api/memories/{memory_id}")
+async def api_memory_delete(memory_id: int) -> dict:
+    async with get_db() as conn:
+        cursor = await conn.execute("DELETE FROM memories WHERE id = ?", (memory_id,))
+        await conn.commit()
+    if cursor.rowcount == 0:
+        raise HTTPException(status_code=404, detail="记忆不存在")
+    return {"deleted": memory_id}
+
+
+@app.get("/api/export")
+async def api_export() -> JSONResponse:
+    """用户数据导出（会话/消息/记忆/文档清单）。chunks 与向量是可从文档重建的
+    派生数据，不进导出文件；要完整备份请用 /api/export/db。"""
+    async with get_db() as conn:
+        data: dict = {
+            "version": 1,
+            "exported_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        }
+        for table in ("sessions", "messages", "memories", "documents"):
+            rows = await conn.execute_fetchall(f"SELECT * FROM {table}")
+            data[table] = [dict(row) for row in rows]
+    return JSONResponse(
+        data,
+        headers={"Content-Disposition": 'attachment; filename="second-brain-export.json"'},
+    )
+
+
+@app.get("/api/export/db")
+async def api_export_db() -> FileResponse:
+    """整库下载。WAL 模式下最新写入可能还在 -wal 文件里，先 checkpoint 合并进主库文件再发。"""
+    async with get_db() as conn:
+        await conn.execute("PRAGMA wal_checkpoint(FULL)")
+    return FileResponse(settings.db_path, filename="app.db")
+
+
+def _iso_from_ts(ts) -> str:
+    """ChatGPT 导出里的 unix 秒时间戳转 ISO；缺失/异常时回退当前时间。"""
+    try:
+        return datetime.fromtimestamp(float(ts), tz=timezone.utc).isoformat(timespec="seconds")
+    except (TypeError, ValueError, OSError, OverflowError):
+        return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _linearize_chatgpt(convo: dict) -> list[tuple[str, str, str]]:
+    """把 ChatGPT conversations.json 的树形 mapping 拉直成 [(role, content, created_at)]。
+
+    从根节点（parent 为 None）沿 children[0] 走主分支：导出文件里一条会话可能有多个
+    分支，只取当前生效的那条。system/tool 角色、非文本 parts（图片等）跳过。
+    """
+    mapping = convo.get("mapping") or {}
+    node = next((n for n in mapping.values() if n.get("parent") is None), None)
+    out: list[tuple[str, str, str]] = []
+    while node:
+        msg = node.get("message")
+        role = ((msg or {}).get("author") or {}).get("role")
+        if role in ("user", "assistant"):
+            parts = ((msg.get("content") or {}).get("parts")) or []
+            text = "\n".join(p for p in parts if isinstance(p, str)).strip()
+            if text:
+                out.append((role, text, _iso_from_ts(msg.get("create_time"))))
+        children = node.get("children") or []
+        node = mapping.get(children[0]) if children else None
+    return out
+
+
+def _linearize_claude(convo: dict) -> list[tuple[str, str, str]]:
+    """Claude 导出（conversations.json）是线性结构：chat_messages 已按序排列，
+    sender 用 human/assistant，正文在 text 或 content[].text。"""
+    out: list[tuple[str, str, str]] = []
+    for m in convo.get("chat_messages") or []:
+        role = {"human": "user", "assistant": "assistant"}.get(m.get("sender"))
+        if not role:
+            continue
+        text = (m.get("text") or "").strip()
+        if not text:
+            parts = [
+                c.get("text", "")
+                for c in (m.get("content") or [])
+                if isinstance(c, dict) and c.get("type") == "text"
+            ]
+            text = "\n".join(p for p in parts if p).strip()
+        if text:
+            # Claude 的 created_at 本身已是 ISO 字符串，原样保留
+            out.append(
+                (
+                    role,
+                    text,
+                    m.get("created_at")
+                    or datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                )
+            )
+    return out
+
+
+@app.post("/api/import/chatgpt")
+async def api_import_chatgpt(file: UploadFile) -> dict:
+    """导入 ChatGPT / Claude 的 conversations.json：逐会话嗅探格式（mapping 树 =
+    ChatGPT，chat_messages 列表 = Claude），每个会话建一条 session（保留原标题），
+    消息按序落库并串成 parent 链。重复导入会重复建会话，由用户自行删除。"""
+    data = await file.read()
+    if len(data) > UPLOAD_MAX_BYTES:
+        raise HTTPException(status_code=422, detail="文件超过 50MB 上限")
+    try:
+        convos = json.loads(data)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        raise HTTPException(status_code=422, detail="不是有效的 JSON 文件")
+    if not isinstance(convos, list):
+        raise HTTPException(status_code=422, detail="不是 ChatGPT/Claude 导出格式（应为会话数组）")
+
+    sessions_n = messages_n = 0
+    async with get_db() as conn:
+        for convo in convos:
+            if not isinstance(convo, dict):
+                continue
+            if "mapping" in convo:
+                msgs = _linearize_chatgpt(convo)
+            elif "chat_messages" in convo:
+                msgs = _linearize_claude(convo)
+            else:
+                continue
+            if not msgs:
+                continue
+            session_id = uuid.uuid4().hex
+            title = (convo.get("title") or convo.get("name") or "").strip() or None
+            await conn.execute(
+                "INSERT INTO sessions (id, created_at, title) VALUES (?, ?, ?)",
+                (session_id, _iso_from_ts(convo.get("create_time") or convo.get("created_at")), title),
+            )
+            prev_id = None
+            for role, content, ts in msgs:
+                cursor = await conn.execute(
+                    "INSERT INTO messages (session_id, role, content, created_at, parent_id) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (session_id, role, content, ts, prev_id),
+                )
+                prev_id = cursor.lastrowid
+            await conn.execute(
+                "UPDATE sessions SET active_leaf = ? WHERE id = ?",
+                (prev_id, session_id),
+            )
+            sessions_n += 1
+            messages_n += len(msgs)
+        await conn.commit()
+    return {"sessions": sessions_n, "messages": messages_n}
 
 
 @app.get("/api/chunks/{chunk_id}")
@@ -315,6 +718,15 @@ class ModelListRequest(BaseModel):
     api_key: str | None = None
 
 
+def _model_context_length(model) -> int | None:
+    """供应商在 /models 里附带的上下文窗口长度。字段名各家不一，OpenAI 官方压根不给。"""
+    for field in ("context_length", "context_window", "max_context_length"):
+        value = getattr(model, field, None)
+        if isinstance(value, int) and value > 0:
+            return value
+    return None
+
+
 @app.post("/api/models")
 async def api_models(req: ModelListRequest) -> dict:
     """转发 GET {base_url}/models，把供应商的模型清单给前端做输入建议。
@@ -338,7 +750,6 @@ async def api_models(req: ModelListRequest) -> dict:
 
     try:
         page = await client.models.list()
-        models = sorted({m.id for m in page.data})
     except AuthenticationError as exc:
         raise HTTPException(status_code=401, detail="API Key 无效或无权访问该端点") from exc
     except APIConnectionError as exc:
@@ -348,7 +759,25 @@ async def api_models(req: ModelListRequest) -> dict:
     finally:
         await client.close()
 
-    return {"models": models}
+    # 去重后按 id 排序。context 缺失就是 null，前端只把它当提示，不强制
+    seen: dict[str, int | None] = {}
+    for m in page.data:
+        seen.setdefault(m.id, _model_context_length(m))
+    return {"models": [{"id": mid, "context": seen[mid]} for mid in sorted(seen)]}
+
+
+@app.get("/api/skills")
+async def api_skills() -> list[dict]:
+    """已加载的 skill 清单，给前端 / 命令面板用。load_skills 每次现扫目录，
+    用户改完 skills/ 目录刷新即生效，无需重启。"""
+    from app.skills.loader import load_skills
+
+    if not settings.skills_enabled:
+        return []
+    return [
+        {"name": s.name, "description": s.description, "triggers": list(s.triggers)}
+        for s in load_skills(settings.skills_dir).values()
+    ]
 
 
 # T6 的前端目录；不存在时跳过挂载（挂到 / 会吞掉未匹配的 API 路径，所以放最后）

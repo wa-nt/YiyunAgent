@@ -45,6 +45,29 @@ async def init_db(db_path: str | Path | None = None, embed_dim: int | None = Non
     conn = await connect(path)
     try:
         await conn.executescript(render_schema(embed_dim or settings.embed_dim))
+        # 存量库补列：CREATE TABLE IF NOT EXISTS 不会给已存在的表加新列
+        session_cols = {r["name"] for r in await conn.execute_fetchall("PRAGMA table_info(sessions)")}
+        if "title" not in session_cols:
+            await conn.execute("ALTER TABLE sessions ADD COLUMN title TEXT")
+        if "provider" not in session_cols:
+            await conn.execute("ALTER TABLE sessions ADD COLUMN provider TEXT")
+        if "model" not in session_cols:
+            await conn.execute("ALTER TABLE sessions ADD COLUMN model TEXT")
+        if "active_leaf" not in session_cols:
+            await conn.execute("ALTER TABLE sessions ADD COLUMN active_leaf INTEGER")
+            # 回填：旧库都是线性消息，叶子 = 每个会话的最后一条
+            await conn.execute(
+                "UPDATE sessions SET active_leaf = "
+                "(SELECT MAX(id) FROM messages WHERE session_id = sessions.id)"
+            )
+        msg_cols = {r["name"] for r in await conn.execute_fetchall("PRAGMA table_info(messages)")}
+        if "parent_id" not in msg_cols:
+            await conn.execute("ALTER TABLE messages ADD COLUMN parent_id INTEGER")
+            # 回填成线性链：每条消息的 parent 是同会话里它前面的最后一条
+            await conn.execute(
+                "UPDATE messages SET parent_id = (SELECT MAX(m2.id) FROM messages m2 "
+                "WHERE m2.session_id = messages.session_id AND m2.id < messages.id)"
+            )
         await conn.commit()
     finally:
         await conn.close()
