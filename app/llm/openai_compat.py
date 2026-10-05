@@ -1,10 +1,12 @@
 import json
 from typing import Any, AsyncIterator
 
+import httpx
 from openai import AsyncOpenAI
 
 from app.llm.types import (
     ChatResult,
+    Effort,
     Message,
     StreamChunk,
     ToolCall,
@@ -95,18 +97,37 @@ class OpenAICompatClient:
         model: str,
         base_url: str | None = None,
         db_path: str | None = None,
+        effort: Effort | None = None,
     ):
-        self.client = AsyncOpenAI(api_key=api_key, base_url=base_url)
+        # 连接快超时、首字节宽限 120s：provider 卡住时尽早报错，别让用户干等；
+        # 重试只给 1 次，重试本身也会晾住首字节
+        self.client = AsyncOpenAI(
+            api_key=api_key,
+            base_url=base_url,
+            timeout=httpx.Timeout(connect=10.0, read=120.0, write=30.0, pool=10.0),
+            max_retries=1,
+        )
         self.model = model
         self.provider = detect_provider(base_url)
         # 埋点落哪个库由**创建者**决定：用自定义库时传进来，HTTP 主流程不传，
         # record_llm 拿到 None 后由 get_db 兜到默认库（见 app/tracing.record_llm）
         self.db_path = db_path
+        self.effort = effort
+
+    def _effort_kwarg(self) -> dict[str, Any]:
+        """把可移植 effort 翻成 reasoning_effort。off/缺省 = 不传（不思考/跟随默认）；
+        max 在这边没有更高档，映射到 high——硬造一个值会被不认的端点 400 拒掉。"""
+        if self.provider == "deepseek":
+            # DeepSeek 不认 reasoning_effort，发了每轮都 400；只能不发
+            return {}
+        if self.effort in ("low", "high", "max"):
+            return {"reasoning_effort": "high" if self.effort in ("high", "max") else "low"}
+        return {}
 
     async def chat(
         self, messages: list[Message], tools: list[ToolDef] | None = None
     ) -> ChatResult:
-        kwargs: dict[str, Any] = {}
+        kwargs: dict[str, Any] = {**self._effort_kwarg()}
         if tools:
             kwargs["tools"] = to_openai_tools(tools)
         resp = await self.client.chat.completions.create(
@@ -127,7 +148,7 @@ class OpenAICompatClient:
     async def chat_stream(
         self, messages: list[Message], tools: list[ToolDef] | None = None
     ) -> AsyncIterator[StreamChunk]:
-        kwargs: dict[str, Any] = {"stream_options": {"include_usage": True}}
+        kwargs: dict[str, Any] = {"stream_options": {"include_usage": True}, **self._effort_kwarg()}
         if tools:
             kwargs["tools"] = to_openai_tools(tools)
         stream = await self.client.chat.completions.create(

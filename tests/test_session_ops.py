@@ -208,16 +208,24 @@ async def test_session_patch_validation(client, db):
     assert (await client.patch("/api/sessions/s1", json={})).status_code == 422
 
 
-async def test_session_delete_removes_messages_too(client, db):
+async def test_session_delete_is_soft_and_restorable(client, db):
+    """删除只打 deleted_at 标记：列表里消失、消息原样留着，撤销后完整回来。"""
     await seed_session(db, messages=[("user", "问"), ("assistant", "答")])
     await seed_session(db, "s2", [("user", "别删我")])
 
     resp = await client.delete("/api/sessions/s1")
 
     assert resp.status_code == 200
-    assert await messages_of(db) == []
+    assert [c for _, c in await messages_of(db)] == ["问", "答"]  # 消息没被物理删除
     rows = (await client.get("/api/sessions")).json()
     assert [r["id"] for r in rows] == ["s2"]
+    assert (await client.get("/api/sessions/s1")).status_code == 404
+    assert (await client.get("/api/sessions/s1/messages")).status_code == 404
+
+    restored = await client.post("/api/sessions/s1/restore")
+    assert restored.status_code == 200
+    assert sorted(r["id"] for r in (await client.get("/api/sessions")).json()) == ["s1", "s2"]
+    assert len((await client.get("/api/sessions/s1/messages")).json()) == 2
 
 
 async def test_session_delete_missing_is_404(client, db):
@@ -518,7 +526,7 @@ async def test_session_provider_override_is_used(db, monkeypatch):
     events = [e async for e in runtime.run_agent("s1", "问", user_saved=True)]
 
     assert events[-1].type == "done"
-    assert captured == {"provider": "anthropic", "model": None}
+    assert captured == {"provider": "anthropic", "model": None, "effort": None}
 
 
 async def test_first_turn_generates_title(db, monkeypatch):
@@ -554,3 +562,56 @@ async def test_title_write_never_overwrites_existing_title(db, monkeypatch):
 async def client_get_sessions(db):
     async with get_db(db) as conn:
         return await conn.execute_fetchall("SELECT id, title FROM sessions")
+
+
+async def test_import_own_export_roundtrip(client, db):
+    """自家 /api/export 的回灌：按原 id 落库（幂等），分支链 parent_id/active_leaf 原样保住。"""
+    export = {
+        "version": 1,
+        "exported_at": "2026-10-05T00:00:00",
+        "sessions": [
+            {"id": "s-own", "created_at": "2026-10-01T00:00:00", "title": "旧会话", "active_leaf": 2}
+        ],
+        "messages": [
+            {"id": 1, "session_id": "s-own", "role": "user", "content": "Q",
+             "created_at": "2026-10-01T00:00:01", "parent_id": None},
+            {"id": 2, "session_id": "s-own", "role": "assistant", "content": "A",
+             "created_at": "2026-10-01T00:00:02", "parent_id": 1},
+        ],
+        "memories": [
+            {"id": 1, "kind": "fact", "content": "备份的记忆", "confidence": 0.9,
+             "status": "active", "created_at": "2026-10-01T00:00:00"}
+        ],
+    }
+    payload = json.dumps(export).encode()
+    resp = await client.post(
+        "/api/import", files={"file": ("export.json", payload, "application/json")}
+    )
+    assert resp.status_code == 200
+    assert resp.json()["imported"]["sessions"] == 1
+    assert resp.json()["imported"]["messages"] == 2
+    msgs = await active_path(client, "s-own")
+    assert [(m["role"], m["content"]) for m in msgs] == [("user", "Q"), ("assistant", "A")]
+    assert (await client.get("/api/memories")).json()[0]["content"] == "备份的记忆"
+
+    # 幂等：同一份备份再灌一次，零新增
+    resp2 = await client.post(
+        "/api/import", files={"file": ("export.json", payload, "application/json")}
+    )
+    assert all(n == 0 for n in resp2.json()["imported"].values())
+
+
+async def test_import_unified_still_accepts_chatgpt(client, db):
+    resp = await client.post(
+        "/api/import",
+        files={"file": ("conversations.json", chatgpt_export(), "application/json")},
+    )
+    assert resp.status_code == 200
+    assert resp.json() == {"sessions": 1, "messages": 2}
+
+
+async def test_import_rejects_unknown_shape(client, db):
+    resp = await client.post(
+        "/api/import", files={"file": ("x.json", b'{"foo": 1}', "application/json")}
+    )
+    assert resp.status_code == 422

@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, AsyncIterator
 
-from app.agent.context import govern_context
+from app.agent.context import compact_history_persistent, govern_context
 from app.config import settings
 from app.db import get_db
 from app.llm import get_llm
@@ -293,16 +293,24 @@ WITH RECURSIVE chain AS (
 """
 
 
+async def load_history_rows(
+    session_id: str, limit: int = HISTORY_LIMIT, db_path: str | None = None
+) -> list[dict]:
+    """按时间正序返回当前分支最近 limit 条历史，带消息 id（持久化压缩要按 id 记覆盖位置）。"""
+    async with get_db(db_path) as conn:
+        rows = await conn.execute_fetchall(
+            _LEAF_CHAIN_SQL + "SELECT id, role, content FROM chain ORDER BY id DESC LIMIT :lim",
+            {"sid": session_id, "lim": limit},
+        )
+    rows.reverse()
+    return [dict(row) for row in rows]
+
+
 async def load_history(
     session_id: str, limit: int = HISTORY_LIMIT, db_path: str | None = None
 ) -> list[Message]:
     """按时间正序返回当前分支最近 limit 条历史（链是新到旧，翻正后截断）。"""
-    async with get_db(db_path) as conn:
-        rows = await conn.execute_fetchall(
-            _LEAF_CHAIN_SQL + "SELECT role, content FROM chain ORDER BY id DESC LIMIT :lim",
-            {"sid": session_id, "lim": limit},
-        )
-    rows.reverse()
+    rows = await load_history_rows(session_id, limit, db_path)
     return [Message(role=row["role"], content=row["content"] or "") for row in rows]
 
 
@@ -357,6 +365,15 @@ async def session_model(session_id: str, db_path: str | None = None) -> str | No
             "SELECT model FROM sessions WHERE id = ?", (session_id,)
         )
     return rows[0]["model"] if rows else None
+
+
+async def session_effort(session_id: str, db_path: str | None = None) -> str | None:
+    """会话的思考强度覆盖；NULL = 跟随供应商默认。四档 off/low/high/max。"""
+    async with get_db(db_path) as conn:
+        rows = await conn.execute_fetchall(
+            "SELECT effort FROM sessions WHERE id = ?", (session_id,)
+        )
+    return rows[0]["effort"] if rows else None
 
 
 # ---------- 可配置人格（T2） ----------
@@ -606,11 +623,14 @@ async def run_agent(
     await ensure_session(session_id, path, mode=mode if mode is not None else DEFAULT_MODE)
     session_mode = mode if mode is not None else await get_session_mode(session_id, path)
 
-    history = await load_history(session_id, HISTORY_LIMIT, path)
+    rows = await load_history_rows(session_id, HISTORY_LIMIT, path)
     if user_saved:
         # respond 端点已校验最后一条就是这条提问，直接摘掉，避免 prompt 里出现两遍
-        if history and history[-1].role == "user":
-            history = history[:-1]
+        if rows and rows[-1]["role"] == "user":
+            rows = rows[:-1]
+    # 持久化压缩（T8）：摘要有缓存时本轮不再调摘要 LLM。摘要是后台工具调用，
+    # 用全局默认模型即可（会话级 provider/model/effort 覆盖是面向正式回答的）
+    history = await compact_history_persistent(session_id, rows, db_path=path)
     first_turn = not history
     # 召回是同步等价的（要进本轮提示词），但失败只降级为无记忆，不抛
     memory = await recall_memories(user_message, path)
@@ -668,11 +688,17 @@ async def run_agent(
             # 不带参数调 get_llm() 是为了兼容测试里 zero-arg 的桩
             provider = await session_provider(session_id, path)
             model = await session_model(session_id, path)
-            llm = get_llm(provider=provider, model=model) if provider or model else get_llm()
+            effort = await session_effort(session_id, path)
+            override = provider or model or effort
+            llm = (
+                get_llm(provider=provider, model=model, effort=effort)
+                if override
+                else get_llm()
+            )
             for _ in range(MAX_TOOL_ROUNDS):
                 # 每轮都重新治理：轮内追加的工具结果同样要进预算。治理结果接着用作
-                # 下一轮的基底，历史摘要因此只生成一次（不然每轮都会重调一次摘要 LLM）；
-                # 它仍然只活在 prompt view 里，下一轮重新加载原始历史再压一次。
+                # 下一轮的基底，历史摘要因此只生成一次；摘要持久化在 sessions 表
+                # （compact_history_persistent），跨用户回合也只在增量越窗时才重压。
                 messages = await govern_context(messages, llm=llm)
                 text = ""
                 final_calls: list[ToolCall] = []

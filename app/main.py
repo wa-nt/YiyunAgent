@@ -1,5 +1,7 @@
 import json
 import logging
+import shutil
+import sqlite3
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -46,9 +48,34 @@ UPLOAD_SUFFIXES = {".md", ".markdown", ".pdf", ".txt"}
 UPLOAD_MAX_BYTES = 50 * 1024 * 1024  # 固定上限，需要时再做配置
 
 
+BACKUP_KEEP = 5  # 启动时自动备份保留的份数
+
+
+def _backup_db() -> None:
+    """启动时把 app.db 复制一份到 backups/（先 checkpoint 把 WAL 合并进主库），保留最近
+    BACKUP_KEEP 份。备份失败只记日志：备份是保险丝，不能挡住应用启动。"""
+    src = Path(settings.db_path)
+    if not src.exists():
+        return
+    try:
+        # 同步 sqlite3 做 checkpoint：此刻 lifespan 还没开始服务请求，无并发写
+        with sqlite3.connect(src) as conn:
+            conn.execute("PRAGMA wal_checkpoint(FULL)")
+        dest_dir = src.parent / "backups"
+        dest_dir.mkdir(exist_ok=True)
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        shutil.copy2(src, dest_dir / f"app-{stamp}.db")
+        old = sorted(dest_dir.glob("app-*.db"))[:-BACKUP_KEEP]
+        for f in old:
+            f.unlink()
+    except OSError as exc:
+        logger.warning("数据库自动备份失败：%s", exc)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await init_db()
+    _backup_db()
     # 定时任务调度（T5）随应用起停。单进程单 worker 是它的前提：多 worker 会重复触发
     # （数据库占位只防同一进程内的重复），桌面入口负责单实例。
     scheduler.start_scheduler()
@@ -109,7 +136,9 @@ async def _existing_session_mode(session_id: str) -> str | None:
     库里的 mode 是未知值时由 get_session_mode 抛 UnknownModeError，交给调用方收口。
     """
     async with get_db() as conn:
-        rows = await conn.execute_fetchall("SELECT 1 FROM sessions WHERE id = ?", (session_id,))
+        rows = await conn.execute_fetchall(
+            "SELECT 1 FROM sessions WHERE id = ? AND deleted_at IS NULL", (session_id,)
+        )
     if not rows:
         return None
     return await get_session_mode(session_id)
@@ -225,6 +254,13 @@ async def respond(session_id: str, mid: int | None = None) -> StreamingResponse:
 
 @app.get("/api/sessions/{session_id}/messages")
 async def session_messages(session_id: str) -> list[dict]:
+    """已软删除的会话按不存在处理（前端会走 resetStaleSession）。"""
+    async with get_db() as conn:
+        rows = await conn.execute_fetchall(
+            "SELECT 1 FROM sessions WHERE id = ? AND deleted_at IS NULL", (session_id,)
+        )
+    if not rows:
+        raise HTTPException(status_code=404, detail="会话不存在")
     return await list_messages(session_id)
 
 
@@ -233,41 +269,59 @@ def _like_escape(q: str) -> str:
     return q.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
+@app.get("/api/sessions/{session_id}")
+async def api_session(session_id: str) -> dict:
+    """单个会话（前端切会话时不用再拉全量列表找一条）。"""
+    async with get_db() as conn:
+        rows = await conn.execute_fetchall(
+            "SELECT id, created_at, title, provider, model, effort, "
+            "COALESCE(mode, 'chat') AS mode, COALESCE(source, 'manual') AS source "
+            "FROM sessions WHERE id = ? AND deleted_at IS NULL",
+            (session_id,),
+        )
+    if not rows:
+        raise HTTPException(status_code=404, detail="会话不存在")
+    return dict(rows[0])
+
+
 @app.get("/api/sessions")
-async def api_sessions(q: str = "") -> list[dict]:
+async def api_sessions(q: str = "", limit: int = Query(200, ge=1, le=1000)) -> list[dict]:
     """会话列表，最近活跃在前。title 优先用户改名 / 自动标题，回退首条 user 消息前 30 字；
     带上 mode 与 source，前端据此显示模式、区分定时任务创建的自动会话。NULL 按迁移口径
     归一（chat / manual），列表读到的 mode、source 因此永远是合法值。
-    q 命中标题或任意一条消息内容的会话才返回（LIKE 子串匹配，量大了再考虑 FTS）。"""
+    q 命中标题或任意一条消息内容的会话才返回（LIKE 子串匹配，量大了再考虑 FTS）。
+    limit 兜住无限增长：搜索时不设限（用户搜的就是全量），默认只回最近 200 个。"""
     like = f"%{_like_escape(q)}%" if q else ""
     async with get_db() as conn:
         rows = await conn.execute_fetchall(
-            "SELECT s.id, s.created_at, s.provider, s.model, "
+            "SELECT s.id, s.created_at, s.provider, s.model, s.effort, "
             "COALESCE(s.mode, 'chat') AS mode, COALESCE(s.source, 'manual') AS source, "
             "COALESCE(s.title, (SELECT substr(content, 1, 30) FROM messages "
             "WHERE session_id = s.id AND role = 'user' ORDER BY id LIMIT 1), '') AS title, "
             "(SELECT COUNT(*) FROM messages WHERE session_id = s.id) AS message_count "
             "FROM sessions s "
-            "WHERE (? = '' OR COALESCE(s.title, '') LIKE ? ESCAPE '\\' "
+            "WHERE s.deleted_at IS NULL AND (? = '' OR COALESCE(s.title, '') LIKE ? ESCAPE '\\' "
             "OR EXISTS (SELECT 1 FROM messages m WHERE m.session_id = s.id "
             "AND m.content LIKE ? ESCAPE '\\')) "
-            "ORDER BY (SELECT MAX(id) FROM messages WHERE session_id = s.id) DESC",
-            (q, like, like),
+            "ORDER BY (SELECT MAX(id) FROM messages WHERE session_id = s.id) DESC "
+            "LIMIT ?",
+            (q, like, like, 1000 if q else limit),
         )
     return [dict(row) for row in rows]
 
 
 class SessionUpdate(BaseModel):
-    """字段缺省 = 不动；provider/model 传空串 = 清掉覆盖（跟随全局）。"""
+    """字段缺省 = 不动；provider/model/effort 传空串 = 清掉覆盖（跟随全局）。"""
 
     title: str | None = None
     provider: Literal["openai_compat", "anthropic", ""] | None = None
     model: str | None = None
+    effort: Literal["off", "low", "high", "max", ""] | None = None
 
 
 @app.patch("/api/sessions/{session_id}")
 async def api_session_update(session_id: str, req: SessionUpdate) -> dict:
-    if req.title is None and req.provider is None and req.model is None:
+    if req.title is None and req.provider is None and req.model is None and req.effort is None:
         raise HTTPException(status_code=422, detail="没有要更新的字段")
     async with get_db() as conn:
         rows = await conn.execute_fetchall(
@@ -292,24 +346,45 @@ async def api_session_update(session_id: str, req: SessionUpdate) -> dict:
                 "UPDATE sessions SET model = ? WHERE id = ?",
                 (req.model.strip() or None, session_id),
             )
+        if req.effort is not None:
+            await conn.execute(
+                "UPDATE sessions SET effort = ? WHERE id = ?",
+                (req.effort or None, session_id),
+            )
         await conn.commit()
     return {"updated": session_id}
 
 
 @app.delete("/api/sessions/{session_id}")
 async def api_session_delete(session_id: str) -> dict:
-    """删会话连带消息：messages 引用 sessions 且没有 ON DELETE CASCADE，
-    必须先删子表再删父表，否则外键约束直接拒。"""
+    """软删除会话（标 deleted_at），列表与读取都过滤掉它，误删可以 /restore 撤回。
+    消息连带留在库里——恢复时原样回来；真要物理清理再另做后台任务（ponytail:
+    现在没有清理任务，软删的行会一直留着，量大了再补 30 天清理）。"""
     async with get_db() as conn:
         rows = await conn.execute_fetchall(
-            "SELECT 1 FROM sessions WHERE id = ?", (session_id,)
+            "SELECT 1 FROM sessions WHERE id = ? AND deleted_at IS NULL", (session_id,)
         )
         if not rows:
             raise HTTPException(status_code=404, detail="会话不存在")
-        await conn.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
-        await conn.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
+        await conn.execute(
+            "UPDATE sessions SET deleted_at = ? WHERE id = ?",
+            (datetime.now(timezone.utc).isoformat(timespec="seconds"), session_id),
+        )
         await conn.commit()
     return {"deleted": session_id}
+
+
+@app.post("/api/sessions/{session_id}/restore")
+async def api_session_restore(session_id: str) -> dict:
+    """撤销软删除。恢复一个没被删的会话是无副作用的成功（幂等）。"""
+    async with get_db() as conn:
+        cursor = await conn.execute(
+            "UPDATE sessions SET deleted_at = NULL WHERE id = ?", (session_id,)
+        )
+        await conn.commit()
+    if cursor.rowcount == 0:
+        raise HTTPException(status_code=404, detail="会话不存在")
+    return {"restored": session_id}
 
 
 class MessageUpdate(BaseModel):
@@ -577,7 +652,10 @@ async def api_import_chatgpt(file: UploadFile) -> dict:
         raise HTTPException(status_code=422, detail="不是有效的 JSON 文件")
     if not isinstance(convos, list):
         raise HTTPException(status_code=422, detail="不是 ChatGPT/Claude 导出格式（应为会话数组）")
+    return await _import_convos(convos)
 
+
+async def _import_convos(convos: list) -> dict:
     sessions_n = messages_n = 0
     async with get_db() as conn:
         for convo in convos:
@@ -613,6 +691,70 @@ async def api_import_chatgpt(file: UploadFile) -> dict:
             messages_n += len(msgs)
         await conn.commit()
     return {"sessions": sessions_n, "messages": messages_n}
+
+
+_OWN_EXPORT_TABLES = (
+    "sessions",
+    "messages",
+    "memories",
+    "documents",
+    "app_settings",
+    "knowledge_gaps",
+    "scheduled_tasks",
+    "notifications",
+)
+
+
+async def _import_own(data: dict) -> dict:
+    """自家 /api/export 的回灌：按原 id INSERT OR IGNORE——幂等，重复导入/还原到
+    已有库都不会产生重复行，分支结构（parent_id/active_leaf）随原 id 一起保住。
+    ponytail: 按原 id 回灌假定「还原」场景；把两份不同来源的库合并成一份时
+    messages 的整数 id 可能撞车——那是合并不是还原，真需要再做 id 重映射。
+    列名按当前库的 table_info 过滤，旧版本导出的多余列/缺列都不致命。"""
+    counts: dict[str, int] = {}
+    async with get_db() as conn:
+        for table in _OWN_EXPORT_TABLES:
+            rows = data.get(table)
+            if not isinstance(rows, list) or not rows:
+                continue
+            cols = {r["name"] for r in await conn.execute_fetchall(f"PRAGMA table_info({table})")}
+            n = 0
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                keys = [k for k in row if k in cols]
+                if not keys:
+                    continue
+                cur = await conn.execute(
+                    f"INSERT OR IGNORE INTO {table} ({', '.join(keys)}) "
+                    f"VALUES ({', '.join('?' for _ in keys)})",
+                    [row[k] for k in keys],
+                )
+                n += cur.rowcount
+            counts[table] = n
+        await conn.commit()
+    return {"imported": counts}
+
+
+@app.post("/api/import")
+async def api_import(file: UploadFile) -> dict:
+    """统一导入入口：按内容嗅探格式——带 version+sessions 的对象 = 自家 /api/export
+    回灌；会话数组 = ChatGPT/Claude 导出。"""
+    data = await file.read()
+    if len(data) > UPLOAD_MAX_BYTES:
+        raise HTTPException(status_code=422, detail="文件超过 50MB 上限")
+    try:
+        payload = json.loads(data)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        raise HTTPException(status_code=422, detail="不是有效的 JSON 文件")
+    if isinstance(payload, dict) and "sessions" in payload:
+        return await _import_own(payload)
+    if isinstance(payload, list):
+        return await _import_convos(payload)
+    raise HTTPException(
+        status_code=422,
+        detail="无法识别的格式（支持本应用导出、ChatGPT、Claude 三种 JSON）",
+    )
 
 
 @app.get("/api/chunks/{chunk_id}")
@@ -813,6 +955,31 @@ async def api_notifications(
 @app.get("/api/documents")
 async def api_documents() -> list[dict]:
     return await list_documents()
+
+
+@app.get("/api/documents/{doc_id}/chunks")
+async def api_document_chunks(doc_id: int) -> list[dict]:
+    """文档的分块预览：排查「为什么没检索到」时不用猜入库结果。"""
+    async with get_db() as conn:
+        docs = await conn.execute_fetchall("SELECT 1 FROM documents WHERE id = ?", (doc_id,))
+        if not docs:
+            raise HTTPException(status_code=404, detail="文档不存在")
+        rows = await conn.execute_fetchall(
+            "SELECT id, content FROM chunks WHERE doc_id = ? ORDER BY id", (doc_id,)
+        )
+    return [dict(row) for row in rows]
+
+
+@app.get("/api/tasks/next-run")
+async def api_task_next_run(cron: str) -> dict:
+    """cron 表达式的下一次运行时间（本机时区），表单输入时即时预览；
+    校验口径与 scheduler 一致（croniter 为唯一来源）。"""
+    from croniter import croniter
+
+    if not cron or not croniter.is_valid(cron):
+        raise HTTPException(status_code=422, detail="无效的 cron 表达式")
+    nxt = croniter(cron, datetime.now()).get_next(datetime)
+    return {"next_run": nxt.isoformat(timespec="seconds")}
 
 
 @app.delete("/api/documents/{doc_id}")

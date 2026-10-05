@@ -1,11 +1,12 @@
 from app.config import settings
-from app.llm.types import LLMClient
+from app.llm.types import Effort, LLMClient
 
 
 def get_llm(
     db_path: str | None = None,
     provider: str | None = None,
     model: str | None = None,
+    effort: Effort | None = None,
 ) -> LLMClient:
     """按配置建一个 LLM 客户端；db_path 决定这一轮 llm trace 落哪个库。
 
@@ -14,6 +15,8 @@ def get_llm(
 
     provider 非空时覆盖全局 settings.llm_provider（per-session 供应商切换）；
     model 非空时覆盖该供应商的全局默认模型（per-session 模型切换）；
+    effort 非空时覆盖思考强度（per-session，off/low/high/max，在客户端层翻成
+    各家的 reasoning_effort / thinking.budget_tokens）；
     密钥/base_url 仍取该供应商的全局配置——会话级不另存密钥。
     """
     if (provider or settings.llm_provider) == "anthropic":
@@ -24,6 +27,7 @@ def get_llm(
             model=model or settings.anthropic_model,
             max_tokens=settings.anthropic_max_tokens,
             db_path=db_path,
+            effort=effort,
         )
     from app.llm.openai_compat import OpenAICompatClient
 
@@ -32,4 +36,5 @@ def get_llm(
         model=model or settings.openai_model,
         base_url=settings.openai_base_url,
         db_path=db_path,
+        effort=effort,
     )

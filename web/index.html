@@ -73,16 +73,33 @@ body {
 }
 /* ---------- 侧栏 ---------- */
 .sidebar {
-  width: 300px; flex-shrink: 0; height: 100vh;
+  width: 260px; flex-shrink: 0; height: 100vh;
   background: var(--surface); border-right: 1px solid var(--hairline);
   display: flex; flex-direction: column;
 }
 .sidebar-head {
-  padding: 20px 20px 16px; border-bottom: 1px solid var(--hairline);
+  padding: 18px 16px 14px; border-bottom: 1px solid var(--hairline);
 }
 .logo { font-family: var(--font-display); font-size: 21px; font-weight: 400; letter-spacing: -0.3px; }
 .logo span { color: var(--primary); }
 .logo-sub { font-size: 13px; color: var(--steel); margin-top: 2px; }
+/* 侧栏手风琴：六个分区默认只开「对话」，<details> 原生折叠，零 JS */
+.sidebar details { border-bottom: 1px solid var(--hairline); }
+.sidebar details:last-of-type { border-bottom: none; }
+.sidebar summary {
+  list-style: none; cursor: pointer; user-select: none;
+  display: flex; align-items: center; gap: 8px;
+  padding: 10px 16px; font-size: 13px; font-weight: 600; color: var(--charcoal);
+}
+.sidebar summary::-webkit-details-marker { display: none; }
+.sidebar summary::before {
+  content: "›"; display: inline-block; width: 12px;
+  color: var(--stone); transition: transform .15s ease;
+}
+.sidebar details[open] summary::before { transform: rotate(90deg); }
+.sidebar summary:hover { background: var(--hairline-soft); }
+.sidebar summary .nav-icon { width: 16px; text-align: center; }
+.sidebar details > .nav-body { padding: 0 12px 12px; }
 .panel-head {
   display: flex; align-items: center; justify-content: space-between;
   padding: 0 8px; margin-bottom: 6px;
@@ -116,6 +133,10 @@ body {
 .session-item:hover .session-act { visibility: visible; }
 .session-act:hover { color: var(--ink); }
 .session-act.del:hover { color: var(--error); }
+.session-mode {
+  flex: none; font-size: 10px; color: var(--stone);
+  border: 1px solid var(--hairline); border-radius: 9999px; padding: 0 6px;
+}
 #session-search {
   width: 100%; height: 30px; margin: 0 0 6px; padding: 4px 10px; font-size: 13px;
   border: 1px solid var(--hairline); border-radius: var(--r-sm);
@@ -170,6 +191,17 @@ body {
 .doc-item:hover .doc-del { visibility: visible; }
 .doc-item .doc-del:hover { color: var(--error); }
 .empty-docs { padding: 16px 8px; font-size: 13px; color: var(--stone); }
+/* 离线提示条：navigator.onLine 变化时由 body.offline 控制显隐 */
+.offline-bar {
+  display: none; background: var(--error-bg); color: var(--error);
+  font-size: 13px; text-align: center; padding: 6px;
+}
+body.offline .offline-bar { display: block; }
+/* 文档分块预览 */
+.doc-chunk-preview { border-top: 1px dashed var(--hairline); margin: 2px 0 6px; }
+.doc-chunk { font-size: 12px; color: var(--slate); padding: 4px 8px; white-space: pre-wrap; word-break: break-word; }
+.doc-chunk b { color: var(--stone); font-weight: 600; }
+.doc-title { cursor: pointer; }
 /* 记忆面板 */
 .memory-box { flex-shrink: 0; border-top: 1px solid var(--hairline); padding: 12px 12px 4px; }
 .memory-list { max-height: 200px; overflow-y: auto; padding-bottom: 8px; }
@@ -262,13 +294,13 @@ body {
 .main { flex: 1; display: flex; flex-direction: column; height: 100vh; }
 .chat-scroll { flex: 1; overflow-y: auto; }
 .chat-inner { max-width: 760px; margin: 0 auto; padding: 32px 32px 16px; }
-.hero-empty { text-align: center; padding-top: 15vh; }
+.hero-empty { text-align: center; padding-top: 20vh; }
 .hero-empty h1 {
   font-family: var(--font-display);
-  font-size: 36px; font-weight: 400; letter-spacing: -0.5px;
-  line-height: 1.2; margin-bottom: 12px;
+  font-size: 44px; font-weight: 400; letter-spacing: -0.5px;
+  line-height: 1.15; margin-bottom: 14px; color: var(--ink);
 }
-.hero-empty p { color: var(--steel); font-size: 16px; max-width: 460px; margin: 0 auto; }
+.hero-empty p { color: var(--muted); font-size: 15px; max-width: 460px; margin: 0 auto; }
 .msg { margin-bottom: 24px; }
 .msg-role {
   font-size: 11px; font-weight: 600; letter-spacing: 1px; text-transform: uppercase;
@@ -323,6 +355,19 @@ pre code .hljs-variable, pre code .hljs-template-variable { color: #e6dfd8; }
   border-left: 3px solid var(--hairline-strong); padding-left: 12px;
   color: var(--slate); margin-bottom: 10px;
 }
+/* GFM 表格与图片：无边框散排/撑破 760px 容器 */
+.msg-body table { border-collapse: collapse; margin: 0 0 10px; font-size: 14px; }
+.msg-body th, .msg-body td { border: 1px solid var(--hairline); padding: 4px 10px; }
+.msg-body th { background: var(--surface-card); }
+.msg-body img { max-width: 100%; border-radius: var(--r-md); }
+/* 代码块右上角的复制钮（pre 需 relative 定位） */
+.msg-body pre { position: relative; }
+.code-copy {
+  position: absolute; top: 6px; right: 8px; border: none; cursor: pointer;
+  background: none; color: var(--on-dark); opacity: .55; font-size: 12px;
+  padding: 2px 6px; border-radius: 4px;
+}
+.code-copy:hover { opacity: 1; background: rgba(255,255,255,.12); }
 /* 工具调用指示 */
 .tool-chip {
   display: inline-flex; align-items: center; gap: 6px;
@@ -363,31 +408,6 @@ cite.chunk-ref:hover { background: var(--primary); color: #fff; }
 /* 分支切换 */
 .branch-nav { display: inline-flex; align-items: center; gap: 2px; }
 .branch-pos { font-size: 12px; color: var(--stone); padding: 0 2px; }
-/* per-session 模型 */
-.model-row { display: flex; gap: 8px; align-items: center; margin-top: 6px; }
-.model-label { font-size: 12px; color: var(--stone); white-space: nowrap; }
-.model-row input {
-  flex: 1; height: 28px; padding: 2px 10px; font-size: 13px;
-  border: 1px solid var(--hairline); border-radius: var(--r-sm);
-  background: var(--canvas); color: var(--ink); outline: none;
-}
-.model-row input:focus { border-color: var(--primary); }
-/* 模式切换器：只决定「下一个新会话」怎么建，所以放在输入区（会话内的模型行之上），
-   不属于 per-session 的模型行。已有会话的模式以库里的为准，打开时回填 */
-.mode-row { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin-top: 10px; }
-.mode-label { font-size: 12px; color: var(--stone); white-space: nowrap; }
-.mode-btn {
-  border: 1px solid var(--hairline); background: var(--canvas); color: var(--charcoal);
-  font-size: 12px; padding: 2px 10px; border-radius: 9999px; cursor: pointer;
-}
-.mode-btn:hover:not(:disabled) { border-color: var(--hairline-strong); color: var(--ink); }
-.mode-btn.active {
-  background: var(--tint-coral); border-color: var(--primary);
-  color: var(--primary-deep); font-weight: 600;
-}
-.mode-btn:disabled { color: var(--muted); cursor: default; }
-/* 「即将推出」是说明而不是按钮文案，用可读的 --stone，别跟着 disabled 一起变灰 */
-.mode-btn em { font-style: normal; font-size: 10px; margin-left: 4px; color: var(--stone); }
 .mode-hint { font-size: 11px; color: var(--stone); }
 .pop-title { font-size: 12px; font-weight: 600; color: var(--steel); margin-bottom: 6px; }
 .pop-body { font-size: 14px; color: var(--charcoal); white-space: pre-wrap; word-break: break-word; }
@@ -395,32 +415,103 @@ cite.chunk-ref:hover { background: var(--primary); color: #fff; }
 .composer { border-top: 1px solid var(--hairline); background: var(--canvas); }
 .composer-inner { max-width: 760px; margin: 0 auto; padding: 16px 32px 20px; }
 .composer-box {
-  display: flex; align-items: flex-end; gap: 8px;
-  border: 1px solid var(--hairline); border-radius: var(--r-lg);
-  background: var(--canvas); padding: 10px 12px;
-  box-shadow: var(--shadow-1); transition: border-color .15s ease;
+  display: flex; flex-direction: column; gap: 10px;
+  border: 1px solid var(--hairline); border-radius: 16px;
+  background: var(--canvas); padding: 14px 16px;
+  box-shadow: var(--shadow-1); transition: border-color .15s ease, box-shadow .15s ease;
 }
 .composer-box:focus-within { border-color: var(--primary); box-shadow: var(--shadow-2); }
 .composer-box textarea {
-  flex: 1; border: none; outline: none; resize: none;
+  width: 100%; border: none; outline: none; resize: none;
   font: inherit; font-size: 15px; color: var(--ink);
   max-height: 160px; background: transparent;
 }
 .composer-box textarea::placeholder { color: var(--muted); }
+/* 工具条：＋ / 模式 chip / 模型 chip / 发送，一行排开 */
+.composer-toolbar { display: flex; align-items: center; gap: 8px; }
+.toolbar-spacer { flex: 1; }
+.tool-btn {
+  width: 30px; height: 30px; border: none; border-radius: 50%;
+  background: transparent; color: var(--slate); font-size: 18px; cursor: pointer;
+  display: inline-flex; align-items: center; justify-content: center;
+}
+.tool-btn:hover { background: var(--hairline-soft); color: var(--ink); }
+.model-chip {
+  border: none; background: var(--surface-card); color: var(--charcoal);
+  font-size: 12px; font-weight: 600; padding: 5px 12px; border-radius: 9999px;
+  cursor: pointer; max-width: 180px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.model-chip:hover { background: var(--hairline-soft); }
+/* 模型 + 思考强度下拉：吸在 composer 上方右侧，对齐 chip */
+.chip-pop {
+  position: absolute; bottom: calc(100% + 8px); right: 32px; z-index: 40;
+  width: 260px; max-height: 60vh; overflow-y: auto;
+  background: var(--canvas); border: 1px solid var(--hairline);
+  border-radius: var(--r-lg); box-shadow: var(--shadow-2); padding: 8px;
+}
+.composer-inner { position: relative; }
+.chip-sec {
+  font-size: 11px; font-weight: 600; letter-spacing: 1px; text-transform: uppercase;
+  color: var(--stone); padding: 6px 8px 4px;
+}
+.chip-models { display: flex; flex-direction: column; }
+.chip-loading { font-size: 13px; color: var(--stone); padding: 8px; }
+.chip-model-item {
+  display: flex; align-items: center; justify-content: space-between; gap: 8px;
+  border: none; background: none; text-align: left; cursor: pointer;
+  padding: 7px 8px; border-radius: var(--r-sm); font-size: 13px; color: var(--charcoal);
+  overflow: hidden;
+}
+.chip-model-item span:first-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.chip-model-item:hover { background: var(--hairline-soft); }
+.chip-model-item.active { color: var(--primary-deep); font-weight: 600; }
+.chip-check { color: var(--primary); flex-shrink: 0; }
+.chip-manual { padding: 4px 4px 0; }
+.chip-manual input {
+  width: 100%; height: 30px; padding: 4px 10px; font-size: 13px;
+  border: 1px solid var(--hairline); border-radius: var(--r-sm);
+  background: var(--canvas); color: var(--ink); outline: none;
+}
+.chip-manual input:focus { border-color: var(--primary); }
+.chip-efforts { display: flex; gap: 4px; padding: 2px 4px 4px; }
+.effort-btn {
+  flex: 1; border: 1px solid var(--hairline); background: var(--canvas);
+  color: var(--charcoal); font-size: 12px; padding: 5px 0; border-radius: var(--r-sm);
+  cursor: pointer;
+}
+.effort-btn:hover { border-color: var(--hairline-strong); }
+.effort-btn.active { background: var(--tint-coral); border-color: var(--primary); color: var(--primary-deep); font-weight: 600; }
 .send-btn {
-  width: 36px; height: 36px; border: none; border-radius: var(--r-md);
+  width: 32px; height: 32px; border: none; border-radius: 50%;
   background: var(--primary); color: #fff; font-size: 16px; cursor: pointer;
   flex-shrink: 0; transition: background .15s ease;
 }
 .send-btn:hover { background: var(--primary-pressed); }
 .send-btn:disabled { background: var(--hairline); color: var(--muted); cursor: default; }
+/* 工具条里的模式 chip：紧贴一排，激活态 coral 底 */
+.composer-toolbar .mode-row { display: flex; gap: 4px; align-items: center; margin: 0; }
+.composer-toolbar .mode-btn {
+  border: none; background: transparent; color: var(--slate);
+  font-size: 12px; padding: 5px 12px; border-radius: 9999px; cursor: pointer;
+}
+.composer-toolbar .mode-btn:hover:not(:disabled) { background: var(--hairline-soft); color: var(--ink); }
+.composer-toolbar .mode-btn.active { background: var(--tint-coral); color: var(--primary-deep); font-weight: 600; }
+.composer-toolbar .mode-btn:disabled { color: var(--muted); cursor: default; }
+.composer-toolbar .mode-btn em { font-style: normal; font-size: 10px; margin-left: 4px; color: var(--stone); }
+.composer-toolbar .mode-hint { font-size: 11px; color: var(--stone); }
 .hint { font-size: 12px; color: var(--stone); margin-top: 8px; text-align: center; }
 /* 错误条 */
 .error-bar {
   background: var(--error-bg); color: var(--error); font-size: 13px; font-weight: 500;
   border: 1px solid var(--error-border); border-radius: var(--r-md);
   padding: 8px 12px; margin-top: 12px;
+  display: flex; align-items: center; gap: 10px;
 }
+.error-bar .err-msg { flex: 1; }
+.error-bar .link-btn { font-size: 12px; color: var(--error); }
+/* 撤销条（删除确认）用中性配色，别把「已删除，可撤销」显示成报错 */
+.error-bar.undo-bar { background: var(--surface-card); color: var(--ink); border-color: var(--hairline); }
+.error-bar.undo-bar .link-btn { color: var(--primary); }
 /* 打字光标 */
 .cursor-blink::after {
   content: "▍"; color: var(--primary); animation: blink 1s step-end infinite;
@@ -569,61 +660,80 @@ cite.chunk-ref:hover { background: var(--primary); color: #fff; }
 </style>
 </head>
 <body>
-<button id="menu-btn" title="菜单">☰</button>
+<div class="offline-bar" id="offline-bar">网络已断开，恢复后操作会自动继续</div>
+<button id="menu-btn" title="菜单" aria-label="菜单">☰</button>
 <aside class="sidebar">
   <div class="sidebar-head">
     <div class="logo">第二<span>大脑</span></div>
     <div class="logo-sub">个人知识库 Agent</div>
-    <button id="theme-btn" title="切换深浅色">☾</button>
-    <button id="settings-btn" title="模型设置">⚙</button>
+    <button id="theme-btn" title="切换深浅色" aria-label="切换深浅色">☾</button>
+    <button id="settings-btn" title="模型设置" aria-label="模型设置">⚙</button>
   </div>
-  <div class="sessions-box">
-    <div class="panel-head">
-      <span class="doc-list-label">对话</span>
-      <span>
-        <button class="link-btn" id="import-btn" title="导入 ChatGPT / Claude 导出的 JSON（自动识别格式）">导入</button>
-        <button class="link-btn" id="new-session">新对话</button>
-      </span>
+  <details open>
+    <summary><span class="nav-icon">💬</span>对话</summary>
+    <div class="nav-body sessions-box">
+      <div class="panel-head">
+        <span class="doc-list-label">对话</span>
+        <span>
+          <button class="link-btn" id="import-btn" title="导入 JSON：本应用导出（回灌备份）/ ChatGPT / Claude，按内容自动识别">导入</button>
+          <button class="link-btn" id="new-session">新对话</button>
+        </span>
+      </div>
+      <input id="session-search" placeholder="搜索对话… (Ctrl+K)">
+      <div class="session-list" id="session-list"></div>
+      <input type="file" id="import-input" accept=".json" hidden>
     </div>
-    <input id="session-search" placeholder="搜索对话… (Ctrl+K)">
-    <div class="session-list" id="session-list"></div>
-    <input type="file" id="import-input" accept=".json" hidden>
-  </div>
-  <div class="ingest-box">
-    <div class="ingest-head">
-      <label>导入文档</label>
-      <button class="link-btn" id="upload-btn">上传文件</button>
-      <input type="file" id="file-input" accept=".md,.markdown,.pdf,.txt" hidden>
+  </details>
+  <details>
+    <summary><span class="nav-icon">📥</span>导入</summary>
+    <div class="nav-body ingest-box">
+      <div class="ingest-head">
+        <label>导入文档</label>
+        <button class="link-btn" id="upload-btn">上传文件</button>
+        <input type="file" id="file-input" accept=".md,.markdown,.pdf,.txt" hidden>
+      </div>
+      <div class="ingest-row">
+        <input id="ingest-input" placeholder="文件路径或 URL…">
+        <button class="btn btn-primary" id="ingest-btn">导入</button>
+      </div>
     </div>
-    <div class="ingest-row">
-      <input id="ingest-input" placeholder="文件路径或 URL…">
-      <button class="btn btn-primary" id="ingest-btn">导入</button>
+  </details>
+  <details>
+    <summary><span class="nav-icon">📁</span>文档</summary>
+    <div class="nav-body doc-list" id="doc-list">
+      <div class="doc-list-label">知识库文档</div>
+      <div class="empty-docs" id="empty-docs">还没有文档，先导入一篇笔记或面经吧。</div>
     </div>
-  </div>
-  <div class="doc-list" id="doc-list">
-    <div class="doc-list-label">知识库文档</div>
-    <div class="empty-docs" id="empty-docs">还没有文档，先导入一篇笔记或面经吧。</div>
-  </div>
-  <div class="memory-box">
-    <div class="panel-head"><span class="doc-list-label">记忆</span></div>
-    <div class="memory-list" id="memory-list"></div>
-  </div>
-  <div class="gaps-box">
-    <div class="panel-head"><span class="doc-list-label">漏洞</span></div>
-    <div class="gap-list" id="gap-list"></div>
-  </div>
-  <div class="tasks-box">
-    <div class="panel-head">
-      <span class="doc-list-label">定时任务</span>
-      <button class="link-btn" id="tasks-btn" title="创建、启停、删除定时任务">管理</button>
+  </details>
+  <details>
+    <summary><span class="nav-icon">🧠</span>记忆</summary>
+    <div class="nav-body memory-box">
+      <div class="panel-head"><span class="doc-list-label">记忆</span></div>
+      <div class="memory-list" id="memory-list"></div>
     </div>
-  </div>
+  </details>
+  <details>
+    <summary><span class="nav-icon">⚠</span>漏洞</summary>
+    <div class="nav-body gaps-box">
+      <div class="panel-head"><span class="doc-list-label">漏洞</span></div>
+      <div class="gap-list" id="gap-list"></div>
+    </div>
+  </details>
+  <details>
+    <summary><span class="nav-icon">⏰</span>定时任务</summary>
+    <div class="nav-body tasks-box">
+      <div class="panel-head">
+        <span class="doc-list-label">定时任务</span>
+        <button class="link-btn" id="tasks-btn" title="创建、启停、删除定时任务">管理</button>
+      </div>
+    </div>
+  </details>
 </aside>
 <main class="main">
   <div class="chat-scroll" id="chat-scroll">
-    <div class="chat-inner" id="chat">
+    <div class="chat-inner" id="chat" aria-live="polite">
       <div class="hero-empty" id="hero">
-        <h1>问你的知识库<br>任何问题</h1>
+        <h1>你好，问点什么</h1>
         <p>笔记、面经、收藏的文章——导入之后，用自然语言检索，回答附带来源引用。</p>
       </div>
     </div>
@@ -631,22 +741,40 @@ cite.chunk-ref:hover { background: var(--primary); color: #fff; }
   <div class="composer">
     <div class="composer-inner">
       <div class="composer-box">
-        <textarea id="input" rows="1" placeholder="问点什么… (Enter 发送，Shift+Enter 换行)"></textarea>
-        <button class="send-btn" id="send" title="发送">↑</button>
+        <textarea id="input" rows="1" placeholder="有什么可以帮你的吗？"></textarea>
+        <div class="composer-toolbar">
+          <button class="tool-btn" id="attach-btn" title="入库：导入文档到知识库（路径 / URL / 上传），不是给消息加附件" aria-label="入库：导入文档到知识库">＋</button>
+          <div class="mode-row" id="mode-row">
+            <button class="mode-btn" data-mode="chat" title="日常问答：对话为主，需要时查知识库">聊天</button>
+            <button class="mode-btn" data-mode="work" title="工作/学习：带复习教练，会记知识漏洞卡片">工作</button>
+            <button class="mode-btn" data-mode="code" disabled title="即将推出">代码<em>即将推出</em></button>
+          </div>
+          <span class="mode-hint" id="mode-hint"></span>
+          <span class="toolbar-spacer"></span>
+          <button class="model-chip" id="model-chip" title="本会话模型与思考强度">默认</button>
+          <button class="send-btn" id="send" title="发送" aria-label="发送">↑</button>
+        </div>
       </div>
-      <div class="hint" id="hint">回答基于你的知识库检索结果生成</div>
-      <div class="mode-row" id="mode-row">
-        <span class="mode-label">模式</span>
-        <button class="mode-btn" data-mode="chat" title="日常问答：对话为主，需要时查知识库">聊天</button>
-        <button class="mode-btn" data-mode="work" title="工作/学习：带复习教练，会记知识漏洞卡片">工作</button>
-        <button class="mode-btn" data-mode="code" disabled title="即将推出">代码<em>即将推出</em></button>
-        <span class="mode-hint" id="mode-hint"></span>
+      <div class="chip-pop" id="chip-pop" hidden>
+        <div class="chip-sec">模型</div>
+        <div class="chip-models" id="chip-models">
+          <div class="chip-loading">拉取中…</div>
+        </div>
+        <div class="chip-manual">
+          <input id="chip-model-input" placeholder="手填模型名，回车保存" autocomplete="off">
+        </div>
+        <!-- 思考强度先藏掉：开了档位也看不到推理过程（SSE 不透传 thinking/reasoning），
+             付费开关没有可见产出比没有开关更糟；且 DeepSeek 端点不认 reasoning_effort。
+             等推理过程能流出来再放回。后端 effort 链路保留。 -->
+        <div class="chip-sec" hidden>思考强度</div>
+        <div class="chip-efforts" id="chip-efforts" hidden>
+          <button class="effort-btn" data-effort="off">关</button>
+          <button class="effort-btn" data-effort="low">低</button>
+          <button class="effort-btn" data-effort="high">高</button>
+          <button class="effort-btn" data-effort="max">最高</button>
+        </div>
       </div>
-      <div class="model-row" id="model-row" hidden>
-        <span class="model-label">本会话模型</span>
-        <input id="session-model" placeholder="留空 = 跟随全局默认" autocomplete="off">
-        <button class="link-btn" id="session-model-save">保存</button>
-      </div>
+      <div class="hint" id="hint">回答基于你的知识库检索结果生成 · Enter 发送 · Shift+Enter 换行</div>
       <div id="error-slot"></div>
     </div>
   </div>
@@ -701,7 +829,7 @@ cite.chunk-ref:hover { background: var(--primary); color: #fff; }
     </label>
     <div class="set-sec">用量统计</div>
     <div class="usage-box" id="usage-box">加载中…</div>
-    <div class="set-sec">数据<span class="set-note">JSON 含全部会话/记忆/文档清单；数据库文件是含知识库向量的完整备份</span></div>
+    <div class="set-sec">数据<span class="set-note">JSON 含全部会话/记忆/文档清单；数据库文件是含知识库向量的完整备份；每次启动自动备份到 data/backups/（保留最近 5 份）</span></div>
     <div class="export-row">
       <a class="set-fetch" href="/api/export" download>导出 JSON</a>
       <a class="set-fetch" href="/api/export/db" download>下载数据库</a>
@@ -718,7 +846,14 @@ cite.chunk-ref:hover { background: var(--primary); color: #fff; }
     <div class="task-form-row">
       <div>
         <label class="set-label">时间（cron）</label>
-        <input id="task-cron" placeholder="0 9 * * *" autocomplete="off" spellcheck="false">
+        <input id="task-cron" list="cron-presets" placeholder="0 9 * * *" autocomplete="off" spellcheck="false">
+        <datalist id="cron-presets">
+          <option value="0 9 * * *">每天 9:00</option>
+          <option value="0 9 * * 1">每周一 9:00</option>
+          <option value="0 */6 * * *">每 6 小时</option>
+          <option value="*/30 * * * *">每 30 分钟</option>
+        </datalist>
+        <div class="set-status" id="cron-next"></div>
       </div>
       <div>
         <label class="set-label">模式</label>
@@ -742,7 +877,6 @@ cite.chunk-ref:hover { background: var(--primary); color: #fff; }
 <script src="/vendor/highlight.min.js"></script>
 <script src="/vendor/katex.min.js"></script>
 <script src="/vendor/katex-auto-render.min.js"></script>
-<script src="/vendor/mermaid.min.js"></script>
 <script>
 const $ = (id) => document.getElementById(id);
 /* 主题要在任何渲染前定好，避免暗色用户看到一帧白屏 */
@@ -758,6 +892,8 @@ setTheme(localStorage.getItem("brain.theme") || "light");
 const chatEl = $("chat"), inputEl = $("input"), sendBtn = $("send");
 const HERO_HTML = $("hero").outerHTML;
 const LS_KEY = "brain.sessionId";
+const LS_DRAFT = "brain.draft";
+let draftTimer = null;
 let sessionId = localStorage.getItem(LS_KEY), busy = false, controller = null;
 
 /* 移动端抽屉：☰ 开关；点会话项/新对话/抽屉外区域自动收起 */
@@ -807,20 +943,53 @@ if (window.marked) marked.use({
   },
 });
 function showHint(t) { $("hint").textContent = t; }
-function showError(t) {
-  $("error-slot").innerHTML = `<div class="error-bar">${esc(t)}</div>`;
-  setTimeout(() => $("error-slot").innerHTML = "", 6000);
+/* 常驻到手动关闭；流式出错时给重试（后端 /respond 可独立重放当前回合） */
+function showError(t, onRetry) {
+  const slot = $("error-slot");
+  slot.innerHTML = `<div class="error-bar"><span class="err-msg">${esc(t)}</span>
+    ${onRetry ? '<button class="link-btn" id="err-retry">重试</button>' : ""}
+    <button class="link-btn" id="err-close">关闭</button></div>`;
+  $("err-close").onclick = () => { slot.innerHTML = ""; };
+  if (onRetry) $("err-retry").onclick = () => { slot.innerHTML = ""; onRetry(); };
 }
 /* 非 200 时尽量读后端给的 detail */
 async function errText(r) {
   const d = await r.json().catch(() => ({}));
   return d.detail || `HTTP ${r.status}`;
 }
+/* 带超时的 fetch：裸 fetch 挂起时按钮会一直停在「上传中…」。默认 60s，
+   大文件导入这类长操作调用方自己放宽 */
+async function fetchT(url, opts = {}, ms = 60000) {
+  return fetch(url, { ...opts, signal: AbortSignal.timeout(ms) });
+}
+/* 断网提示（只侦测本机网络，服务器挂掉由 fetchT 超时兜底） */
+function syncOnline() { document.body.classList.toggle("offline", !navigator.onLine); }
+window.addEventListener("online", syncOnline);
+window.addEventListener("offline", syncOnline);
+syncOnline();
+/* 软删除的撤销入口：会话删除后 10 秒内可一键恢复（后端只打 deleted_at 标记） */
+function showUndo(text, sid) {
+  const slot = $("error-slot");
+  slot.innerHTML = `<div class="error-bar undo-bar"><span class="err-msg">${esc(text)}</span>
+    <button class="link-btn" id="undo-btn">撤销</button></div>`;
+  $("undo-btn").onclick = async () => {
+    slot.innerHTML = "";
+    const r = await fetch(`/api/sessions/${sid}/restore`, { method: "POST" });
+    if (!r.ok) { showError(await errText(r)); return; }
+    loadSessions();
+    showHint("已恢复会话");
+  };
+  setTimeout(() => { if (slot.querySelector("#undo-btn")) slot.innerHTML = ""; }, 10000);
+}
+
 function scrollBottom() {
   const s = $("chat-scroll"); s.scrollTop = s.scrollHeight;
 }
-
-if (window.mermaid) mermaid.initialize({ startOnLoad: false, theme: "neutral" });
+/* 流式期间不跟用户抢滚动条：只在本来就贴着底时才自动滚 */
+function nearBottom() {
+  const s = $("chat-scroll");
+  return s.scrollHeight - s.scrollTop - s.clientHeight < 80;
+}
 
 /* ---------- 消息渲染 ---------- */
 function addMsg(role, mid) {
@@ -832,13 +1001,20 @@ function addMsg(role, mid) {
   chatEl.appendChild(div);
   if (mid) {
     const actions = div.querySelector(".msg-actions");
+    const copyBtn = `<button class="msg-act copy">复制</button>`;
     if (role === "user") {
-      actions.innerHTML = `<button class="msg-act edit">编辑</button>`;
+      actions.innerHTML = `${copyBtn}<button class="msg-act edit">编辑</button>`;
       actions.querySelector(".edit").onclick = () => editMessage(div);
     } else {
-      actions.innerHTML = `<button class="msg-act regen">重新生成</button>`;
+      actions.innerHTML = `${copyBtn}<button class="msg-act regen">重新生成</button>`;
       actions.querySelector(".regen").onclick = () => regenerate(div);
     }
+    const btn = actions.querySelector(".copy");
+    btn.onclick = async () => {
+      await navigator.clipboard.writeText(div.querySelector(".msg-body").textContent);
+      btn.textContent = "已复制";
+      setTimeout(() => { btn.textContent = "复制"; }, 1500);
+    };
   }
   scrollBottom();
   return div.querySelector(".msg-body");
@@ -890,16 +1066,10 @@ function addToolChip(name) {
   scrollBottom();
   return chip;
 }
-/* Markdown 渲染，再把 [chunk N] 换成可点击的引用角标 */
+/* Markdown 渲染，再把 [chunk N] 换成可点击的引用角标。
+   mermaid 已移除：原来的占位符会被 marked 的 html 转义器吃掉，图从来没渲染出来过，
+   还占 vendor 2.5MB；```mermaid 块现在按普通代码块展示（源码可见，不是坏图） */
 function renderCitations(el, text) {
-  /* mermaid 代码块先换成占位 div：marked 不认识 ```mermaid，直接过会渲染成普通代码块 */
-  let mermaidBlocks = [];
-  if (window.mermaid) {
-    text = text.replace(/```mermaid\s*\n([\s\S]*?)```/g, (_, code) => {
-      mermaidBlocks.push(code.trim());
-      return `<pre class="mermaid-slot"></pre>`;
-    });
-  }
   el.innerHTML = window.marked ? marked.parse(text) : esc(text);
   const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT);
   const nodes = [];
@@ -923,22 +1093,28 @@ function renderCitations(el, text) {
   }
   /* 代码高亮：marked 会给 code 打 language-* class，hljs 按它识别 */
   if (window.hljs) el.querySelectorAll("pre code").forEach(c => hljs.highlightElement(c));
-  /* LaTeX：$…$ / $$…$$。流式渲染时每帧重跑，auto-render 只处理还没渲染的文本节点，幂等 */
+  /* 代码块复制钮：innerHTML 每帧重写，按钮跟着重建，无需去重 */
+  el.querySelectorAll("pre").forEach(pre => {
+    const b = document.createElement("button");
+    b.className = "code-copy";
+    b.textContent = "复制";
+    b.onclick = async () => {
+      await navigator.clipboard.writeText(pre.querySelector("code")?.textContent ?? pre.textContent);
+      b.textContent = "已复制";
+      setTimeout(() => { b.textContent = "复制"; }, 1500);
+    };
+    pre.appendChild(b);
+  });
+  /* LaTeX：$$…$$ 块级 / \(…\) 行内。单 $ 故意不开：「花了 $5 和 $10」会被当成公式。
+     流式渲染时每帧重跑，auto-render 只处理还没渲染的文本节点，幂等 */
   if (window.renderMathInElement) {
     renderMathInElement(el, {
       delimiters: [
         { left: "$$", right: "$$", display: true },
-        { left: "$", right: "$", display: false },
+        { left: "\\(", right: "\\)", display: false },
       ],
       throwOnError: false,
     });
-  }
-  /* Mermaid：占位 div 灌入源码后交给 mermaid.run；流式中途源码不全，
-     mermaid 解析失败只影响这一帧，下一帧文本更全时重试（slot 带 textContent 才算数） */
-  if (window.mermaid && mermaidBlocks.length) {
-    const slots = el.querySelectorAll("pre.mermaid-slot");
-    slots.forEach((slot, i) => { slot.textContent = mermaidBlocks[i] || ""; });
-    mermaid.run({ nodes: [...slots].filter(s => s.textContent.trim()) }).catch(() => {});
   }
 }
 function clearChat() { chatEl.innerHTML = HERO_HTML; }
@@ -987,14 +1163,28 @@ async function loadDocs() {
     if (!r.ok) throw new Error(await errText(r));
     const docs = await r.json();
     const list = $("doc-list");
-    list.querySelectorAll(".doc-item").forEach(e => e.remove());
+    list.querySelectorAll(".doc-item, .doc-chunk-preview").forEach(e => e.remove());
     $("empty-docs").style.display = docs.length ? "none" : "";
     for (const d of docs) {
       const item = document.createElement("div");
       item.className = "doc-item";
-      item.innerHTML = `<span class="doc-title" title="${esc(d.source || "")}">${esc(d.title || "未命名")}</span>
+      item.innerHTML = `<span class="doc-title" title="${esc(d.source || "")}（点击预览分块）">${esc(d.title || "未命名")}</span>
         <span class="doc-chunks">${d.chunk_count ?? ""}</span>
         <button class="doc-del" title="删除">✕</button>`;
+      /* 点击标题展开/收起分块预览：排查「为什么没检索到」不用猜入库结果 */
+      item.querySelector(".doc-title").onclick = async () => {
+        const next = item.nextElementSibling;
+        if (next?.classList.contains("doc-chunk-preview")) { next.remove(); return; }
+        const r = await fetch(`/api/documents/${d.id}/chunks`);
+        if (!r.ok) { showError(await errText(r)); return; }
+        const chunks = await r.json();
+        const box = document.createElement("div");
+        box.className = "doc-chunk-preview";
+        box.innerHTML = chunks.length
+          ? chunks.map(c => `<div class="doc-chunk"><b>#${c.id}</b> ${esc(c.content.slice(0, 200))}${c.content.length > 200 ? "…" : ""}</div>`).join("")
+          : `<div class="doc-chunk">这个文档没有分块</div>`;
+        item.after(box);
+      };
       item.querySelector(".doc-del").onclick = async () => {
         if (!confirm(`删除「${d.title}」？`)) return;
         const r = await fetch(`/api/documents/${d.id}`, { method: "DELETE" });
@@ -1012,10 +1202,10 @@ $("ingest-btn").onclick = async () => {
   const btn = $("ingest-btn");
   btn.disabled = true; btn.textContent = "…";
   try {
-    const r = await fetch("/api/ingest", {
+    const r = await fetchT("/api/ingest", {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ source: src }),
-    });
+    }, 300000);
     if (!r.ok) throw new Error(await errText(r));
     const data = await r.json();
     $("ingest-input").value = "";
@@ -1032,7 +1222,7 @@ async function uploadFile(file) {
   fd.append("file", file);
   btn.disabled = true; btn.textContent = "上传中…";
   try {
-    const r = await fetch("/api/ingest/upload", { method: "POST", body: fd });
+    const r = await fetchT("/api/ingest/upload", { method: "POST", body: fd }, 300000);
     if (!r.ok) throw new Error(await errText(r));
     const data = await r.json();
     showHint(`已导入 ${file.name}，共 ${data.chunks} 个分块`);
@@ -1069,10 +1259,18 @@ async function loadSessions(q = $("session-search").value.trim()) {
     const sessions = await r.json();
     const list = $("session-list");
     list.innerHTML = "";
+    if (!sessions.length) {
+      list.innerHTML = `<div class="empty-docs">没有匹配的对话</div>`;
+      return;
+    }
     for (const s of sessions) {
       const item = document.createElement("div");
       item.className = "session-item" + (s.id === sessionId ? " active" : "");
-      item.innerHTML = `<span class="session-title"></span>
+      /* mode 徽章：定时任务自动会话（source=scheduled）与手动会话一眼区分 */
+      const badge = s.mode && s.mode !== "chat"
+        ? `<span class="session-mode">${MODE_LABELS[s.mode] || esc(s.mode)}</span>` : "";
+      const auto = s.source === "scheduled" ? `<span class="session-mode" title="定时任务创建">⏰</span>` : "";
+      item.innerHTML = `<span class="session-title"></span>${badge}${auto}
         <button class="session-act rename" title="重命名">✎</button>
         <button class="session-act del" title="删除">✕</button>`;
       const titleEl = item.querySelector(".session-title");
@@ -1098,6 +1296,7 @@ async function loadSessions(q = $("session-search").value.trim()) {
           sessionId = null; localStorage.removeItem(LS_KEY); clearChat();
         }
         loadSessions();
+        showUndo(`已删除「${s.title || "空对话"}」`, s.id);
       };
       item.onclick = () => openSession(s.id);
       list.appendChild(item);
@@ -1109,7 +1308,7 @@ $("session-search").oninput = () => {
   clearTimeout(searchTimer);
   searchTimer = setTimeout(() => loadSessions(), 200);
 };
-/* 导入 ChatGPT / Claude 导出的 JSON（后端按结构自动识别） */
+/* 导入：统一入口按内容嗅探——自家导出（回灌备份）、ChatGPT、Claude 三种 JSON */
 $("import-btn").onclick = () => $("import-input").click();
 $("import-input").onchange = async () => {
   const file = $("import-input").files[0];
@@ -1117,16 +1316,23 @@ $("import-input").onchange = async () => {
   const fd = new FormData();
   fd.append("file", file);
   try {
-    const r = await fetch("/api/import/chatgpt", { method: "POST", body: fd });
+    const r = await fetchT("/api/import", { method: "POST", body: fd }, 300000);
     if (!r.ok) throw new Error(await errText(r));
     const d = await r.json();
-    showHint(`已导入 ${d.sessions} 个会话、${d.messages} 条消息`);
-    loadSessions();
+    if (d.imported) {
+      const parts = Object.entries(d.imported).filter(([, n]) => n).map(([k, n]) => `${k} ${n} 行`);
+      showHint(parts.length ? `已回灌备份：${parts.join("，")}` : "备份内容已全部存在，无新增");
+      loadSessions(); loadDocs(); loadMemories(); loadGaps();
+    } else {
+      showHint(`已导入 ${d.sessions} 个会话、${d.messages} 条消息`);
+      loadSessions();
+    }
   } catch (e) { showError(e.message); }
   finally { $("import-input").value = ""; }
 };
 async function openSession(id) {
-  if (busy) return;
+  /* 生成中也允许切走：流在后台照常落库，切回来 refreshMessages 能看到已落库的部分。
+     被摘出 DOM 的流式气泡由 rAF 继续渲染，无害 */
   sessionId = id; localStorage.setItem(LS_KEY, id);
   closePopover();
   sidebarEl.classList.remove("open");
@@ -1152,50 +1358,141 @@ async function loadSessionMode() {
   const id = sessionId;
   if (!id) { sessionMode = null; renderMode(); return; }
   try {
-    const r = await fetch("/api/sessions");
-    if (!r.ok) return;
-    const s = (await r.json()).find(x => x.id === id);
+    const r = await fetch(`/api/sessions/${id}`);
     if (sessionId !== id) return;  // 挂起期间切走了：这份结果已经过期，丢掉
-    if (!s) { resetStaleSession(); return; }
+    if (r.status === 404) { resetStaleSession(); return; }  // 查无此会话 = 真的没了
+    if (!r.ok) return;
+    const s = await r.json();
     sessionMode = s.mode || "chat";
     renderMode();
-  } catch { /* 列表拿不到就保留现状，不打扰 */ }
+  } catch { /* 拿不到就保留现状，不打扰 */ }
 }
 /* 会话已不存在：清掉本地 id 回到新对话，别把用户卡在「会话不存在」上 */
 function resetStaleSession() {
   sessionId = null; sessionMode = null;
   localStorage.removeItem(LS_KEY);
-  $("model-row").hidden = true;
+  sessModel = ""; sessEffort = "";
+  syncModelChip();
   renderMode();
   loadSessions();
   showHint("原会话已不存在，已回到新对话：再发一次就开一个新会话");
 }
-/* per-session 模型覆盖：从会话列表里捞当前会话的 model 填进输入框 */
+/* per-session 模型 + 思考强度：chip 下拉的当前值来源。从会话列表捞，改动后本地同步。 */
+let sessModel = "", sessEffort = "";
 async function loadSessionModel() {
-  const row = $("model-row");
-  if (!sessionId) { row.hidden = true; return; }
+  const id = sessionId;
+  if (!id) { sessModel = ""; sessEffort = ""; syncModelChip(); return; }
   try {
-    const r = await fetch("/api/sessions");
-    if (!r.ok) return;
-    const s = (await r.json()).find(x => x.id === sessionId);
-    if (!s) { row.hidden = true; return; }
-    row.hidden = false;
-    $("session-model").value = s.model || "";
-  } catch { /* 列表拿不到就只藏行，不打扰 */ }
+    const r = await fetch(`/api/sessions/${id}`);
+    if (sessionId !== id || !r.ok) return;  // 切走了或会话没了：别动当前显示
+    const s = await r.json();
+    sessModel = s.model || "";
+    sessEffort = s.effort || "";
+    syncModelChip();
+  } catch { /* 拿不到就保留现状，不打扰 */ }
 }
-$("session-model-save").onclick = async () => {
-  if (!sessionId) return;
+async function patchSession(fields) {
+  if (!sessionId) return false;
   const r = await fetch(`/api/sessions/${sessionId}`, {
     method: "PATCH", headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ model: $("session-model").value.trim() }),
+    body: JSON.stringify(fields),
   });
-  if (!r.ok) { showError(await errText(r)); return; }
-  showHint($("session-model").value.trim() ? "本会话模型已保存" : "已恢复跟随全局默认模型");
+  if (!r.ok) { showError(await errText(r)); return false; }
+  return true;
+}
+/* ＋按钮：跳到侧栏「导入」分区的输入框（复用现有导入框，不另开入口） */
+function focusIngest() {
+  const det = $("ingest-input").closest("details");
+  if (det && !det.open) det.open = true;
+  $("ingest-input").focus();
+  $("ingest-input").scrollIntoView({ block: "nearest", behavior: "smooth" });
+}
+$("attach-btn").onclick = focusIngest;
+/* 模型 chip：toggle 下拉浮层。没开会话时不给设（模型/强度都是会话级覆盖）。 */
+const chipPop = $("chip-pop");
+$("model-chip").onclick = (e) => {
+  e.stopPropagation();
+  if (!sessionId) { showHint("先开一个新对话，再选模型和思考强度"); return; }
+  chipPop.hidden ? openChipPop() : closeChipPop();
 };
-$("session-model").onkeydown = (e) => { if (e.key === "Enter") $("session-model-save").click(); };
+function closeChipPop() { chipPop.hidden = true; }
+document.addEventListener("click", (e) => {
+  if (!chipPop.hidden && !chipPop.contains(e.target) && e.target.id !== "model-chip") closeChipPop();
+});
+async function openChipPop() {
+  chipPop.hidden = false;
+  renderEfforts();
+  const box = $("chip-models");
+  box.innerHTML = `<div class="chip-loading">拉取中…</div>`;
+  try {
+    const r = await fetch("/api/models", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ kind: "llm", base_url: "", api_key: "" }),
+    });
+    if (!r.ok) throw new Error(await errText(r));
+    const { models } = await r.json();
+    renderChipModels(models.map(m => m.id));
+  } catch {
+    // 拉取失败（Anthropic 不支持 / 没配 key）降级为「默认 + 手填」，不阻塞强度选择
+    renderChipModels([]);
+  }
+}
+function renderChipModels(ids) {
+  const box = $("chip-models");
+  const items = [{ id: "", label: "默认（跟随全局）" }, ...ids.map(id => ({ id, label: id }))];
+  box.innerHTML = "";
+  for (const m of items) {
+    const b = document.createElement("button");
+    b.className = "chip-model-item" + (m.id === sessModel ? " active" : "");
+    b.innerHTML = `<span>${esc(m.label)}</span>${m.id === sessModel ? '<span class="chip-check">✓</span>' : ""}`;
+    b.onclick = async () => {
+      if (await patchSession({ model: m.id })) {
+        sessModel = m.id; syncModelChip(); renderChipModels(ids);
+        showHint(m.id ? `本会话模型：${m.id}` : "已恢复跟随全局默认模型");
+      }
+    };
+    box.appendChild(b);
+  }
+}
+$("chip-model-input").onkeydown = async (e) => {
+  if (e.key !== "Enter") return;
+  const v = e.target.value.trim();
+  if (await patchSession({ model: v })) {
+    sessModel = v; syncModelChip(); e.target.value = "";
+    showHint(v ? `本会话模型：${v}` : "已恢复跟随全局默认模型");
+  }
+};
+const EFFORTS = ["off", "low", "high", "max"];
+function renderEfforts() {
+  document.querySelectorAll(".effort-btn").forEach(b => {
+    const on = (b.dataset.effort === (sessEffort || "off"));
+    b.classList.toggle("active", on);
+    b.innerHTML = esc(b.dataset.effort[0].toUpperCase() + b.dataset.effort.slice(1)) + (on ? ' <span class="chip-check">✓</span>' : "");
+  });
+}
+$("chip-efforts").onclick = async (e) => {
+  const b = e.target.closest(".effort-btn");
+  if (!b) return;
+  const v = b.dataset.effort;
+  if (await patchSession({ effort: v === "off" ? "" : v })) {
+    sessEffort = v === "off" ? "" : v;
+    syncModelChip(); renderEfforts();
+  }
+};
+function syncModelChip() {
+  const parts = [];
+  if (sessModel) parts.push(sessModel);
+  if (sessEffort) parts.push(sessEffort[0].toUpperCase() + sessEffort.slice(1));
+  $("model-chip").textContent = parts.length ? parts.join(" · ") : "默认";
+  $("model-chip").title = parts.length
+    ? `本会话：${parts.join("，")}`
+    : "本会话模型与思考强度（默认跟随全局）";
+}
 $("new-session").onclick = () => {
-  if (busy) return;
+  /* 同 openSession：生成中也允许开新对话，旧会话的流在后台继续落库 */
   sessionId = null; sessionMode = null;
+  /* 会话级模型/强度标签也要清，否则 chip 挂着上一个会话的设置到发第一条消息 */
+  sessModel = ""; sessEffort = ""; syncModelChip();
   localStorage.removeItem(LS_KEY);
   closePopover();
   sidebarEl.classList.remove("open");
@@ -1401,6 +1698,22 @@ async function openTasks() {
 function closeTasks() { taskMask.style.display = "none"; }
 $("tasks-close").onclick = closeTasks;
 taskMask.onclick = (e) => { if (e.target === taskMask) closeTasks(); };
+/* cron 输入即时预览下次运行时间（防抖 300ms；校验口径与后端同为 croniter） */
+let cronTimer = null;
+$("task-cron").addEventListener("input", () => {
+  clearTimeout(cronTimer);
+  cronTimer = setTimeout(async () => {
+    const v = $("task-cron").value.trim();
+    const el = $("cron-next");
+    if (!v) { el.textContent = ""; return; }
+    try {
+      const r = await fetch(`/api/tasks/next-run?cron=${encodeURIComponent(v)}`);
+      el.textContent = r.ok
+        ? `下次运行：${new Date((await r.json()).next_run).toLocaleString()}`
+        : "无效的 cron 表达式";
+    } catch { el.textContent = ""; }
+  }, 300);
+});
 /* 新建任务：后端校验 cron / 名称 / 内容，400 的 detail 直接显示在表单下方 */
 $("task-create").onclick = async () => {
   const btn = $("task-create");
@@ -1428,6 +1741,7 @@ async function send() {
   const text = inputEl.value.trim();
   if (!text || busy) return;
   inputEl.value = ""; inputEl.style.height = "auto";
+  localStorage.removeItem(LS_DRAFT);
   addMsg("user").textContent = text;
   /* 只有新会话带 mode：已有会话的模式由后端按库里的判定，带上不同的值只会换来 409 */
   const payload = { session_id: sessionId, message: text };
@@ -1438,7 +1752,7 @@ async function send() {
   });
 }
 
-/* 编辑提问：改库 → 重渲染（截断的尾巴消失）→ 对编辑后的提问重新生成 */
+/* 编辑提问：改库 → 重渲染（截断的尾巴消失）→ 可选对编辑后的提问重新生成 */
 function editMessage(div) {
   if (busy) return;
   const body = div.querySelector(".msg-body");
@@ -1449,22 +1763,25 @@ function editMessage(div) {
   ta.value = original;
   const row = document.createElement("div");
   row.className = "edit-actions";
-  row.innerHTML = `<button class="btn btn-primary">保存并重新生成</button><button class="link-btn">取消</button>`;
+  row.innerHTML = `<button class="btn btn-primary">保存并重新生成</button><button class="btn">仅保存</button><button class="link-btn">取消</button>`;
   body.append(ta, row);
   ta.focus();
   ta.setSelectionRange(ta.value.length, ta.value.length);
-  row.children[1].onclick = () => { body.textContent = original; };
-  row.children[0].onclick = async () => {
+  row.children[2].onclick = () => { body.textContent = original; };
+  const save = async () => {
     const text = ta.value.trim();
-    if (!text) return;
+    if (!text) return false;
     const r = await fetch(`/api/messages/${div.dataset.mid}`, {
       method: "PUT", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ content: text }),
     });
-    if (!r.ok) { showError(await errText(r)); return; }
+    if (!r.ok) { showError(await errText(r)); return false; }
     await refreshMessages();
-    respond();
+    return true;
   };
+  row.children[0].onclick = async () => { if (await save()) respond(); };
+  /* 只改错字之类不该付一次完整生成：保存即完事，要重答再点「重新生成」 */
+  row.children[1].onclick = () => save();
 }
 
 /* 重新生成：删掉这条回答（连带其后消息）后，让会话末尾的提问再走一轮 */
@@ -1489,7 +1806,7 @@ async function streamFrom(url, opts) {
   sendBtn.textContent = "■"; sendBtn.title = "停止生成";
   const answerEl = addMsg("assistant");
   answerEl.classList.add("cursor-blink");
-  let answer = "", chips = [], stale = false;
+  let answer = "", chips = [], stale = false, renderQueued = false;
   try {
     const resp = await fetch(url, { ...opts, signal: controller.signal });
     if (!resp.ok) {
@@ -1520,8 +1837,16 @@ async function streamFrom(url, opts) {
         }
         else if (ev.type === "text_delta") {
           answer += ev.data.text;
-          renderCitations(answerEl, answer);
-          scrollBottom();
+          /* rAF 节流：每个 token 全量重渲染是 O(n²)；一帧最多渲染一次。
+             收尾的 refreshMessages 会从库里重渲染，最后一帧丢了也不碍事 */
+          if (!renderQueued) {
+            renderQueued = true;
+            requestAnimationFrame(() => {
+              renderQueued = false;
+              renderCitations(answerEl, answer);
+              if (nearBottom()) scrollBottom();
+            });
+          }
         }
         else if (ev.type === "tool_start") chips.push(addToolChip(ev.data.arguments?.query ?? ev.data.name ?? ""));
         else if (ev.type === "tool_end") chips.forEach(c => c.classList.add("done"));
@@ -1531,7 +1856,7 @@ async function streamFrom(url, opts) {
     }
   } catch (e) {
     if (e.name === "AbortError") showHint("已停止生成");
-    else if (!stale) showError(e.message);
+    else if (!stale) showError(e.message, sessionId ? respond : null);
   } finally {
     answerEl.classList.remove("cursor-blink");
     busy = false; controller = null;
@@ -1547,6 +1872,8 @@ async function streamFrom(url, opts) {
 
 sendBtn.onclick = () => controller ? controller.abort() : send();
 inputEl.onkeydown = (e) => {
+  /* IME 选词中的 Enter 不发送（Chrome 拼音确认会触发 keydown Enter，keyCode 229 兜底） */
+  if (e.isComposing || e.keyCode === 229) return;
   if (paletteEl.style.display === "block") {
     const n = paletteEl._hits?.length || 0;
     if (e.key === "ArrowDown") { e.preventDefault(); paletteIdx = (paletteIdx + 1) % n; updatePalette(); return; }
@@ -1560,6 +1887,12 @@ inputEl.oninput = () => {
   inputEl.style.height = "auto";
   inputEl.style.height = Math.min(inputEl.scrollHeight, 160) + "px";
   updatePalette();
+  /* 草稿防抖落 localStorage：刷新/重启不该吃掉正在写的问题 */
+  clearTimeout(draftTimer);
+  draftTimer = setTimeout(() => {
+    if (inputEl.value.trim()) localStorage.setItem(LS_DRAFT, inputEl.value);
+    else localStorage.removeItem(LS_DRAFT);
+  }, 300);
 };
 
 /* ---------- / 命令面板 ---------- */
@@ -1830,10 +2163,37 @@ $("settings-save").onclick = async () => {
 
 $("tasks-btn").onclick = openTasks;
 
+/* ESC 关掉设置/任务面板与引用浮层（原来只有 / 面板响应 ESC） */
+document.addEventListener("keydown", (e) => {
+  if (e.key !== "Escape") return;
+  $("settings-mask").style.display = "none";
+  $("tasks-mask").style.display = "none";
+  closePopover();
+});
+
+/* 首次启动引导：没配任何 API Key 时 hero 直接给一个通往设置面板的按钮，
+   而不是让用户发一条消息等 6 秒的错误提示 */
+async function checkOnboarding() {
+  try {
+    const r = await fetch("/api/settings");
+    if (!r.ok) return;
+    const s = await r.json();
+    if (s.openai_api_key || s.anthropic_api_key) return;
+    const hero = $("hero");
+    if (!hero) return;
+    hero.innerHTML = `<h1>先配置模型</h1>
+      <p>还没有可用的 API Key。填入供应商与密钥后，就能开始导入笔记并提问。</p>
+      <button class="btn btn-primary" id="onboard-settings">打开设置</button>`;
+    $("onboard-settings").onclick = () => $("settings-btn").click();
+  } catch { /* 探测失败不打扰正常使用 */ }
+}
+
 loadDocs();
 loadMemories();
 loadGaps();
 renderMode();
+checkOnboarding();
+localStorage.getItem(LS_DRAFT) && (inputEl.value = localStorage.getItem(LS_DRAFT));
 sessionId ? openSession(sessionId) : loadSessions();
 inputEl.focus();
 </script>

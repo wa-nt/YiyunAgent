@@ -43,7 +43,7 @@ python -m app.desktop
 # 重新打包前请先从托盘菜单退出正在运行的实例，否则脚本会直接拒绝构建
 build_desktop.bat
 
-# 跑测试（324 条）
+# 跑测试（578 条）
 python -m pytest tests/ -q
 
 # 跑评测（需配置 key；--ablation 跑 8 组消融矩阵）
@@ -59,9 +59,16 @@ LLM 后端通过 `LLM_PROVIDER=openai_compat|anthropic` 切换；OpenAI 兼容�
 |---|---|---|
 | POST | `/api/ingest` | 导入文档（文件路径或 URL） |
 | GET | `/api/documents` | 文档列表 |
+| GET | `/api/documents/{id}/chunks` | 文档分块预览（排查「为什么没检索到」） |
 | DELETE | `/api/documents/{id}` | 删除文档 |
 | POST | `/api/chat` | SSE 流式对话（session/text_delta/tool_start/tool_end/done/error） |
+| GET | `/api/sessions` | 会话列表（`q` 搜索、`limit` 上限） |
+| GET | `/api/sessions/{id}` | 单个会话（含 mode/source/模型覆盖） |
+| DELETE | `/api/sessions/{id}` | 软删除会话（打 deleted_at 标记，列表/读取即隐藏） |
+| POST | `/api/sessions/{id}/restore` | 撤销软删除 |
 | GET | `/api/sessions/{id}/messages` | 会话历史 |
+| POST | `/api/import` | 统一导入：本应用导出回灌 / ChatGPT / Claude 三种 JSON |
+| GET | `/api/tasks/next-run?cron=` | cron 表达式的下次运行时间（表单即时预览） |
 | GET | `/api/traces` | 调用明细（kind/name/时间窗过滤，分页） |
 | GET | `/api/traces/summary` | 成本聚合（总计 + 按 kind/name 分组） |
 | GET/POST | `/api/settings` | 模型供应商设置（密钥脱敏回显；保存写 .env 并即时生效，对应侧栏 ⚙ 面板）。`persona`（存 SQLite）与 `autostart`（Windows 注册表）不走 .env，见 `app/autostart.py` |
@@ -85,7 +92,7 @@ app/
 skills/              5 个内置技能（SKILL.md 声明式定义）
 eval/                评测框架：runner / metrics / ablation / report + 38 条评测集
 web/index.html       单文件前端（Notion 风格）
-tests/               324 条测试
+tests/               578 条测试
 docs/design.md       设计方案
 ```
 

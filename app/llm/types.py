@@ -6,6 +6,11 @@ from pydantic import BaseModel, Field
 
 Role = Literal["system", "user", "assistant", "tool"]
 
+# 思考强度：可移植的四档枚举，在各家客户端层映射成具体 API 参数
+# （OpenAI 兼容 → reasoning_effort，Anthropic → thinking.budget_tokens）。
+# off = 不思考（不传任何参数）；NULL/缺省 = 跟随供应商默认。
+Effort = Literal["off", "low", "high", "max"]
+
 
 class ToolCall(BaseModel):
     id: str

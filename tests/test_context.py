@@ -997,3 +997,81 @@ async def test_run_agent_without_governance_sends_history_untouched(db, monkeypa
     assert "已落库的历史0" in [m.content for m in sent]
     assert not any(m.content.startswith(ctx.SUMMARY_PREFIX) for m in sent)
     assert llm.chats == []
+
+
+# ---------- 持久化压缩（摘要落 sessions 表，增量才调 LLM） ----------
+
+
+async def test_persistent_compaction_caches_summary(db):
+    """第一轮生成摘要并落库；增量未越过保留窗口时第二轮直接复用缓存，不再调摘要 LLM。"""
+    calls = 0
+
+    class CountingLLM:
+        async def chat(self, messages, tools=None):
+            nonlocal calls
+            calls += 1
+            return ChatResult(text=SUMMARY)
+
+    await seed_history(db, 13, "已落库的历史")
+    rows = await runtime.load_history_rows(SESSION, db_path=str(db))
+    view = await ctx.compact_history_persistent(SESSION, rows, llm=CountingLLM(), db_path=str(db))
+    assert calls == 1
+    assert view[0].role == "system" and view[0].content.startswith(ctx.SUMMARY_PREFIX)
+    assert len(view) < len(rows)  # 被摘要覆盖的前缀从视图里消失了
+
+    async with get_db(db) as conn:
+        cached = (await conn.execute_fetchall(
+            "SELECT history_summary, history_summary_upto FROM sessions WHERE id = ?",
+            (SESSION,),
+        ))[0]
+    assert cached["history_summary"] == SUMMARY
+    assert cached["history_summary_upto"] is not None
+
+    # 同一批历史再来一轮：命中缓存，不再调 LLM
+    view2 = await ctx.compact_history_persistent(SESSION, rows, llm=CountingLLM(), db_path=str(db))
+    assert calls == 1
+    assert view2[0].content.startswith(ctx.SUMMARY_PREFIX)
+
+
+async def test_persistent_compaction_summarizes_increment(db):
+    """缓存之后又攒够一轮增量：旧摘要随新增量一起重压（滚动更新），覆盖位置前移。"""
+    seen_inputs = []
+
+    class RecordingLLM:
+        async def chat(self, messages, tools=None):
+            seen_inputs.append(messages[-1].content)
+            return ChatResult(text=SUMMARY)
+
+    await seed_history(db, 13, "历史")
+    rows = await runtime.load_history_rows(SESSION, db_path=str(db))
+    await ctx.compact_history_persistent(SESSION, rows, llm=RecordingLLM(), db_path=str(db))
+    async with get_db(db) as conn:
+        upto1 = (await conn.execute_fetchall(
+            "SELECT history_summary_upto FROM sessions WHERE id = ?", (SESSION,)
+        ))[0]["history_summary_upto"]
+
+    # 增量追加 8 条（越过保留窗口），再跑一轮：应再调一次 LLM，且旧摘要进了输入
+    async with get_db(db) as conn:
+        prev = (await conn.execute_fetchall(
+            "SELECT active_leaf FROM sessions WHERE id = ?", (SESSION,)
+        ))[0]["active_leaf"]
+        for i in range(8):
+            cur = await conn.execute(
+                "INSERT INTO messages (session_id, role, content, created_at, parent_id) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (SESSION, "user" if i % 2 == 0 else "assistant", f"新增 {i}",
+                 f"2026-09-25T10:{i:02d}:00", prev),
+            )
+            prev = cur.lastrowid
+        await conn.execute("UPDATE sessions SET active_leaf = ? WHERE id = ?", (prev, SESSION))
+        await conn.commit()
+    rows2 = await runtime.load_history_rows(SESSION, db_path=str(db))
+    view = await ctx.compact_history_persistent(SESSION, rows2, llm=RecordingLLM(), db_path=str(db))
+    assert len(seen_inputs) == 2
+    assert SUMMARY in seen_inputs[1]  # 旧摘要参与滚动压缩
+    async with get_db(db) as conn:
+        upto2 = (await conn.execute_fetchall(
+            "SELECT history_summary_upto FROM sessions WHERE id = ?", (SESSION,)
+        ))[0]["history_summary_upto"]
+    assert upto2 > upto1
+    assert view[0].content.startswith(ctx.SUMMARY_PREFIX)

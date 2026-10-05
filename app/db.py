@@ -40,6 +40,8 @@ async def connect(db_path: str | Path | None = None) -> aiosqlite.Connection:
     await _load_vec_extension(conn)
     await conn.execute("PRAGMA journal_mode = WAL")
     await conn.execute("PRAGMA foreign_keys = ON")
+    # 写者相撞时等待 5s 而不是立即 database is locked（托盘只读连接已单独设过）
+    await conn.execute("PRAGMA busy_timeout = 5000")
     return conn
 
 
@@ -57,6 +59,10 @@ async def init_db(db_path: str | Path | None = None, embed_dim: int | None = Non
             await conn.execute("ALTER TABLE sessions ADD COLUMN provider TEXT")
         if "model" not in session_cols:
             await conn.execute("ALTER TABLE sessions ADD COLUMN model TEXT")
+        # per-session 思考强度覆盖；NULL = 跟随供应商默认。off/low/high/max 四档，
+        # 在 LLM 客户端层翻成各家的 reasoning_effort / thinking.budget_tokens
+        if "effort" not in session_cols:
+            await conn.execute("ALTER TABLE sessions ADD COLUMN effort TEXT")
         if "active_leaf" not in session_cols:
             await conn.execute("ALTER TABLE sessions ADD COLUMN active_leaf INTEGER")
             # 回填：旧库都是线性消息，叶子 = 每个会话的最后一条
@@ -64,6 +70,15 @@ async def init_db(db_path: str | Path | None = None, embed_dim: int | None = Non
                 "UPDATE sessions SET active_leaf = "
                 "(SELECT MAX(id) FROM messages WHERE session_id = sessions.id)"
             )
+        # 历史压缩摘要的持久化（T8）：summary = 摘要文本，summary_upto = 摘要覆盖到的
+        # 最后一条消息 id。两列成对出现/清空，只写其一视为无缓存
+        if "history_summary" not in session_cols:
+            await conn.execute("ALTER TABLE sessions ADD COLUMN history_summary TEXT")
+        if "history_summary_upto" not in session_cols:
+            await conn.execute("ALTER TABLE sessions ADD COLUMN history_summary_upto INTEGER")
+        # 软删除：DELETE /api/sessions/{id} 只打标，列表与读取按 deleted_at IS NULL 过滤
+        if "deleted_at" not in session_cols:
+            await conn.execute("ALTER TABLE sessions ADD COLUMN deleted_at TEXT")
         # 模式框架（T1）：mode 是会话创建时固定的运行时选择，其余三列标记「这条会话由
         # 定时任务创建」及其归属。新库同样走这段迁移（schema.sql 里不写这四列），
         # 保证新老安装只有一条建列路径。
@@ -119,6 +134,9 @@ async def init_db(db_path: str | Path | None = None, embed_dim: int | None = Non
                 "WHERE m2.session_id = messages.session_id AND m2.id < messages.id)"
             )
         await conn.commit()
+        # 迁移目前是一组幂等 ALTER，user_version 只作为「库被哪个版本动过」的标记，
+        # 后续真引入破坏性迁移时以它做门栏（现在恒为 1）
+        await conn.execute("PRAGMA user_version = 1")
     finally:
         await conn.close()
 

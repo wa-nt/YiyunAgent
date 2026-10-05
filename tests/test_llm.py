@@ -149,6 +149,43 @@ async def test_anthropic_chat():
     assert result.usage.tokens_out == 5
 
 
+async def test_openai_effort_maps_to_reasoning_effort():
+    """low/high → reasoning_effort；max 这边没有更高档，映射到 high；off/缺省不传。"""
+    for effort, want in [("low", "low"), ("high", "high"), ("max", "high"), ("off", None), (None, None)]:
+        client = OpenAICompatClient(api_key="k", model="m", effort=effort)
+        seen: dict = {}
+
+        async def fake_create(**kwargs):
+            seen.update(kwargs)
+            return _openai_response()
+
+        client.client = SimpleNamespace(
+            chat=SimpleNamespace(completions=SimpleNamespace(create=fake_create))
+        )
+        await client.chat(MSGS)
+        assert seen.get("reasoning_effort") == want, f"effort={effort}"
+
+
+async def test_anthropic_effort_maps_to_thinking_budget():
+    """low/high/max → thinking.budget_tokens，并把 max_tokens 抬到 budget 之上；off/缺省不开 thinking。"""
+    cases = [("low", 2048), ("high", 8192), ("max", 16384), ("off", None), (None, None)]
+    for effort, budget in cases:
+        client = AnthropicClient(api_key="k", model="m", effort=effort)
+        seen: dict = {}
+
+        async def fake_create(**kwargs):
+            seen.update(kwargs)
+            return _anthropic_response()
+
+        client.client = SimpleNamespace(messages=SimpleNamespace(create=fake_create))
+        await client.chat(MSGS)
+        if budget is None:
+            assert "thinking" not in seen, f"effort={effort}"
+        else:
+            assert seen["thinking"] == {"type": "enabled", "budget_tokens": budget}, f"effort={effort}"
+            assert seen["max_tokens"] > budget, f"effort={effort}"
+
+
 def test_anthropic_merges_parallel_tool_results():
     msgs = [
         Message(role="user", content="查两个"),
@@ -260,3 +297,14 @@ async def test_anthropic_stream():
     final = chunks[-1]
     assert final.finish and final.tool_calls[0].name == "search"
     assert final.usage.tokens_in == 10
+
+
+def test_clients_have_timeout_and_limited_retries():
+    """provider 卡住时应在分钟级报错（connect 10s / read 120s），重试只给 1 次。"""
+    c = OpenAICompatClient(api_key="k", model="m")
+    assert c.client.timeout.connect == 10.0
+    assert c.client.timeout.read == 120.0
+    assert c.client.max_retries == 1
+    a = AnthropicClient(api_key="k", model="m")
+    assert float(a.client.timeout) == 120.0
+    assert a.client.max_retries == 1

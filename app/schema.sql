@@ -96,6 +96,8 @@ CREATE TABLE IF NOT EXISTS knowledge_gaps (
 -- 消息列表、按 status 筛有效记忆、看板按 (kind, name, ts) 过滤 trace。
 -- 全部 IF NOT EXISTS，init_db 每次启动重放本文件时给存量库补上，无需迁移脚本。
 CREATE INDEX IF NOT EXISTS idx_messages_session_id ON messages(session_id);
+-- parent_id 是分支树递归 CTE 与编辑截断的 join key，无索引则长会话全表扫
+CREATE INDEX IF NOT EXISTS idx_messages_parent_id ON messages(parent_id);
 CREATE INDEX IF NOT EXISTS idx_memories_status ON memories(status);
 CREATE INDEX IF NOT EXISTS idx_traces_kind_name_ts ON traces(kind, name, ts);
 -- /api/gaps?all=false 与定时复习任务（T5）只查「已到期」，列表按到期时间排序

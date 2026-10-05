@@ -127,4 +127,5 @@ async def bm25_search(
     query: str, k: int = 20, db_path: str | Path | None = None
 ) -> list[RetrievedChunk]:
     index = await _get_index(db_path)
-    return index.search(query, k)
+    # search 是同步 CPU 计算（numpy + 全量 sorted），语料大了会卡住事件循环
+    return await asyncio.to_thread(index.search, query, k)

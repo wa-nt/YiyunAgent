@@ -96,6 +96,7 @@ async def test_sessions_list_orders_by_last_message(client, db):
         "created_at": "2026-09-28T10:00:00",
         "provider": None,
         "model": None,
+        "effort": None,
         "mode": "chat",
         "source": "manual",
         "title": "RAG 是什么？",
@@ -287,3 +288,56 @@ async def test_memories_list_newest_first(client, db):
         "confidence": 0.8,
         "created_at": "2026-09-28T10:00:00",
     }
+
+async def test_single_session_endpoint(client, db):
+    """单会话接口：切会话时不用再拉全量列表找一条；不存在的 id 回 404。"""
+    async with get_db(db) as conn:
+        await conn.execute(
+            "INSERT INTO sessions (id, created_at, title) VALUES ('s-one', '2026-10-05T00:00:00', '一条')"
+        )
+        await conn.commit()
+    resp = await client.get("/api/sessions/s-one")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["id"] == "s-one" and body["title"] == "一条"
+    assert body["mode"] == "chat" and body["source"] == "manual"
+    assert (await client.get("/api/sessions/nope")).status_code == 404
+
+
+async def test_sessions_limit(client, db):
+    async with get_db(db) as conn:
+        for i in range(5):
+            await conn.execute(
+                "INSERT INTO sessions (id, created_at) VALUES (?, '2026-10-05T00:00:00')",
+                (f"s{i}",),
+            )
+        await conn.commit()
+    assert len((await client.get("/api/sessions?limit=2")).json()) == 2
+
+
+async def test_document_chunks_preview(client, db):
+    async with get_db(db) as conn:
+        cursor = await conn.execute(
+            "INSERT INTO documents (title, source, ingested_at) "
+            "VALUES ('笔记', 'notes.md', '2026-10-05T00:00:00')"
+        )
+        doc_id = cursor.lastrowid
+        for text, dim in (("第一段内容", 8), ("第二段内容", 8)):
+            cur = await conn.execute(
+                "INSERT INTO chunks (doc_id, content) VALUES (?, ?)", (doc_id, text)
+            )
+            await conn.execute(
+                "INSERT INTO chunk_vectors (chunk_id, embedding) VALUES (?, ?)",
+                (cur.lastrowid, "[" + ",".join(["0.1"] * dim) + "]"),
+            )
+        await conn.commit()
+    rows = (await client.get(f"/api/documents/{doc_id}/chunks")).json()
+    assert [r["content"] for r in rows] == ["第一段内容", "第二段内容"]
+    assert (await client.get("/api/documents/999/chunks")).status_code == 404
+
+
+async def test_task_next_run_preview(client, db):
+    resp = await client.get("/api/tasks/next-run", params={"cron": "0 9 * * *"})
+    assert resp.status_code == 200
+    assert "T09:00:00" in resp.json()["next_run"]
+    assert (await client.get("/api/tasks/next-run", params={"cron": "not a cron"})).status_code == 422

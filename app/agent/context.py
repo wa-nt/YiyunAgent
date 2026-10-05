@@ -5,7 +5,8 @@
     工具结果清理 → 历史压缩 → token 预算截断
 
 治理只读原始历史、只产出新的 Message 对象：数据库里的 messages 表不动，调用方传进来的
-Message 也不被修改，所以治理后重新加载历史就能拿到完整原文（不做持久化压缩）。
+Message 也不被修改。历史压缩的**摘要产物**持久化在 sessions 表（见
+compact_history_persistent），压缩本身仍不改写原始消息。
 
 压缩要调 LLM 生成摘要，因此本模块的入口是异步的；`assemble_messages` 保持同步（T7 的
 记忆注入在那里），由 run_agent 在每次调用模型前对组装好的视图走一遍治理。
@@ -92,6 +93,77 @@ async def govern_context(
 
 
 # ---------- 历史压缩 ----------
+
+
+async def compact_history_persistent(
+    session_id: str,
+    rows: list[dict],
+    llm: LLMClient | None = None,
+    db_path=None,
+) -> list[Message]:
+    """历史压缩的持久化版：摘要与覆盖位置存 sessions.history_summary/_upto。
+
+    此前的实现每轮都拿全量历史重压一次（runtime 注释自认「下一轮重新加载原始历史再压
+    一次」），长会话里每个用户回合都白付一次摘要 LLM 调用且阻塞首 token。这里只在
+    增量越过保留窗口时才调一次摘要 LLM（旧摘要一并喂进去滚动更新），否则直接复用缓存。
+
+    rows 需带 id 且时间正序（load_history_rows 的产物）。返回 prompt view 的历史段，
+    可能以摘要 system 消息开头——后续 govern_context 看到摘要就不会再压（_is_summary）。
+    分支切换/编辑后 id 仍单调，covered 前缀判定不受影响；摘要失败则原样返回全文。
+    """
+    plain = [Message(role=r["role"], content=r["content"] or "") for r in rows]
+    if not settings.context_compaction_enabled:
+        return plain
+    threshold = max(settings.context_compaction_threshold, MIN_COMPACTION_THRESHOLD)
+    if len(rows) <= threshold:
+        return plain
+
+    from app.db import get_db  # 延迟 import：db.init_db 里也 import runtime，模块层会成环
+
+    async with get_db(db_path) as conn:
+        cached = await conn.execute_fetchall(
+            "SELECT history_summary, history_summary_upto FROM sessions WHERE id = ?",
+            (session_id,),
+        )
+    summary = upto = None
+    if cached:
+        summary, upto = cached[0]["history_summary"], cached[0]["history_summary_upto"]
+    covered = 0
+    if summary and upto is not None:
+        while covered < len(rows) and rows[covered]["id"] <= upto:
+            covered += 1
+    rest = rows[covered:]
+    keep = max(threshold // 2, 1)
+    if covered and len(rest) <= keep:
+        # 增量还没攒够一轮：直接复用缓存摘要，本轮不调 LLM
+        return [
+            Message(role="system", content=f"{SUMMARY_PREFIX} {summary}"),
+            *[Message(role=r["role"], content=r["content"] or "") for r in rest],
+        ]
+
+    boundary = _keep_boundary(
+        [Message(role=r["role"], content="") for r in rest], keep
+    )
+    if boundary <= 0:
+        return plain
+    new_part = rest[:boundary]
+    to_summarize = [
+        *([Message(role="user", content=f"之前的摘要：{summary}")] if covered else []),
+        *[Message(role=r["role"], content=r["content"] or "") for r in new_part],
+    ]
+    new_summary = await _summarize(to_summarize, llm)
+    if new_summary is None:
+        return plain  # 摘要失败退化为不压缩，也不动缓存
+    async with get_db(db_path) as conn:
+        await conn.execute(
+            "UPDATE sessions SET history_summary = ?, history_summary_upto = ? WHERE id = ?",
+            (new_summary, new_part[-1]["id"], session_id),
+        )
+        await conn.commit()
+    return [
+        Message(role="system", content=f"{SUMMARY_PREFIX} {new_summary}"),
+        *[Message(role=r["role"], content=r["content"] or "") for r in rest[boundary:]],
+    ]
 
 
 async def _compact_history(

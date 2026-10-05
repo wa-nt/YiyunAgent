@@ -4,6 +4,7 @@ from anthropic import AsyncAnthropic
 
 from app.llm.types import (
     ChatResult,
+    Effort,
     Message,
     StreamChunk,
     ToolCall,
@@ -13,6 +14,9 @@ from app.llm.types import (
 from app.tracing import record_llm
 
 DEFAULT_MAX_TOKENS = 4096
+
+# effort → thinking.budget_tokens。off/缺省 = 不开启 thinking；max 给真有的 headroom。
+_EFFORT_BUDGET = {"low": 2048, "high": 8192, "max": 16384}
 
 
 def to_anthropic_payload(
@@ -97,19 +101,34 @@ class AnthropicClient:
         model: str,
         max_tokens: int = DEFAULT_MAX_TOKENS,
         db_path: str | None = None,
+        effort: Effort | None = None,
     ):
-        self.client = AsyncAnthropic(api_key=api_key)
+        # 同 openai_compat：120s 超时 + 只重试 1 次。
+        # ponytail: anthropic 1.8 用 httpx2 不认 httpx.Timeout，直接传秒数
+        self.client = AsyncAnthropic(api_key=api_key, timeout=120.0, max_retries=1)
         self.model = model
         self.max_tokens = max_tokens
         self.provider = "anthropic"
         # 同 openai_compat：埋点落哪个库由创建者决定，None 时 record_llm 兜到默认库
         self.db_path = db_path
+        self.effort = effort
+
+    def _effort_kwarg(self) -> dict[str, Any]:
+        """effort → thinking 配置。开了 thinking 后 max_tokens 必须大于 budget_tokens，
+        所以按档位把 max_tokens 抬到 budget + 一份回答余量（不足才抬，不压低原配置）。"""
+        budget = _EFFORT_BUDGET.get(self.effort or "")
+        if budget is None:
+            return {}
+        return {
+            "thinking": {"type": "enabled", "budget_tokens": budget},
+            "max_tokens": max(self.max_tokens, budget + 2048),
+        }
 
     async def chat(
         self, messages: list[Message], tools: list[ToolDef] | None = None
     ) -> ChatResult:
         system, msgs = to_anthropic_payload(messages)
-        kwargs: dict[str, Any] = {"max_tokens": self.max_tokens}
+        kwargs: dict[str, Any] = {"max_tokens": self.max_tokens, **self._effort_kwarg()}
         if system:
             kwargs["system"] = system
         if tools:
@@ -127,7 +146,7 @@ class AnthropicClient:
         self, messages: list[Message], tools: list[ToolDef] | None = None
     ) -> AsyncIterator[StreamChunk]:
         system, msgs = to_anthropic_payload(messages)
-        kwargs: dict[str, Any] = {"max_tokens": self.max_tokens}
+        kwargs: dict[str, Any] = {"max_tokens": self.max_tokens, **self._effort_kwarg()}
         if system:
             kwargs["system"] = system
         if tools:

@@ -25,12 +25,18 @@ async def hybrid_search(
     if mode == "bm25":
         return await bm25_search(query, k, db_path)
 
-    query_vec = (await embed_texts([query]))[0]
     if mode == "vector":
+        query_vec = (await embed_texts([query]))[0]
         return await vector_search(query_vec, k, db_path)
 
+    # embedding 是一次网络往返，和 BM25 / entity 并发跑：向量路自己等它，不让另外两路干等
+    embed_task = asyncio.create_task(embed_texts([query]))
+
+    async def vector_route() -> list[RetrievedChunk]:
+        return await vector_search((await embed_task)[0], CANDIDATES, db_path)
+
     routes = await asyncio.gather(
-        vector_search(query_vec, CANDIDATES, db_path),
+        vector_route(),
         bm25_search(query, CANDIDATES, db_path),
         entity_search(query, CANDIDATES, db_path),
     )
