@@ -504,3 +504,28 @@ async def test_sessions_list_exposes_mode_and_source(client, db):
     row = next(r for r in rows if r["id"] == WORK_SESSION)
     assert row["mode"] == "work"
     assert row["source"] == "manual"
+
+
+async def test_sessions_list_filters_by_mode(client, db):
+    await seed_session(db, SESSION, "chat")
+    await seed_session(db, WORK_SESSION, "work")
+
+    all_rows = (await client.get("/api/sessions")).json()
+    assert {r["id"] for r in all_rows} == {SESSION, WORK_SESSION}
+
+    work_rows = (await client.get("/api/sessions", params={"mode": "work"})).json()
+    assert [r["id"] for r in work_rows] == [WORK_SESSION]
+
+    chat_rows = (await client.get("/api/sessions", params={"mode": "chat"})).json()
+    assert [r["id"] for r in chat_rows] == [SESSION]
+
+
+async def test_sessions_list_mode_filter_combines_with_search(client, db):
+    await seed_session(db, SESSION, "chat", messages=[("user", "向量检索怎么做")])
+    await seed_session(db, WORK_SESSION, "work", messages=[("user", "向量检索怎么做")])
+
+    rows = (
+        await client.get("/api/sessions", params={"mode": "work", "q": "向量"})
+    ).json()
+
+    assert [r["id"] for r in rows] == [WORK_SESSION]

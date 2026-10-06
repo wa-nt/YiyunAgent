@@ -126,6 +126,13 @@ async def init_db(db_path: str | Path | None = None, embed_dim: int | None = Non
             "UPDATE sessions SET source = 'manual' WHERE source IS NULL OR source = ''"
         )
         msg_cols = {r["name"] for r in await conn.execute_fetchall("PRAGMA table_info(messages)")}
+        # traces 的两列观测增强（T9 看板的缓存命中率与速度）：老库补列，新库同样走这段，
+        # schema.sql 里不写——保证只有一条建列路径（同 sessions 的处理）
+        trace_cols = {r["name"] for r in await conn.execute_fetchall("PRAGMA table_info(traces)")}
+        if "cached_tokens" not in trace_cols:
+            await conn.execute("ALTER TABLE traces ADD COLUMN cached_tokens INTEGER DEFAULT 0")
+        if "duration_ms" not in trace_cols:
+            await conn.execute("ALTER TABLE traces ADD COLUMN duration_ms INTEGER DEFAULT 0")
         if "parent_id" not in msg_cols:
             await conn.execute("ALTER TABLE messages ADD COLUMN parent_id INTEGER")
             # 回填成线性链：每条消息的 parent 是同会话里它前面的最后一条

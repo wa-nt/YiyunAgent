@@ -1,3 +1,4 @@
+import time
 from typing import Any, AsyncIterator
 
 from anthropic import AsyncAnthropic
@@ -10,6 +11,7 @@ from app.llm.types import (
     ToolCall,
     ToolDef,
     Usage,
+    cached_from_anthropic,
 )
 from app.tracing import record_llm
 
@@ -133,13 +135,16 @@ class AnthropicClient:
             kwargs["system"] = system
         if tools:
             kwargs["tools"] = to_anthropic_tools(tools)
+        t0 = time.perf_counter()
         resp = await self.client.messages.create(model=self.model, messages=msgs, **kwargs)
+        elapsed_ms = int((time.perf_counter() - t0) * 1000)
         text, calls = _parse_content(resp.content)
         usage = Usage(
             tokens_in=resp.usage.input_tokens,
             tokens_out=resp.usage.output_tokens,
+            cached_tokens=cached_from_anthropic(resp.usage),
         )
-        record_llm(self.provider, self.model, usage, self.db_path)
+        record_llm(self.provider, self.model, usage, self.db_path, duration_ms=elapsed_ms)
         return ChatResult(text=text, tool_calls=calls, usage=usage)
 
     async def chat_stream(
@@ -151,18 +156,21 @@ class AnthropicClient:
             kwargs["system"] = system
         if tools:
             kwargs["tools"] = to_anthropic_tools(tools)
+        t0 = time.perf_counter()
         async with self.client.messages.stream(
             model=self.model, messages=msgs, **kwargs
         ) as stream:
             async for text in stream.text_stream:
                 yield StreamChunk(text_delta=text)
             final = await stream.get_final_message()
+        elapsed_ms = int((time.perf_counter() - t0) * 1000)
         text, calls = _parse_content(final.content)
         usage = Usage(
             tokens_in=final.usage.input_tokens,
             tokens_out=final.usage.output_tokens,
+            cached_tokens=cached_from_anthropic(final.usage),
         )
         yield StreamChunk(finish=True, tool_calls=calls, usage=usage)
         # 埋点在最后一个 chunk 之后：到这里调用才算完成，中途弃用生成器时不计
         # （同 openai_compat.chat_stream）
-        record_llm(self.provider, self.model, usage, self.db_path)
+        record_llm(self.provider, self.model, usage, self.db_path, duration_ms=elapsed_ms)

@@ -491,7 +491,7 @@ async def test_reset_db_waits_for_inflight_traces(tmp_path, monkeypatch):
 
     order: list[str] = []
 
-    async def slow_insert(kind, name, detail, tokens_in, tokens_out, cost, db_path):
+    async def slow_insert(*args, **kwargs):
         await asyncio.sleep(0.05)  # 模拟一次真实的落库耗时
         order.append("trace-done")
 

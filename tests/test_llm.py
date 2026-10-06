@@ -149,6 +149,62 @@ async def test_anthropic_chat():
     assert result.usage.tokens_out == 5
 
 
+async def test_openai_reports_cached_tokens_and_duration():
+    """prompt 缓存命中从 prompt_tokens_details.cached_tokens 读；duration_ms 由客户端计时。"""
+    client = OpenAICompatClient(api_key="k", model="m")
+
+    async def fake_create(**kwargs):
+        return SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content="好", tool_calls=None))],
+            usage=SimpleNamespace(
+                prompt_tokens=100,
+                completion_tokens=10,
+                prompt_tokens_details=SimpleNamespace(cached_tokens=60),
+            ),
+        )
+
+    client.client = SimpleNamespace(
+        chat=SimpleNamespace(completions=SimpleNamespace(create=fake_create))
+    )
+    result = await client.chat(MSGS, TOOLS)
+
+    assert result.usage.cached_tokens == 60
+
+
+async def test_openai_missing_cache_details_defaults_to_zero():
+    """老端点不返回 prompt_tokens_details 时不能崩，命中数记 0。"""
+    client = OpenAICompatClient(api_key="k", model="m")
+
+    async def fake_create(**kwargs):
+        return SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content="好", tool_calls=None))],
+            usage=SimpleNamespace(prompt_tokens=10, completion_tokens=5),
+        )
+
+    client.client = SimpleNamespace(
+        chat=SimpleNamespace(completions=SimpleNamespace(create=fake_create))
+    )
+    result = await client.chat(MSGS, TOOLS)
+
+    assert result.usage.cached_tokens == 0
+
+
+async def test_anthropic_reports_cached_tokens():
+    """Anthropic 的缓存命中是 cache_read_input_tokens。"""
+    client = AnthropicClient(api_key="k", model="m")
+
+    async def fake_create(**kwargs):
+        return SimpleNamespace(
+            content=[SimpleNamespace(type="text", text="好")],
+            usage=SimpleNamespace(input_tokens=100, output_tokens=5, cache_read_input_tokens=40),
+        )
+
+    client.client = SimpleNamespace(messages=SimpleNamespace(create=fake_create))
+    result = await client.chat(MSGS, TOOLS)
+
+    assert result.usage.cached_tokens == 40
+
+
 async def test_openai_effort_maps_to_reasoning_effort():
     """low/high → reasoning_effort；max 这边没有更高档，映射到 high；off/缺省不传。"""
     for effort, want in [("low", "low"), ("high", "high"), ("max", "high"), ("off", None), (None, None)]:

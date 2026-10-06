@@ -200,14 +200,18 @@ def count_sync(db) -> int:
 async def seed(db, rows: list[tuple]) -> None:
     """直接写库造数据：时间戳可控，便于断言时间范围过滤与分组数学。
 
-    行格式：(kind, name, detail, tokens_in, tokens_out, cost, ts)
+    行格式：(kind, name, detail, tokens_in, tokens_out, cost, ts[, cached_tokens[, duration_ms]])
+    后两列可省略，默认 0（旧用例不必逐个补）。
     """
     async with get_db(db) as conn:
-        for kind, name, detail, tokens_in, tokens_out, cost, ts in rows:
+        for row in rows:
+            kind, name, detail, tokens_in, tokens_out, cost, ts = row[:7]
+            cached = row[7] if len(row) > 7 else 0
+            duration = row[8] if len(row) > 8 else 0
             await conn.execute(
-                "INSERT INTO traces (ts, kind, name, detail, tokens_in, tokens_out, cost) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (ts, kind, name, detail, tokens_in, tokens_out, cost),
+                "INSERT INTO traces (ts, kind, name, detail, tokens_in, tokens_out, cost, "
+                "cached_tokens, duration_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (ts, kind, name, detail, tokens_in, tokens_out, cost, cached, duration),
             )
         await conn.commit()
 
@@ -907,6 +911,57 @@ async def test_traces_summary_on_empty_table_returns_zeros(client, db):
         0,
     )
     assert body["by_kind"] == [] and body["by_name"] == []
+    assert body["by_day"] == []
+
+
+async def test_traces_summary_aggregates_by_day(client, db):
+    """热力图按天聚合：同一天的多条调用合并成一行，日期升序。"""
+    await seed(db, SEED)
+
+    body = (await client.get("/api/traces/summary")).json()
+
+    days = {d["day"]: d for d in body["by_day"]}
+    assert set(days) == {"2026-09-25", "2026-09-26"}
+    # 9-25 两条 llm：100+200 in，20+40 out，成本相加
+    assert days["2026-09-25"]["calls"] == 2
+    assert days["2026-09-25"]["tokens_in"] == 300
+    assert days["2026-09-25"]["tokens_out"] == 60
+    assert days["2026-09-25"]["cost"] == pytest.approx(0.0000662)
+    # 日期升序，方便前端直接铺热力图
+    assert [d["day"] for d in body["by_day"]] == ["2026-09-25", "2026-09-26"]
+
+
+async def test_traces_summary_reports_cache_hit_rate(client, db):
+    """缓存命中率 = cached / (input + cached)，无缓存调用时为 0，不除零。"""
+    await seed(
+        db,
+        [
+            ("llm", "m", "", 100, 10, 0.0, "2026-09-25T10:00:00.000+00:00", 300),
+            ("llm", "m", "", 100, 10, 0.0, "2026-09-25T11:00:00.000+00:00", 0),
+        ],
+    )
+
+    body = (await client.get("/api/traces/summary")).json()
+
+    # 300 / (200 + 300) = 0.6
+    assert body["cached_tokens"] == 300
+    assert body["cache_hit_rate"] == pytest.approx(0.6)
+
+
+async def test_traces_summary_reports_average_latency(client, db):
+    """平均耗时 = 有耗时记录的平均值（无耗时的调用不计入分母）。"""
+    await seed(
+        db,
+        [
+            ("llm", "m", "", 10, 5, 0.0, "2026-09-25T10:00:00.000+00:00", 0, 1200),
+            ("llm", "m", "", 10, 5, 0.0, "2026-09-25T11:00:00.000+00:00", 0, 800),
+            ("tool", "t", "", 0, 0, 0.0, "2026-09-25T12:00:00.000+00:00", 0, 0),
+        ],
+    )
+
+    body = (await client.get("/api/traces/summary")).json()
+
+    assert body["avg_duration_ms"] == 1000
 
 
 async def test_llm_call_reaches_the_dashboard_end_to_end(client, db):

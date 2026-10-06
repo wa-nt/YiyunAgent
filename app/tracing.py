@@ -120,6 +120,8 @@ def record_trace(
     tokens_in: int = 0,
     tokens_out: int = 0,
     cost: float = 0.0,
+    cached_tokens: int = 0,
+    duration_ms: int = 0,
     db_path: str | None = None,
 ) -> None:
     """埋点入口：把一次调用记进 traces 表，fire-and-forget。
@@ -138,7 +140,7 @@ def record_trace(
         return
     # 先拿到 loop 再造协程：create_task 直接抛的话会留下一个没人 await 的协程对象
     task = loop.create_task(
-        _insert(kind, name, detail, tokens_in, tokens_out, cost, db_path),
+        _insert(kind, name, detail, tokens_in, tokens_out, cost, cached_tokens, duration_ms, db_path),
         name=f"trace:{kind}:{name}",
     )
     _pending.add(task)
@@ -146,12 +148,19 @@ def record_trace(
 
 
 def record_llm(
-    provider: str, model: str, usage: Usage | None = None, db_path: str | None = None
+    provider: str,
+    model: str,
+    usage: Usage | None = None,
+    db_path: str | None = None,
+    duration_ms: int = 0,
 ) -> None:
     """LLM 调用埋点：name=provider/model，成本按定价表估算。
 
     usage 为 None（部分兼容端点的流式响应不带 usage）时 token 与成本记 0：调用次数
-    仍然计入，只是这一次没有 token 归因。
+    仍然计入，只是这一次没有 token 归因。usage 里的 cached_tokens 是 prompt 缓存命中
+    的输入 token（各家 API 都从输入里单列出来），供看板算缓存命中率。
+
+    duration_ms 由客户端计时后传入：适配层是唯一知道一次调用耗时的位置。
 
     db_path 由**调用方的 client** 带来：LLM 客户端在构造时存下它（见 app/llm 的
     get_llm），record_llm 原样透传给 record_trace。用自定义库创建 client 的地方
@@ -160,12 +169,15 @@ def record_llm(
     """
     tokens_in = usage.tokens_in if usage else 0
     tokens_out = usage.tokens_out if usage else 0
+    cached = usage.cached_tokens if usage else 0
     record_trace(
         "llm",
         f"{provider}/{model}",
         tokens_in=tokens_in,
         tokens_out=tokens_out,
         cost=estimate_cost(provider, tokens_in, tokens_out),
+        cached_tokens=cached,
+        duration_ms=duration_ms,
         db_path=db_path,
     )
 
@@ -195,15 +207,17 @@ async def _insert(
     tokens_in: int,
     tokens_out: int,
     cost: float,
+    cached_tokens: int,
+    duration_ms: int,
     db_path: str | None,
 ) -> None:
     """真正落库的一步，只被 record_trace 调度。任何失败都只记日志、不上抛。"""
     try:
         async with get_db(db_path) as conn:
             await conn.execute(
-                "INSERT INTO traces (ts, kind, name, detail, tokens_in, tokens_out, cost) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (_now(), kind, name, detail, tokens_in, tokens_out, cost),
+                "INSERT INTO traces (ts, kind, name, detail, tokens_in, tokens_out, cost, "
+                "cached_tokens, duration_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (_now(), kind, name, detail, tokens_in, tokens_out, cost, cached_tokens, duration_ms),
             )
             await conn.commit()
     except Exception as exc:  # 观测是增强项：写不进去也不能影响对话
@@ -306,7 +320,8 @@ async def list_traces(
             f"SELECT COUNT(*) AS n FROM traces{where}", params
         )
         rows = await conn.execute_fetchall(
-            "SELECT id, ts, kind, name, detail, tokens_in, tokens_out, cost "
+            "SELECT id, ts, kind, name, detail, tokens_in, tokens_out, cost, "
+            "cached_tokens, duration_ms "
             f"FROM traces{where} ORDER BY id DESC LIMIT ? OFFSET ?",
             [*params, limit, offset],
         )
@@ -334,7 +349,9 @@ async def summarize_traces(
         totals = (
             await conn.execute_fetchall(
                 "SELECT COUNT(*) AS calls, COALESCE(SUM(tokens_in), 0) AS tokens_in, "
-                "COALESCE(SUM(tokens_out), 0) AS tokens_out, COALESCE(SUM(cost), 0) AS cost "
+                "COALESCE(SUM(tokens_out), 0) AS tokens_out, COALESCE(SUM(cost), 0) AS cost, "
+                "COALESCE(SUM(cached_tokens), 0) AS cached_tokens, "
+                "COALESCE(AVG(NULLIF(duration_ms, 0)), 0) AS avg_duration "
                 f"FROM traces{where}",
                 params,
             )
@@ -350,12 +367,42 @@ async def summarize_traces(
                 params,
             )
             grouped[field] = [_group_row(field, row) for row in rows]
+        # 按天聚合（热力图用）：ts 是 UTC ISO 串，前 10 位就是日期，直接 substr 分组。
+        # 跨时区的用户看到的是 UTC 日期——热力图是趋势视图，不追求本地日历精度。
+        day_rows = await conn.execute_fetchall(
+            "SELECT substr(ts, 1, 10) AS day, COUNT(*) AS calls, "
+            "COALESCE(SUM(tokens_in), 0) AS tokens_in, "
+            "COALESCE(SUM(tokens_out), 0) AS tokens_out, "
+            "COALESCE(SUM(cost), 0) AS cost "
+            f"FROM traces{where} GROUP BY day ORDER BY day",
+            params,
+        )
     return {
         "total_calls": totals["calls"],
         "tokens_in": totals["tokens_in"],
         "tokens_out": totals["tokens_out"],
         "tokens_total": totals["tokens_in"] + totals["tokens_out"],
         "cost": round(totals["cost"], COST_DECIMALS),
+        "cached_tokens": totals["cached_tokens"],
+        # 命中率 = 命中 / (普通输入 + 命中)。两者加起来才是「全部输入 token」，
+        # 各家把 cached 从 input 里拆出来单列，直接 cached/tokens_in 会算出 >100%
+        "cache_hit_rate": round(
+            totals["cached_tokens"] / (totals["tokens_in"] + totals["cached_tokens"]), 4
+        )
+        if (totals["tokens_in"] + totals["cached_tokens"])
+        else 0.0,
+        "avg_duration_ms": round(totals["avg_duration"]),
         "by_kind": grouped["kind"],
         "by_name": grouped["name"],
+        "by_day": [
+            {
+                "day": row["day"],
+                "calls": row["calls"],
+                "tokens_in": row["tokens_in"],
+                "tokens_out": row["tokens_out"],
+                "tokens_total": row["tokens_in"] + row["tokens_out"],
+                "cost": round(row["cost"], COST_DECIMALS),
+            }
+            for row in day_rows
+        ],
     }

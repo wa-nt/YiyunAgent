@@ -34,6 +34,20 @@ class ToolDef(BaseModel):
 class Usage(BaseModel):
     tokens_in: int = 0
     tokens_out: int = 0
+    # prompt 缓存命中的输入 token：OpenAI 的 prompt_tokens_details.cached_tokens、
+    # Anthropic 的 cache_read_input_tokens。各家从 input 里单列出来，用于看板算命中率
+    cached_tokens: int = 0
+
+
+def cached_from_openai(usage: Any) -> int:
+    """从 OpenAI 兼容响应的 usage 里读缓存命中数；老端点没有这个字段就回 0。"""
+    details = getattr(usage, "prompt_tokens_details", None)
+    return int(getattr(details, "cached_tokens", 0) or 0)
+
+
+def cached_from_anthropic(usage: Any) -> int:
+    """从 Anthropic 响应的 usage 里读缓存命中数（cache_read_input_tokens）。"""
+    return int(getattr(usage, "cache_read_input_tokens", 0) or 0)
 
 
 class ChatResult(BaseModel):

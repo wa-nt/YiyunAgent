@@ -1,4 +1,5 @@
 import json
+import time
 from typing import Any, AsyncIterator
 
 import httpx
@@ -12,6 +13,7 @@ from app.llm.types import (
     ToolCall,
     ToolDef,
     Usage,
+    cached_from_openai,
 )
 from app.tracing import record_llm
 
@@ -130,15 +132,18 @@ class OpenAICompatClient:
         kwargs: dict[str, Any] = {**self._effort_kwarg()}
         if tools:
             kwargs["tools"] = to_openai_tools(tools)
+        t0 = time.perf_counter()
         resp = await self.client.chat.completions.create(
             model=self.model, messages=to_openai_messages(messages), **kwargs
         )
+        elapsed_ms = int((time.perf_counter() - t0) * 1000)
         msg = resp.choices[0].message
         usage = Usage(
             tokens_in=resp.usage.prompt_tokens if resp.usage else 0,
             tokens_out=resp.usage.completion_tokens if resp.usage else 0,
+            cached_tokens=cached_from_openai(resp.usage) if resp.usage else 0,
         )
-        record_llm(self.provider, self.model, usage, self.db_path)
+        record_llm(self.provider, self.model, usage, self.db_path, duration_ms=elapsed_ms)
         return ChatResult(
             text=msg.content or "",
             tool_calls=_parse_tool_calls(msg.tool_calls or []),

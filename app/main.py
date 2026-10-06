@@ -285,11 +285,16 @@ async def api_session(session_id: str) -> dict:
 
 
 @app.get("/api/sessions")
-async def api_sessions(q: str = "", limit: int = Query(200, ge=1, le=1000)) -> list[dict]:
+async def api_sessions(
+    q: str = "",
+    mode: str | None = None,
+    limit: int = Query(200, ge=1, le=1000),
+) -> list[dict]:
     """会话列表，最近活跃在前。title 优先用户改名 / 自动标题，回退首条 user 消息前 30 字；
     带上 mode 与 source，前端据此显示模式、区分定时任务创建的自动会话。NULL 按迁移口径
     归一（chat / manual），列表读到的 mode、source 因此永远是合法值。
     q 命中标题或任意一条消息内容的会话才返回（LIKE 子串匹配，量大了再考虑 FTS）。
+    mode 过滤让每种模式各自一份列表（跟 Claude Code 的模式分区一致）；缺省不过滤。
     limit 兜住无限增长：搜索时不设限（用户搜的就是全量），默认只回最近 200 个。"""
     like = f"%{_like_escape(q)}%" if q else ""
     async with get_db() as conn:
@@ -300,12 +305,13 @@ async def api_sessions(q: str = "", limit: int = Query(200, ge=1, le=1000)) -> l
             "WHERE session_id = s.id AND role = 'user' ORDER BY id LIMIT 1), '') AS title, "
             "(SELECT COUNT(*) FROM messages WHERE session_id = s.id) AS message_count "
             "FROM sessions s "
-            "WHERE s.deleted_at IS NULL AND (? = '' OR COALESCE(s.title, '') LIKE ? ESCAPE '\\' "
+            "WHERE s.deleted_at IS NULL AND (? IS NULL OR COALESCE(s.mode, 'chat') = ?) "
+            "AND (? = '' OR COALESCE(s.title, '') LIKE ? ESCAPE '\\' "
             "OR EXISTS (SELECT 1 FROM messages m WHERE m.session_id = s.id "
             "AND m.content LIKE ? ESCAPE '\\')) "
             "ORDER BY (SELECT MAX(id) FROM messages WHERE session_id = s.id) DESC "
             "LIMIT ?",
-            (q, like, like, 1000 if q else limit),
+            (mode, mode, q, like, like, 1000 if q else limit),
         )
     return [dict(row) for row in rows]
 
