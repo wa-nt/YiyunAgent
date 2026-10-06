@@ -51,7 +51,7 @@ NOTIFY_BUSY_TIMEOUT_MS = 5000
 # 各跑一遍 cron（数据库占位挡不住跨进程）。用一个具名内核互斥体把第二个实例挡在启动阶段，
 # 而不是让它起完服务再发现端口/调度冲突。名字带 Local\ 前缀 = 只在当前用户会话内生效，
 # 不干扰多用户同时登录的场景（本应用只影响自己的数据目录）。
-INSTANCE_MUTEX_NAME = r"Local\SecondBrainAgent.single-instance"
+INSTANCE_MUTEX_NAME = r"Local\YiyunAgent.single-instance"
 # 已持有的互斥体句柄。进程存活期间必须一直持有（关掉就等于放弃单实例），
 # 所以只在模块级保存引用，由进程退出时释放。
 _instance_handle = None
@@ -261,7 +261,7 @@ def _fatal(message: str) -> None:
     try:
         import ctypes
 
-        ctypes.windll.user32.MessageBoxW(None, message, "第二大脑 Agent 启动失败", 0x10)
+        ctypes.windll.user32.MessageBoxW(None, message, "忆云 Agent 启动失败", 0x10)
     except Exception:
         pass
     raise SystemExit(1)
@@ -301,7 +301,7 @@ def main() -> None:
     # 单实例闸门放在起服务之前：第二个实例此刻还没建库、没起调度循环，直接退出最干净。
     # 放行后再重复启动一次也不会重复触发 cron（T5 的幂等只覆盖同进程）。
     if not acquire_single_instance():
-        _fatal("第二大脑 Agent 已经在运行了。\n\n请到托盘图标菜单里操作，不要重复启动。")
+        _fatal("忆云 Agent 已经在运行了。\n\n请到托盘图标菜单里操作，不要重复启动。")
 
     import webview
 
@@ -313,7 +313,7 @@ def main() -> None:
         _fatal(f"{exc}\n\n请确认 .env 与 data 目录与程序在同一目录。")
 
     window = webview.create_window(
-        "第二大脑 Agent",
+        "忆云 Agent",
         f"http://127.0.0.1:{port}/",
         width=1280,
         height=800,
@@ -357,9 +357,9 @@ def main() -> None:
             window.destroy()
 
         icon = pystray.Icon(
-            "second-brain-agent",
+            "yiyun-agent",
             make_icon(64),
-            "第二大脑 Agent",
+            "忆云 Agent",
             menu=pystray.Menu(
                 Item("打开主界面", show_window, default=True),
                 Item("退出", quit_app),

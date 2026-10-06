@@ -1,7 +1,7 @@
 [project]
-name = "second-brain-agent"
+name = "yiyun-agent"
 version = "0.1.0"
-description = "第二大脑 Agent：个人知识管理 Agent（分层记忆 × 上下文治理 × Skill 化 × 评测）"
+description = "忆云 Agent：个人知识管理 Agent（分层记忆 × 上下文治理 × Skill 化 × 评测）"
 requires-python = ">=3.12"
 dependencies = [
     "fastapi",

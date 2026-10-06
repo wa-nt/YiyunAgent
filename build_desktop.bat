@@ -1,21 +1,21 @@
 @echo off
 rem Build the desktop app: PyInstaller one-folder, windowed (no console).
-rem Output: dist\SecondBrainAgent\  -> double-click SecondBrainAgent.exe
+rem Output: dist\YiyunAgent\  -> double-click YiyunAgent.exe
 rem NOTE: keep this file pure ASCII - cmd.exe parses .bat in the OEM codepage (GBK
 rem on zh-CN systems) and UTF-8 Chinese comments break line-continuation parsing.
 setlocal
 cd /d %~dp0
 set PY=.venv\Scripts\python.exe
-set OUT=dist\SecondBrainAgent
+set OUT=dist\YiyunAgent
 set STASH=%TEMP%\sba-runtime-stash
 
 rem ---- Refuse to build while the app is running ----
 rem PyInstaller --noconfirm deletes OUT wholesale, but a running instance holds
 rem _internal\*.dll (clr_loader, vec0, pythonnet). The delete then fails halfway
 rem and leaves OUT mangled - no schema.sql, no data - which looks like a broken build.
-tasklist /FI "IMAGENAME eq SecondBrainAgent.exe" 2>nul | find /I "SecondBrainAgent.exe" >nul
+tasklist /FI "IMAGENAME eq YiyunAgent.exe" 2>nul | find /I "YiyunAgent.exe" >nul
 if not errorlevel 1 (
-  echo ERROR: SecondBrainAgent.exe is still running.
+  echo ERROR: YiyunAgent.exe is still running.
   echo Quit it first from the tray icon menu, then re-run this script.
   exit /b 1
 )
@@ -46,7 +46,7 @@ rem               through importlib), so PyInstaller's dependency analysis misse
 rem               the frozen app cannot resolve any IANA zone - local_timezone_name()
 rem               then fails and every scheduled task breaks.
 %PY% -m PyInstaller --noconfirm --clean --windowed ^
-  --name SecondBrainAgent ^
+  --name YiyunAgent ^
   --icon web\app.ico ^
   --paths . ^
   --add-data "web;web" ^
@@ -65,7 +65,7 @@ xcopy /E /I /Y /Q skills "%OUT%\skills" >nul
 call :restore
 rmdir /S /Q "%STASH%"
 echo.
-echo Done: %OUT%\SecondBrainAgent.exe
+echo Done: %OUT%\YiyunAgent.exe
 echo .env and data\ were carried over from the previous build (or the project root).
 exit /b 0
 

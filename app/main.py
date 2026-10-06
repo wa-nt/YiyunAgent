@@ -96,7 +96,7 @@ async def lifespan(app: FastAPI):
             await drain_traces()
 
 
-app = FastAPI(title="第二大脑 Agent", lifespan=lifespan)
+app = FastAPI(title="忆云 Agent", lifespan=lifespan)
 
 
 class IngestRequest(BaseModel):
@@ -573,7 +573,7 @@ async def api_export() -> JSONResponse:
             data[table] = [dict(row) for row in rows]
     return JSONResponse(
         data,
-        headers={"Content-Disposition": 'attachment; filename="second-brain-export.json"'},
+        headers={"Content-Disposition": 'attachment; filename="yiyun-export.json"'},
     )
 
 

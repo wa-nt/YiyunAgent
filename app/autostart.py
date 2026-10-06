@@ -23,7 +23,7 @@ import sys
 
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 # 值名就是注册表里显示给用户看的那一行，用产品名而不是包名
-VALUE_NAME = "SecondBrainAgent"
+VALUE_NAME = "YiyunAgent"
 # 固定启动参数：桌面端不带参数就是正常启动。留成常量是为了让「自启时跑的命令」在一处
 # 可见，将来真要加 `--tray` 之类只需改这里
 STARTUP_ARGS: tuple[str, ...] = ()

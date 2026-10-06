@@ -144,14 +144,14 @@ def test_is_supported_is_false_in_the_source_tree():
 
 
 def test_enable_writes_a_fully_quoted_command_and_is_idempotent(registry, monkeypatch):
-    monkeypatch.setattr(sys, "executable", r"C:\Program Files\第二大脑\SecondBrainAgent.exe")
+    monkeypatch.setattr(sys, "executable", r"C:\Program Files\忆云\YiyunAgent.exe")
 
     autostart.enable()
     autostart.enable()  # 重复 enable 幂等
 
     assert registry.store[autostart.RUN_KEY] == {
         autostart.VALUE_NAME: subprocess.list2cmdline(
-            [r"C:\Program Files\第二大脑\SecondBrainAgent.exe"]
+            [r"C:\Program Files\忆云\YiyunAgent.exe"]
         )
     }
     written = registry.store[autostart.RUN_KEY][autostart.VALUE_NAME]

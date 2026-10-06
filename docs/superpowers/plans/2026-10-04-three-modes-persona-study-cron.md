@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use `superpowers:subagent-driven-development` (recommended) or `superpowers:executing-plans` to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** 把 SecondBrainAgent 从知识库问答扩展为 chat/work 两种可用模式：可配置去-AI-味人格、复习漏洞自动记录（简化 SM-2）、用户自设定时任务（cron + 托盘通知 + 自动开会话），并优化冷启动与可选开机自启。Code 入口本期只展示为禁用状态，不实现运行时。
+**Goal:** 把 YiyunAgent 从知识库问答扩展为 chat/work 两种可用模式：可配置去-AI-味人格、复习漏洞自动记录（简化 SM-2）、用户自设定时任务（cron + 托盘通知 + 自动开会话），并优化冷启动与可选开机自启。Code 入口本期只展示为禁用状态，不实现运行时。
 
 **Architecture:**
 

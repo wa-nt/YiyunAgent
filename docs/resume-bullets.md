@@ -1,4 +1,4 @@
-# 简历 Bullet —— 第二大脑 Agent
+# 简历 Bullet —— 忆云 Agent
 
 > 使用说明：每条 bullet = 技术动作 + 量化结果 + 业务价值。数字均来自代码库实测
 > （测试数、commit 数、模块行数可复核）；评测数字的口径与局限见每条备注，
@@ -6,7 +6,7 @@
 
 ## 一句话版本（放简历项目名后）
 
-**第二大脑 Agent** —— 个人知识管理 Agent：分层记忆 × 上下文治理 × Skill 化 × 评测与可观测（Python / FastAPI / SQLite+sqlite-vec / 双协议 LLM 接入）
+**忆云 Agent** —— 个人知识管理 Agent：分层记忆 × 上下文治理 × Skill 化 × 评测与可观测（Python / FastAPI / SQLite+sqlite-vec / 双协议 LLM 接入）
 
 ## 推荐 Bullets
 
