@@ -47,6 +47,10 @@ python -m app.desktop
 # 重新打包前请先从托盘菜单退出正在运行的实例，否则脚本会直接拒绝构建
 build_desktop.bat
 
+# 打成 Windows 安装器（Inno Setup，每用户安装到 %LOCALAPPDATA%\Programs\YiyunAgent）
+# 需先跑 build_desktop.bat；本机需装 Inno Setup 6（https://jrsoftware.org/isdl.php）
+build_installer.bat
+
 # 跑测试（600 条）
 python -m pytest tests/ -q
 
@@ -104,6 +108,7 @@ eval/                评测框架：runner / metrics / ablation / report + 38 �
 web/index.html       单文件前端（Notion 风格）
 tests/               600 条测试
 docs/design.md       设计方案
+installer/           Inno Setup 安装脚本（Windows 安装器）
 ```
 
 ## 评测
