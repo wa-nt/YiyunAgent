@@ -14,5 +14,6 @@ node_modules/
 dist/
 # PyInstaller 打包中间产物：每次构建重新生成
 build/
-SecondBrainAgent.spec
 YiyunAgent.spec
+# Playwright 浏览器调试产物（截图 / 快照 / 控制台日志）
+.playwright-mcp/

@@ -57,10 +57,18 @@ OpenTelemetry/OpenInference 语义，观测后端首选本地 Phoenix。只借�
 |---|---|
 | 采集入库 | Markdown / TXT / PDF / 网页剪藏（文件上传或路径/URL）→ 解析 → 语义切分 → 向量化入库 |
 | 知识问答 | 三路混合检索（vector + BM25 + entity，RRF 融合）+ 生成 + 引用溯源（可跳回原文块） |
+| 三模式会话 | 聊天 / 工作 / 代码（占位）。模式在会话创建时固定，各模式各一份会话列表；工作模式带复习教练 |
 | 记忆学习 | 对话中自动抽取用户偏好与事实，写入分层记忆 |
-| 主动回顾 | 基于记忆 + 间隔重复生成「本周该复习什么」 |
+| 漏洞回顾 | 工作模式把没掌握的点记成复习卡片（简化 SM-2），到点提醒 |
+| 定时任务 | cron + 模式 + 内容，到点自动开会话跑，结果走系统托盘通知 |
+| 桌面端 | pywebview 原生窗口 + pystray 托盘，点 X 最小化到托盘；单实例锁防重复启动 |
 
-明确不做：多用户/权限体系、前端美化（能演示即可）、移动端、文件同步。
+明确不做：多用户/权限体系、移动端、文件同步。
+
+> 实现注记：落地时存储层用 SQLite + sqlite-vec（非 PostgreSQL/PGVector），
+> 短期记忆落在会话消息表（非 Redis），Agent 运行时不引 LangGraph 而手写 ReAct
+> 循环（≤6 轮工具调用），可观测落 SQLite traces 表（非 OpenTelemetry）。
+> 取舍理由见 §11 与 `docs/resume-bullets.md` 的「为什么不用 XX」。
 
 ## 4. LLM 双协议接入层（W1 内置）
 
@@ -259,9 +267,14 @@ OpenTelemetry span 级埋点：每次 LLM 调用 / 工具调用 / 重试 / 降�
 
 ## 11. 技术栈
 
-Python 3.12 / FastAPI / LangGraph / openai + anthropic SDK /
-PostgreSQL + PGVector / rank_bm25 / Redis / OpenTelemetry + Phoenix / Docker。
+Python 3.12 / FastAPI / openai + anthropic SDK /
+SQLite + sqlite-vec / rank_bm25 / 原生 HTML/JS 单文件前端 /
+pywebview + pystray 桌面端 / 自建 traces 表做可观测。
 LLM：DeepSeek 或通义 API 为主（成本低），Claude 走 Anthropic 适配器做对照。
+
+> 与原设计的偏离：不用 PostgreSQL/PGVector、Redis、LangGraph、OpenTelemetry——
+> 单用户本地优先场景下 SQLite + sqlite-vec 零外部服务即可；手写 ReAct 循环比
+> 重型编排框架更透明；traces 落 SQLite 足够做成本归因。
 
 ## 12. 10 周排期
 

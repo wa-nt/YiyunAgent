@@ -6,20 +6,24 @@
 并用自建评测集 + 消融实验验证每一项的收益。
 
 ![首页](docs/demo/home.png)
-![文档管理](docs/demo/documents.png)
+![对话](docs/demo/chat.png)
+![设置](docs/demo/settings.png)
+![用量看板](docs/demo/usage.png)
 
 ## 核心特性
 
+- **三模式会话**：聊天 / 工作 / 代码（代码为占位）。模式在会话创建时固定，各模式各有一份会话列表；工作模式带复习教练，会把没掌握的点记成漏洞卡片
 - **混合检索**：向量（sqlite-vec）+ BM25 + 实体三路召回，RRF 融合；单路可切换（消融对照）
 - **分层记忆**：短期（会话消息）/ 长期（memories 表）。LLM 抽取候选 → 重要性评分 → 归一化去重 → LLM 冲突检测（不覆盖旧记忆，标 conflict 并衰减置信度）→ 敏感信息过滤落库；召回按置信度注入 system 消息
 - **上下文治理**：三策略独立开关 —— 工具结果清理（旧检索结果换占位符）、历史压缩（超阈值时 LLM 生成摘要）、token 预算（按优先级逐级截断）。只改发给模型的 prompt view，不动数据库
 - **Skill 系统**：`skills/*/SKILL.md` 声明触发词与能力，命中后按需注入 system 提示 + 注册专用工具（渐进式披露）。内置 5 个：简历写作（含简历体检、JD 关键词缺口两个工具）、面试准备、笔记整理、学习计划、项目创意
-- **可观测**：LLM/工具/skill 调用 fire-and-forget 埋点进 traces 表，按 provider 定价表估算成本；`GET /api/traces` + `GET /api/traces/summary` 成本看板
+- **定时任务**：cron 表达式 + 模式 + 内容，到点自动开一个会话跑；结果走系统托盘气泡通知。cron 按创建时的时区解释，幂等去重防重复触发
+- **可观测与成本看板**：LLM / 工具 / skill 调用 fire-and-forget 埋点进 traces 表，记录 token、prompt 缓存命中与调用耗时，按 provider 定价表估算成本；设置页有统计卡片 + 53 周用量热力图 + 请求日志表
 - **评测框架**：38 条中文评测集（single-hop / multi-hop / temporal / 跨会话偏好 / 对抗），8 组消融矩阵（记忆 × 压缩 × 检索方式），结果落盘含 git commit 与配置快照，一键生成 Markdown 报告
 
 ## 技术栈
 
-Python 3.12 · FastAPI（SSE 流式）· SQLite + sqlite-vec · rank-bm25 · 原生 HTML/JS 单文件前端 · OpenAI 兼容 + Anthropic 双协议 LLM 接入
+Python 3.12 · FastAPI（SSE 流式）· SQLite + sqlite-vec · rank-bm25 · 原生 HTML/JS 单文件前端 · OpenAI 兼容 + Anthropic 双协议 LLM 接入 · 桌面端 pywebview + pystray 托盘
 
 ## 快速开始
 
@@ -43,7 +47,7 @@ python -m app.desktop
 # 重新打包前请先从托盘菜单退出正在运行的实例，否则脚本会直接拒绝构建
 build_desktop.bat
 
-# 跑测试（578 条）
+# 跑测试（600 条）
 python -m pytest tests/ -q
 
 # 跑评测（需配置 key；--ablation 跑 8 组消融矩阵）
@@ -62,16 +66,20 @@ LLM 后端通过 `LLM_PROVIDER=openai_compat|anthropic` 切换；OpenAI 兼容�
 | GET | `/api/documents/{id}/chunks` | 文档分块预览（排查「为什么没检索到」） |
 | DELETE | `/api/documents/{id}` | 删除文档 |
 | POST | `/api/chat` | SSE 流式对话（session/text_delta/tool_start/tool_end/done/error） |
-| GET | `/api/sessions` | 会话列表（`q` 搜索、`limit` 上限） |
+| GET | `/api/sessions` | 会话列表（`q` 搜索、`mode` 按模式过滤、`limit` 上限） |
 | GET | `/api/sessions/{id}` | 单个会话（含 mode/source/模型覆盖） |
 | DELETE | `/api/sessions/{id}` | 软删除会话（打 deleted_at 标记，列表/读取即隐藏） |
 | POST | `/api/sessions/{id}/restore` | 撤销软删除 |
 | GET | `/api/sessions/{id}/messages` | 会话历史 |
 | POST | `/api/import` | 统一导入：本应用导出回灌 / ChatGPT / Claude 三种 JSON |
+| GET/POST | `/api/tasks` | 定时任务列表 / 新建（cron + 模式 + 内容） |
+| POST | `/api/tasks/{id}/enable` · `/disable` · DELETE | 启停 / 删除定时任务 |
 | GET | `/api/tasks/next-run?cron=` | cron 表达式的下次运行时间（表单即时预览） |
-| GET | `/api/traces` | 调用明细（kind/name/时间窗过滤，分页） |
-| GET | `/api/traces/summary` | 成本聚合（总计 + 按 kind/name 分组） |
-| GET/POST | `/api/settings` | 模型供应商设置（密钥脱敏回显；保存写 .env 并即时生效，对应侧栏 ⚙ 面板）。`persona`（存 SQLite）与 `autostart`（Windows 注册表）不走 .env，见 `app/autostart.py` |
+| GET | `/api/gaps` | 漏洞卡片（工作模式记下的复习卡片） |
+| GET | `/api/skills` | 已加载的技能清单（名称 / 描述 / 触发词） |
+| GET | `/api/traces` | 调用明细（kind/name/时间窗过滤，分页；含缓存命中与耗时） |
+| GET | `/api/traces/summary` | 成本聚合（总计 + 按 kind/name/按天分组 + 缓存命中率 + 平均耗时） |
+| GET/POST | `/api/settings` | 模型供应商设置（密钥脱敏回显；保存写 .env 并即时生效，对应侧栏 ⚙ 设置面板）。`persona`（存 SQLite）与 `autostart`（Windows 注册表）不走 .env，见 `app/autostart.py` |
 | POST | `/api/models` | 转发供应商 `GET /models` 给设置面板做模型名建议，附带上下文窗口长度（字段名各家不一，取不到为 null）。只读，不落库；失败返回 401/502/422 |
 
 ## 项目结构
@@ -88,11 +96,13 @@ app/
   agent/context.py   上下文治理三策略
   memory/            记忆写入（抽取/去重/冲突/过滤）与召回
   skills/            Skill 加载与触发（渐进式披露）
+  scheduler.py       cron 定时任务调度（幂等 + 托盘通知）
   tracing.py         埋点与成本看板查询
+  desktop.py         桌面端：pywebview 窗口 + pystray 托盘 + 单实例锁
 skills/              5 个内置技能（SKILL.md 声明式定义）
 eval/                评测框架：runner / metrics / ablation / report + 38 条评测集
 web/index.html       单文件前端（Notion 风格）
-tests/               578 条测试
+tests/               600 条测试
 docs/design.md       设计方案
 ```
 
@@ -125,3 +135,5 @@ token 数为字符估算（中文实际 token 约为估算值的 3-4 倍）。
 - 评测集说明：`eval/dataset/README.md`
 - Skill 编写指南：`skills/README.md`
 - 简历 bullet：`docs/resume-bullets.md`
+- 产品审视报告：`docs/product-review-2026-10-04.md`
+- 侧栏图标调研：`docs/sidebar-icon-research-2026-10-06.md`
